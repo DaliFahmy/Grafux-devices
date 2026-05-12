@@ -10,8 +10,8 @@ Once connected, you can send typed command blocks to any device and receive resu
 ## Project Structure
 
 ```
-server/devices/
-├── main.py               # FastAPI app — WebSocket endpoint + REST API
+Grafux-devices/
+├── devices_server.py     # FastAPI app — WebSocket endpoint + REST API
 ├── connection_manager.py # Tracks active device connections
 ├── commands.py           # Command block builders
 ├── requirements.txt      # Python dependencies
@@ -29,7 +29,7 @@ server/devices/
 1. Go to [https://render.com](https://render.com) and log in.
 2. Click **New → Web Service**.
 3. Connect your GitHub/GitLab repository.
-4. Set the **Root Directory** to `server/devices`.
+4. Leave **Root Directory** empty (the repo root contains `devices_server.py` directly).
 
 ### Step 2 — Configure build & start commands
 
@@ -37,7 +37,7 @@ server/devices/
 |---------|-------|
 | Environment | `Python 3` |
 | Build Command | `pip install -r requirements.txt` |
-| Start Command | `uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| Start Command | `uvicorn devices_server:app --host 0.0.0.0 --port $PORT` |
 | Health Check Path | `/health` |
 
 > **Tip:** You can also use `render.yaml` (already in this folder) for infrastructure-as-code deployment. Link it in the Render dashboard under **Blueprint**.
@@ -166,7 +166,7 @@ curl -X POST https://devices-agent-server.onrender.com/broadcast \
 | `compile_and_run` | Compile (C/C++) and run a workspace file | `file_path`, `args`, `timeout` |
 | `download_and_run` | Download from S3 then compile and run | `s3_key`, `filename`, `args`, `timeout`; or `file_url` |
 
-> The `download_from_s3`, `compile_and_run`, and `download_and_run` commands require the Raspberry Pi agent (`server/devices/raspberry_pi/agent.py`) instead of the generic `client_example.py`.
+> The `download_from_s3`, `compile_and_run`, and `download_and_run` commands require the Raspberry Pi agent (`raspberry_pi/agent.py`) instead of the generic `client_example.py`.
 
 ### Raspberry Pi — download and run example
 
@@ -207,9 +207,8 @@ FastAPI generates interactive docs automatically:
 ## 6. Run Locally
 
 ```bash
-cd server/devices
 pip install -r requirements.txt
-AGENT_TOKEN=mysecret uvicorn main:app --reload
+AGENT_TOKEN=mysecret uvicorn devices_server:app --reload
 ```
 
 Then connect a test client:

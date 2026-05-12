@@ -1,7 +1,7 @@
 """
 test_main_robot_endpoints.py
 Integration tests for the 7 robot REST shortcut endpoints added to
-server/devices/main.py.
+server/devices/devices_server.py.
 
 Uses httpx.AsyncClient with ASGITransport to exercise each endpoint end-to-end
 through the ASGI app without starting a real server.  The ConnectionManager.send()
@@ -26,8 +26,8 @@ import httpx
 from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 
-import main
-from main import app, manager
+import devices_server
+from devices_server import app, manager
 
 
 # ---------------------------------------------------------------------------

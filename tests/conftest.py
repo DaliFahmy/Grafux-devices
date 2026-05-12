@@ -8,7 +8,7 @@ Every ROS2 / WebSocket dependency is replaced by a MagicMock / AsyncMock.
 Path setup
 ----------
 This conftest inserts `server/devices/` at the front of sys.path so that
-both the flat imports used by `main.py` (e.g. `import commands`) and the
+both the flat imports used by `devices_server.py` (e.g. `import commands`) and the
 package imports used by the Mitsubishi_MELFA package work correctly.
 """
 
