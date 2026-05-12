@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: grafux-devices
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.0"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: AGENT_TOKEN
+        generateValue: true

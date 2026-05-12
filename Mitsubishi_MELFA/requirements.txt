@@ -1,0 +1,12 @@
+# Mitsubishi MELFA Grafux Agent — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# These are the only packages needed to run agent.py on the robot machine.
+# No ROS2 Python environment is required — rosbridge_server handles the
+# ROS2 side; this agent communicates with it over a standard WebSocket.
+
+# WebSocket client used for both Grafux device server and rosbridge connections
+websockets>=12.0
+
+# rosbridge v2 protocol client library
+roslibpy>=1.3.0

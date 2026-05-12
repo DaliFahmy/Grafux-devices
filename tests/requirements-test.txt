@@ -1,0 +1,20 @@
+# Test dependencies for the MELFA ROS2 integration test suite
+# Install with:  pip install -r requirements-test.txt
+#
+# Run tests from server/devices/ with:
+#   pytest tests/ -v
+#
+# Or from server/devices/tests/ with:
+#   pytest -v
+
+# Test runner
+pytest>=8.0
+
+# Async test support (required for @pytest.mark.asyncio)
+pytest-asyncio>=0.23
+
+# HTTP client used for async ASGI testing (compatible with all versions >=0.23)
+httpx>=0.23
+
+# The server itself also needs its own deps — install from parent:
+#   pip install -r ../requirements.txt
