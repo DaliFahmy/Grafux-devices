@@ -50,11 +50,17 @@ In the Render dashboard, go to your service → **Environment**:
 |----------|-------|-------|
 | `AGENT_TOKEN` | *(generate a strong random string)* | Every device must use this token |
 | `PYTHON_VERSION` | `3.11.0` | Ensures consistent runtime |
+| `ANTHROPIC_API_KEY` | *(your Anthropic key, `sk-ant-…`)* | **Required for the OpenClaw runtime** — used to run and AI-scaffold claws (`/claw/*`). Declared as `sync: false` in `render.yaml`, so set the value here in the dashboard. |
 
 > **Generate a secure token:**
 > ```bash
 > python -c "import secrets; print(secrets.token_urlsafe(32))"
 > ```
+>
+> **OpenClaw note:** the `anthropic` dependency is already in `requirements.txt` and the
+> `/claw/*` endpoints are mounted automatically by `devices_server.py`. If `ANTHROPIC_API_KEY`
+> is unset, the rest of the server still runs, but claw run/scaffold calls return a graceful
+> "no API key" result instead of an AI response.
 
 ### Step 4 — Deploy
 

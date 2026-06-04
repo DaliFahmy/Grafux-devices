@@ -14,3 +14,7 @@ services:
         value: "1"
       - key: AGENT_TOKEN
         generateValue: true
+      # OpenClaw runtime — Anthropic key used to run and scaffold claws.
+      # sync:false => set the secret value in the Render dashboard, not in the repo.
+      - key: ANTHROPIC_API_KEY
+        sync: false
