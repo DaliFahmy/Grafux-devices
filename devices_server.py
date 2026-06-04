@@ -69,6 +69,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# OpenClaw — server-side claw runtime (software AI agents; no device_id needed).
+# Mounted as a router so it shares this server's host/port and CORS config.
+try:
+    from openclaw.router import router as claw_router
+
+    app.include_router(claw_router)
+    logger.info("OpenClaw router mounted at /claw")
+except Exception as exc:  # noqa: BLE001 — never let claw imports break device serving
+    logger.warning("OpenClaw router not mounted: %s", exc)
+
 manager = ConnectionManager()
 
 # ---------------------------------------------------------------------------

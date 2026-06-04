@@ -1,0 +1,2 @@
+# OpenClaw runtime dependencies (in addition to the devices-server requirements).
+anthropic>=0.40

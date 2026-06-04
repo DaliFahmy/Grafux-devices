@@ -1,0 +1,20 @@
+5. Grafux-devices
+
+Excellent separation.
+
+This becomes:
+
+“Realtime Device Gateway”
+Responsibilities
+device pairing
+websocket connections
+OpenClaw integration
+device presence
+command routing
+telemetry
+remote execution
+device permissions
+Stack
+WebSockets
+OpenClaw
+Redis pub/sub
