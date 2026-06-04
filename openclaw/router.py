@@ -29,6 +29,8 @@ from .models import (
     CreateClawResponse,
     RunRequest,
     RunResponse,
+    ScaffoldRequest,
+    ScaffoldResponse,
 )
 from .registry import registry
 
@@ -42,6 +44,18 @@ async def create_claw(spec: ClawSpec) -> CreateClawResponse:
     """Provision a reusable claw from its block ports and return its id."""
     claw_id = registry.create(spec)
     return CreateClawResponse(claw_id=claw_id, status="created")
+
+
+@router.post("/scaffold", response_model=ScaffoldResponse)
+async def scaffold_claw(body: ScaffoldRequest) -> ScaffoldResponse:
+    """
+    Draft a claw's input-port values from a description (used by the create dialog).
+
+    Never errors for AI failures — returns a best-effort object (empty design ports
+    + placeholder secrets) so the block can still be created.
+    """
+    drafted = await claw_runtime.scaffold_claw(body.description, body.name)
+    return ScaffoldResponse(**drafted)
 
 
 @router.get("", response_model=list[ClawSummary])

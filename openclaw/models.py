@@ -61,3 +61,30 @@ class ClawSummary(BaseModel):
     claw_id: str
     name: str = ""
     agent: str = ""
+
+
+class ScaffoldRequest(BaseModel):
+    """Ask the AI to draft a claw's design ports from a free-text description."""
+
+    description: str = Field("", description="What the claw should be / do.")
+    name: str = Field("", description="Optional claw name for extra context.")
+    category: str = Field("", description="Optional category for extra context.")
+
+
+class ScaffoldResponse(BaseModel):
+    """
+    AI-drafted values for the claw block's input ports.
+
+    The design ports (soul/skills/agent/task/memory/tools_config) are filled from
+    the description.  The secret ports (credentials/api_keys) are NEVER fabricated
+    — they carry placeholder hints the user replaces with real secrets.
+    """
+
+    soul: str = ""
+    skills: str = ""
+    agent: str = ""
+    task: str = ""
+    memory: str = ""
+    tools_config: str = ""
+    credentials: str = ""
+    api_keys: str = ""

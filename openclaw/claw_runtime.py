@@ -174,3 +174,99 @@ async def run_claw(spec: ClawSpec, task: str, memory: str = "") -> Dict[str, str
         block.text for block in message.content if getattr(block, "type", None) == "text"
     )
     return {"status": "ok", "response": text, "errors": ""}
+
+
+# ---------------------------------------------------------------------------
+# Scaffold — draft a claw's design ports from a description
+# ---------------------------------------------------------------------------
+
+# Placeholder hints for the secret ports — never AI-fabricated.
+_CREDENTIALS_HINT = "<your-service-credentials>"
+_API_KEYS_HINT = "<your-anthropic-api-key>"
+
+# Keys the scaffold returns to the dialog.  Secret keys are appended last and are
+# always overwritten with the placeholder hints below.
+_DESIGN_KEYS = ("soul", "skills", "agent", "task", "memory", "tools_config")
+
+_SCAFFOLD_SYSTEM = (
+    "You design 'claws' — small AI agents — for the Grafux platform. Given a short "
+    "description, draft sensible values for a claw's configuration ports and respond "
+    "with ONLY a single JSON object (no prose, no markdown fences) with EXACTLY these "
+    "keys:\n"
+    '  "soul"         — the agent\'s persona / system prompt (2-5 sentences).\n'
+    '  "skills"       — a concise comma- or newline-separated list of capabilities.\n'
+    '  "agent"        — a model id; default to "claude-opus-4-8" unless the '
+    "description clearly implies otherwise.\n"
+    '  "task"         — a concrete example task the claw would perform.\n'
+    '  "memory"       — initial context worth remembering, or "" if none.\n'
+    '  "tools_config" — tool/MCP configuration notes, or "" if none.\n'
+    "Do NOT include API keys, credentials, or secrets in any field."
+)
+
+
+def _scaffold_fallback() -> Dict[str, str]:
+    """Empty design ports + placeholder secrets, used when the AI is unavailable."""
+    out = {k: "" for k in _DESIGN_KEYS}
+    out["agent"] = DEFAULT_MODEL
+    out["credentials"] = _CREDENTIALS_HINT
+    out["api_keys"] = _API_KEYS_HINT
+    return out
+
+
+async def scaffold_claw(description: str, name: str = "") -> Dict[str, str]:
+    """
+    Draft the claw's input-port values from ``description``.
+
+    Returns a dict with the six design keys plus ``credentials``/``api_keys``
+    (always placeholder hints).  Never raises — returns a best-effort fallback so
+    the block can still be created when the AI is unavailable.
+    """
+    description = (description or "").strip()
+    if not description:
+        return _scaffold_fallback()
+
+    try:
+        from anthropic import AsyncAnthropic  # lazy import — see module docstring
+    except ImportError:
+        logger.warning("scaffold: anthropic not installed — returning fallback")
+        return _scaffold_fallback()
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        # At scaffold time the user hasn't entered api_keys yet (that's what we're
+        # generating), so we rely on the server's own key.
+        logger.warning("scaffold: ANTHROPIC_API_KEY not set — returning fallback")
+        return _scaffold_fallback()
+
+    user_msg = f"Description: {description}"
+    if name:
+        user_msg = f"Claw name: {name}\n{user_msg}"
+
+    client = AsyncAnthropic(api_key=api_key)
+    try:
+        message = await client.messages.create(
+            model=DEFAULT_MODEL,
+            max_tokens=1024,
+            system=_SCAFFOLD_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully on any SDK/API error
+        logger.warning("scaffold: API call failed (%s) — returning fallback", exc)
+        return _scaffold_fallback()
+
+    text = "".join(
+        block.text for block in message.content if getattr(block, "type", None) == "text"
+    )
+    parsed = _maybe_json(text)
+    if not isinstance(parsed, dict):
+        logger.warning("scaffold: model did not return JSON — returning fallback")
+        return _scaffold_fallback()
+
+    # Keep only the design keys we asked for; default agent to a model id.
+    out = {k: str(parsed.get(k, "") or "") for k in _DESIGN_KEYS}
+    if not out["agent"].strip():
+        out["agent"] = DEFAULT_MODEL
+    # Secrets are ALWAYS placeholders, regardless of what the model returned.
+    out["credentials"] = _CREDENTIALS_HINT
+    out["api_keys"] = _API_KEYS_HINT
+    return out
