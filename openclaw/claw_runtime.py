@@ -33,10 +33,25 @@ logger = logging.getLogger("openclaw.runtime")
 DEFAULT_MODEL = "claude-opus-4-8"
 DEFAULT_MAX_TOKENS = 4096
 
+# Sentinels the Grafux frontend writes into a port file when nothing is wired to
+# it (see PortDataService::kEmptyPortValue and the "unconnected" literal in the
+# block runner).  They are NOT real values — treat them as an empty port so an
+# unconnected ``agent`` port never becomes the model id "unconnected" (which the
+# Anthropic API rejects with 404 not_found).
+_PLACEHOLDER_VALUES = {"empty", "unconnected"}
+
 
 # ---------------------------------------------------------------------------
 # Port parsing helpers — every port is free text that MAY contain JSON.
 # ---------------------------------------------------------------------------
+
+def _clean_port(text: Optional[str]) -> str:
+    """Return the port's real value, mapping placeholder sentinels to ``""``."""
+    text = (text or "").strip()
+    if text.lower() in _PLACEHOLDER_VALUES:
+        return ""
+    return text
+
 
 def _maybe_json(text: str) -> Optional[Any]:
     """Parse ``text`` as JSON, returning None when it is not valid JSON."""
@@ -57,7 +72,7 @@ def _resolve_api_key(spec: ClawSpec) -> Optional[str]:
     credentials port (same shapes), then the ANTHROPIC_API_KEY env var.
     """
     for raw in (spec.api_keys, spec.credentials):
-        raw = (raw or "").strip()
+        raw = _clean_port(raw)
         if not raw:
             continue
         parsed = _maybe_json(raw)
@@ -78,13 +93,14 @@ def _resolve_model_params(spec: ClawSpec) -> Dict[str, Any]:
     {"model": "claude-opus-4-8", "max_tokens": 8192, "temperature": 0.7}.
     """
     params: Dict[str, Any] = {"model": DEFAULT_MODEL, "max_tokens": DEFAULT_MAX_TOKENS}
-    agent = (spec.agent or "").strip()
+    agent = _clean_port(spec.agent)
     if not agent:
         return params
     parsed = _maybe_json(agent)
     if isinstance(parsed, dict):
-        if parsed.get("model"):
-            params["model"] = str(parsed["model"])
+        model = _clean_port(str(parsed.get("model", "")))
+        if model:
+            params["model"] = model
         if isinstance(parsed.get("max_tokens"), int):
             params["max_tokens"] = parsed["max_tokens"]
         if isinstance(parsed.get("temperature"), (int, float)):
@@ -97,13 +113,15 @@ def _resolve_model_params(spec: ClawSpec) -> Dict[str, Any]:
 def _build_system_prompt(spec: ClawSpec) -> str:
     """Assemble the claw's standing instructions from soul + skills + tools_config."""
     parts = []
-    soul = (spec.soul or "").strip()
+    soul = _clean_port(spec.soul)
     parts.append(soul if soul else "You are a helpful AI agent (a Grafux claw).")
-    if spec.skills.strip():
-        parts.append("Your skills and capabilities:\n" + spec.skills.strip())
-    if spec.tools_config.strip():
-        parts.append("Tool / environment configuration:\n" + spec.tools_config.strip())
-    if spec.credentials.strip():
+    skills = _clean_port(spec.skills)
+    if skills:
+        parts.append("Your skills and capabilities:\n" + skills)
+    tools_config = _clean_port(spec.tools_config)
+    if tools_config:
+        parts.append("Tool / environment configuration:\n" + tools_config)
+    if _clean_port(spec.credentials):
         # Credentials are provided so the claw is *aware* it has access; we do not
         # dump raw secret blobs into the prompt beyond what the user supplied.
         parts.append("You have been provisioned with credentials needed for your tasks.")
@@ -111,8 +129,8 @@ def _build_system_prompt(spec: ClawSpec) -> str:
 
 
 def _build_user_turn(task: str, memory: str) -> str:
-    task = (task or "").strip()
-    memory = (memory or "").strip()
+    task = _clean_port(task)
+    memory = _clean_port(memory)
     if memory:
         return f"Relevant prior context (memory):\n{memory}\n\n---\n\nTask:\n{task}"
     return task or "Introduce yourself and describe what you can do."
