@@ -46,6 +46,7 @@ class RunRequest(BaseModel):
 
     task: str = Field("", description="The task / instruction to run the claw against.")
     memory: str = Field("", description="Prior context prepended to the task.")
+    text_message: str = Field("", description="A free-text message the user sends to the claw on this run.")
 
 
 class RunResponse(BaseModel):

@@ -78,7 +78,7 @@ async def run_claw(claw_id: str, body: RunRequest) -> RunResponse:
     spec = registry.get(claw_id)
     if spec is None:
         raise HTTPException(status_code=404, detail=f"No claw with id '{claw_id}'")
-    result = await claw_runtime.run_claw(spec, body.task, body.memory)
+    result = await claw_runtime.run_claw(spec, body.task, body.memory, body.text_message)
     return RunResponse(claw_id=claw_id, **result)
 
 

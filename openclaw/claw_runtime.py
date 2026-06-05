@@ -128,19 +128,25 @@ def _build_system_prompt(spec: ClawSpec) -> str:
     return "\n\n".join(parts)
 
 
-def _build_user_turn(task: str, memory: str) -> str:
+def _build_user_turn(task: str, memory: str, text_message: str = "") -> str:
     task = _clean_port(task)
     memory = _clean_port(memory)
+    text_message = _clean_port(text_message)
+    parts = []
     if memory:
-        return f"Relevant prior context (memory):\n{memory}\n\n---\n\nTask:\n{task}"
-    return task or "Introduce yourself and describe what you can do."
+        parts.append(f"Relevant prior context (memory):\n{memory}")
+    if task:
+        parts.append(f"Task:\n{task}")
+    if text_message:
+        parts.append(f"Message:\n{text_message}")
+    return "\n\n---\n\n".join(parts) or "Introduce yourself and describe what you can do."
 
 
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 
-async def run_claw(spec: ClawSpec, task: str, memory: str = "") -> Dict[str, str]:
+async def run_claw(spec: ClawSpec, task: str, memory: str = "", text_message: str = "") -> Dict[str, str]:
     """
     Execute the claw described by ``spec`` against ``task`` and return a result dict
     with keys: status ("ok"|"error"), response, errors.
@@ -166,7 +172,7 @@ async def run_claw(spec: ClawSpec, task: str, memory: str = "") -> Dict[str, str
 
     params = _resolve_model_params(spec)
     system_prompt = _build_system_prompt(spec)
-    user_turn = _build_user_turn(task, memory)
+    user_turn = _build_user_turn(task, memory, text_message)
 
     client = AsyncAnthropic(api_key=api_key)
     try:
