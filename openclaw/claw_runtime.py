@@ -24,8 +24,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+from . import connections
 from .models import ClawSpec
 
 logger = logging.getLogger("openclaw.runtime")
@@ -110,7 +111,7 @@ def _resolve_model_params(spec: ClawSpec) -> Dict[str, Any]:
     return params
 
 
-def _build_system_prompt(spec: ClawSpec) -> str:
+def _build_system_prompt(spec: ClawSpec, from_channel: bool = False) -> str:
     """Assemble the claw's standing instructions from soul + skills + tools_config."""
     parts = []
     soul = _clean_port(spec.soul)
@@ -121,6 +122,20 @@ def _build_system_prompt(spec: ClawSpec) -> str:
     tools_config = _clean_port(spec.tools_config)
     if tools_config:
         parts.append("Tool / environment configuration:\n" + tools_config)
+    connected = connections.describe_connections(spec)
+    if connected:
+        # The claw has real tools for these apps via the MCP connector — tell it so.
+        parts.append(
+            "Connected apps you can act on with tools: " + connected + ".\n"
+            "Use the available tools to take real actions (send messages, post, read) "
+            "when the task requires it."
+        )
+    if from_channel:
+        parts.append(
+            "You are replying inside a live chat. Your text response is delivered to the "
+            "user automatically — write it as the reply itself. Use tools only for "
+            "additional side effects, not to send your own reply."
+        )
     if _clean_port(spec.credentials):
         # Credentials are provided so the claw is *aware* it has access; we do not
         # dump raw secret blobs into the prompt beyond what the user supplied.
@@ -146,10 +161,21 @@ def _build_user_turn(task: str, memory: str, text_message: str = "") -> str:
 # Run
 # ---------------------------------------------------------------------------
 
-async def run_claw(spec: ClawSpec, task: str, memory: str = "", text_message: str = "") -> Dict[str, str]:
+async def run_claw(
+    spec: ClawSpec,
+    task: str,
+    memory: str = "",
+    text_message: str = "",
+    from_channel: bool = False,
+) -> Dict[str, str]:
     """
     Execute the claw described by ``spec`` against ``task`` and return a result dict
     with keys: status ("ok"|"error"), response, errors.
+
+    When the claw has enabled app connections, their Composio-hosted MCP servers are
+    passed to Anthropic's remote-MCP connector so the claw can take real actions.
+    With no connections the call is identical to before (plain Messages request).
+    ``from_channel`` tweaks the system prompt for inbound chat replies.
     """
     try:
         from anthropic import AsyncAnthropic  # lazy import — see module docstring
@@ -171,25 +197,37 @@ async def run_claw(spec: ClawSpec, task: str, memory: str = "", text_message: st
         }
 
     params = _resolve_model_params(spec)
-    system_prompt = _build_system_prompt(spec)
+    system_prompt = _build_system_prompt(spec, from_channel=from_channel)
     user_turn = _build_user_turn(task, memory, text_message)
+    mcp_servers = connections.build_mcp_servers(spec)
 
     client = AsyncAnthropic(api_key=api_key)
+    request_kwargs: Dict[str, Any] = dict(
+        model=params["model"],
+        max_tokens=params["max_tokens"],
+        temperature=params.get("temperature", 1.0),
+        system=[
+            {
+                "type": "text",
+                "text": system_prompt,
+                # Cache the stable persona so repeated runs are cheap/fast.
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        messages=[{"role": "user", "content": user_turn}],
+    )
+
     try:
-        message = await client.messages.create(
-            model=params["model"],
-            max_tokens=params["max_tokens"],
-            temperature=params.get("temperature", 1.0),
-            system=[
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    # Cache the stable persona so repeated runs are cheap/fast.
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_turn}],
-        )
+        if mcp_servers:
+            # Remote-MCP connector: Claude calls the Composio app tools server-side,
+            # so a single round-trip still yields the final text (no local loop).
+            message = await client.beta.messages.create(
+                betas=[connections.MCP_CONNECTOR_BETA],
+                mcp_servers=mcp_servers,
+                **request_kwargs,
+            )
+        else:
+            message = await client.messages.create(**request_kwargs)
     except Exception as exc:  # noqa: BLE001 — surface any SDK/API error to the block
         logger.exception("claw run failed")
         return {"status": "error", "response": "", "errors": str(exc)}
@@ -210,7 +248,7 @@ _API_KEYS_HINT = "<your-anthropic-api-key>"
 
 # Keys the scaffold returns to the dialog.  Secret keys are appended last and are
 # always overwritten with the placeholder hints below.
-_DESIGN_KEYS = ("soul", "skills", "agent", "task", "memory", "tools_config")
+_DESIGN_KEYS = ("soul", "skills", "agent", "task", "memory", "tools_config", "connections")
 
 _SCAFFOLD_SYSTEM = (
     "You design 'claws' — small AI agents — for the Grafux platform. Given a short "
@@ -224,6 +262,10 @@ _SCAFFOLD_SYSTEM = (
     '  "task"         — a concrete example task the claw would perform.\n'
     '  "memory"       — initial context worth remembering, or "" if none.\n'
     '  "tools_config" — tool/MCP configuration notes, or "" if none.\n'
+    '  "connections"  — a JSON array of apps the claw should connect to (Telegram, '
+    'WhatsApp, Slack, Gmail, …) inferred from the description, e.g. '
+    '[{"app":"telegram","enabled":true}]. Use "[]" if none are implied. NEVER include '
+    "tokens or connection ids — those are added later via OAuth.\n"
     "Do NOT include API keys, credentials, or secrets in any field."
 )
 
@@ -287,7 +329,14 @@ async def scaffold_claw(description: str, name: str = "") -> Dict[str, str]:
         return _scaffold_fallback()
 
     # Keep only the design keys we asked for; default agent to a model id.
-    out = {k: str(parsed.get(k, "") or "") for k in _DESIGN_KEYS}
+    out = {}
+    for k in _DESIGN_KEYS:
+        val = parsed.get(k, "") or ""
+        # ``connections`` is a structured array — serialise it as JSON, not a Python
+        # repr, so the port stores valid JSON the runtime can re-parse.
+        if k == "connections" and isinstance(val, (list, dict)):
+            val = json.dumps(val)
+        out[k] = str(val)
     if not out["agent"].strip():
         out["agent"] = DEFAULT_MODEL
     # Secrets are ALWAYS placeholders, regardless of what the model returned.
