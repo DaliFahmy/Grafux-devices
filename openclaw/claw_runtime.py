@@ -200,6 +200,7 @@ async def run_claw(
     system_prompt = _build_system_prompt(spec, from_channel=from_channel)
     user_turn = _build_user_turn(task, memory, text_message)
     mcp_servers = connections.build_mcp_servers(spec)
+    local_conns = connections.local_loop_connections(spec)
 
     client = AsyncAnthropic(api_key=api_key)
     request_kwargs: Dict[str, Any] = dict(
@@ -218,6 +219,15 @@ async def run_claw(
     )
 
     try:
+        if local_conns:
+            # Header-authenticated servers (e.g. Composio's Connect/Tool-Router URL) can't
+            # use Anthropic's connector — we run them via a local MCP client loop that sends
+            # the x-consumer-api-key header. Any bearer/self-auth connector servers ride
+            # along on the same calls so a mixed claw still works.
+            text = await connections.run_local_agent_loop(
+                client, request_kwargs, spec, connector_servers=mcp_servers
+            )
+            return {"status": "ok", "response": text, "errors": ""}
         if mcp_servers:
             # Remote-MCP connector: Claude calls the Composio app tools server-side,
             # so a single round-trip still yields the final text (no local loop).

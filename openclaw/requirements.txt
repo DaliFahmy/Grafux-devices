@@ -6,3 +6,7 @@ anthropic>=0.69
 # httpx powers the Composio REST calls in connections.py (OAuth, send-message). It
 # is not a runtime dependency of the base devices server, so it is pinned here.
 httpx>=0.23
+# mcp (Model Context Protocol SDK) drives header-authenticated MCP servers via the local
+# tool loop in connections.run_local_agent_loop — for Composio's Connect/Tool-Router URL
+# (x-consumer-api-key), which Anthropic's bearer-only connector cannot authenticate to.
+mcp>=1.0.0

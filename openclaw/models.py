@@ -38,8 +38,10 @@ class ClawSpec(BaseModel):
         description=(
             "Connected applications (Telegram, WhatsApp, Slack, …) as a JSON list of "
             "connection objects: [{\"app\", \"connection_id\", \"account_label\", "
-            "\"enabled\", \"channel\", \"mcp_url\"}]. Parsed at run time to give the "
-            "claw real tools via Composio's hosted MCP servers."
+            "\"enabled\", \"channel\", \"mcp_url\", \"header_auth\", \"api_key\"}]. Parsed at "
+            "run time to give the claw real tools via Composio's hosted MCP servers — through "
+            "Anthropic's connector (bearer auth) or, when header_auth is set, a local MCP loop "
+            "that authenticates with the x-consumer-api-key header."
         ),
     )
     channel: str = Field(
@@ -73,6 +75,24 @@ class ClawConnection(BaseModel):
     auth_token: str = Field(
         "",
         description="Optional OAuth bearer token for the MCP server (sent as Authorization: Bearer).",
+    )
+    header_auth: bool = Field(
+        False,
+        description=(
+            "When True, the claw does NOT hand this server's URL to Anthropic's MCP connector "
+            "(which can only send an OAuth bearer). Instead it connects to the server itself via "
+            "a local MCP client loop and authenticates with the 'x-consumer-api-key' header — "
+            "required for Composio's Connect / Tool-Router URL "
+            "(https://connect.composio.dev/mcp). Default False keeps the original connector path."
+        ),
+    )
+    api_key: str = Field(
+        "",
+        description=(
+            "Composio API key sent as 'x-consumer-api-key' when header_auth is True. When empty, "
+            "the claw falls back to the Composio key resolved from its api_keys/credentials ports "
+            "or the COMPOSIO_API_KEY env var, so the secret can live in api_keys rather than here."
+        ),
     )
     connection_id: str = Field("", description="Composio connected-account id (used for inbound replies).")
     account_label: str = Field("", description="Human-friendly label for the connected account.")

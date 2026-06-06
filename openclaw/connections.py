@@ -146,6 +146,11 @@ def build_mcp_servers(spec: ClawSpec) -> List[Dict[str, Any]]:
     for i, conn in enumerate(parse_connections(spec)):
         if not conn.enabled:
             continue
+        if conn.header_auth:
+            # Header-authenticated servers (e.g. Composio's Connect/Tool-Router URL) cannot
+            # go through Anthropic's connector — it only sends a bearer, never a custom
+            # header. They are handled by the local MCP loop instead (run_local_agent_loop).
+            continue
         url = _mcp_url_for(conn)
         if not url:
             continue
@@ -178,6 +183,201 @@ def describe_connections(spec: ClawSpec) -> str:
         _clean_port(c.app) for c in parse_connections(spec) if c.enabled and _clean_port(c.app)
     ]
     return ", ".join(dict.fromkeys(apps))  # de-dupe, preserve order
+
+
+# ---------------------------------------------------------------------------
+# Local MCP loop — header-authenticated servers (Composio Connect / Tool-Router)
+#
+# Anthropic's remote-MCP connector can only send an OAuth bearer (authorization_token),
+# never a custom header, so it cannot reach a Composio server that wants
+# ``x-consumer-api-key``.  For those connections (``header_auth: true``) we act as the
+# MCP client ourselves — connect over the MCP SDK's Streamable-HTTP (or SSE) transport
+# with the api-key header, expose the server's tools to Claude as ordinary tools, and
+# run a normal tool-use loop, executing each call against the MCP server.
+# ---------------------------------------------------------------------------
+
+# Composio's Connect/Tool-Router MCP servers authenticate with this header.
+COMPOSIO_API_KEY_HEADER = "x-consumer-api-key"
+
+# Guard so a tool that keeps asking for more tools cannot loop forever.
+_MAX_TOOL_ITERATIONS = 8
+
+
+def local_loop_connections(spec: ClawSpec) -> List[ClawConnection]:
+    """Enabled connections that must be driven by the local MCP loop (header_auth)."""
+    return [
+        c
+        for c in parse_connections(spec)
+        if c.enabled and c.header_auth and _mcp_url_for(c)
+    ]
+
+
+def _header_key_for(conn: ClawConnection, spec: ClawSpec) -> str:
+    """The ``x-consumer-api-key`` value: the connection's own key, else the claw's Composio key."""
+    explicit = _clean_port(conn.api_key)
+    return explicit or (resolve_composio_key(spec) or "")
+
+
+def _sanitize_tool_name(name: str) -> str:
+    """Coerce an MCP tool name into Anthropic's ``^[a-zA-Z0-9_-]{1,128}$`` constraint."""
+    cleaned = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in (name or ""))
+    cleaned = cleaned.strip("_") or "tool"
+    return cleaned[:128]
+
+
+def _tool_result_text(result: Any) -> str:
+    """Flatten an MCP ``call_tool`` result's content blocks into text for a tool_result."""
+    parts: List[str] = []
+    for block in getattr(result, "content", None) or []:
+        text = getattr(block, "text", None)
+        parts.append(text if text is not None else str(block))
+    return "\n".join(parts)
+
+
+def _extract_text(message: Any) -> str:
+    """Join the text blocks of an Anthropic message (mirrors claw_runtime's extraction)."""
+    return "".join(
+        b.text for b in getattr(message, "content", []) if getattr(b, "type", None) == "text"
+    )
+
+
+async def run_local_agent_loop(
+    client: Any,
+    base_kwargs: Dict[str, Any],
+    spec: ClawSpec,
+    connector_servers: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    Run a tool-use loop against the claw's header-authenticated MCP servers and return
+    the final assistant text.
+
+    ``base_kwargs`` is the same dict claw_runtime builds for ``messages.create`` (model,
+    max_tokens, temperature, system, messages).  ``connector_servers`` (the bearer/self-auth
+    servers from ``build_mcp_servers``) are passed through on the same call so a claw that
+    mixes both connection styles still works; those tools resolve server-side and never
+    surface as local ``tool_use`` blocks.
+
+    Raises RuntimeError with a friendly message when the ``mcp`` SDK is not installed.
+    """
+    try:
+        from contextlib import AsyncExitStack
+
+        from mcp import ClientSession
+        from mcp.client.sse import sse_client
+        from mcp.client.streamable_http import streamablehttp_client
+    except ImportError as exc:  # noqa: F841
+        raise RuntimeError(
+            "Header-authenticated connections need the 'mcp' package on the devices server. "
+            "Add 'mcp>=1.0.0' to requirements.txt (pip install mcp)."
+        ) from exc
+
+    conns = local_loop_connections(spec)
+    connector_servers = connector_servers or []
+
+    # dispatch maps the (sanitized, unique) tool name we expose to Claude back to the
+    # owning MCP session and the tool's real name on that server.
+    dispatch: Dict[str, Any] = {}
+    tool_defs: List[Dict[str, Any]] = []
+
+    async with AsyncExitStack() as stack:
+        for i, conn in enumerate(conns):
+            url = _mcp_url_for(conn)
+            key = _header_key_for(conn, spec)
+            headers = {COMPOSIO_API_KEY_HEADER: key} if key else None
+
+            # Streamable-HTTP is Composio's transport; fall back to SSE for ``…/sse`` URLs.
+            if url.rstrip("/").endswith("/sse"):
+                transport_ctx = sse_client(url, headers=headers)
+            else:
+                transport_ctx = streamablehttp_client(url, headers=headers)
+            streams = await stack.enter_async_context(transport_ctx)
+            # streamable_http yields (read, write, get_session_id); sse yields (read, write).
+            read, write = streams[0], streams[1]
+            session = await stack.enter_async_context(ClientSession(read, write))
+            await session.initialize()
+
+            prefix = _server_name_for(conn, i)
+            listed = await session.list_tools()
+            for tool in listed.tools:
+                # Prefix when there is more than one server so names stay unique.
+                raw = f"{prefix}__{tool.name}" if len(conns) > 1 else tool.name
+                exposed = _sanitize_tool_name(raw)
+                dispatch[exposed] = (session, tool.name)
+                schema = tool.inputSchema if isinstance(tool.inputSchema, dict) else None
+                tool_defs.append(
+                    {
+                        "name": exposed,
+                        "description": tool.description or "",
+                        "input_schema": schema or {"type": "object", "properties": {}},
+                    }
+                )
+
+        messages = list(base_kwargs.get("messages", []))
+        loop_kwargs = {k: v for k, v in base_kwargs.items() if k != "messages"}
+        use_connector = bool(connector_servers)
+
+        last_message: Any = None
+        for _ in range(_MAX_TOOL_ITERATIONS):
+            if use_connector:
+                last_message = await client.beta.messages.create(
+                    betas=[MCP_CONNECTOR_BETA],
+                    mcp_servers=connector_servers,
+                    tools=build_mcp_toolsets(connector_servers) + tool_defs,
+                    messages=messages,
+                    **loop_kwargs,
+                )
+            else:
+                last_message = await client.messages.create(
+                    tools=tool_defs, messages=messages, **loop_kwargs
+                )
+
+            tool_uses = [
+                b for b in last_message.content if getattr(b, "type", None) == "tool_use"
+            ]
+            if last_message.stop_reason != "tool_use" or not tool_uses:
+                return _extract_text(last_message)
+
+            # Echo the assistant turn back verbatim (preserves connector blocks too).
+            messages.append({"role": "assistant", "content": last_message.content})
+            tool_results: List[Dict[str, Any]] = []
+            for tu in tool_uses:
+                session_real = dispatch.get(tu.name)
+                if session_real is None:
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "is_error": True,
+                            "content": f"Unknown tool: {tu.name}",
+                        }
+                    )
+                    continue
+                session, real_name = session_real
+                try:
+                    result = await session.call_tool(real_name, tu.input or {})
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "is_error": bool(getattr(result, "isError", False)),
+                            "content": _tool_result_text(result) or "(no output)",
+                        }
+                    )
+                except Exception as exc:  # noqa: BLE001 — report the failure to the model
+                    logger.warning("local MCP tool %s failed: %s", tu.name, exc)
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "is_error": True,
+                            "content": f"Tool {tu.name} failed: {exc}",
+                        }
+                    )
+            messages.append({"role": "user", "content": tool_results})
+
+        # Ran out of iterations — return whatever text the last turn produced.
+        logger.warning("local MCP loop hit the %d-iteration cap", _MAX_TOOL_ITERATIONS)
+        return _extract_text(last_message)
 
 
 # ---------------------------------------------------------------------------

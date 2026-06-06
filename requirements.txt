@@ -7,3 +7,7 @@ anthropic>=0.69
 # httpx powers the Composio REST calls in openclaw/connections.py. It is not pulled
 # in transitively by the base server, so it is pinned here (Render installs this file).
 httpx>=0.23
+# mcp is the Model Context Protocol SDK used by openclaw/connections.run_local_agent_loop
+# to drive header-authenticated MCP servers (Composio Connect/Tool-Router, x-consumer-api-key)
+# that Anthropic's bearer-only connector cannot reach.
+mcp>=1.0.0
