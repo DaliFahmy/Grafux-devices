@@ -32,12 +32,11 @@ logger = logging.getLogger("openclaw.connections")
 
 # Composio endpoints (kept identical to the Grafux-mcp integration).
 _COMPOSIO_BACKEND = "https://backend.composio.dev"
-# Base for Composio's hosted MCP servers; an explicit per-connection ``mcp_url``
-# always wins over anything derived from this base.
-_COMPOSIO_MCP_BASE = os.environ.get("COMPOSIO_MCP_BASE", "https://mcp.composio.dev")
 
 # Anthropic beta flag that enables the remote-MCP connector on the Messages API.
-MCP_CONNECTOR_BETA = "mcp-client-2025-04-04"
+# (mcp-client-2025-04-04 is deprecated; 2025-11-20 requires a matching mcp_toolset
+# entry in the tools array for every server — see claw_runtime.run_claw.)
+MCP_CONNECTOR_BETA = "mcp-client-2025-11-20"
 
 _PLACEHOLDER_VALUES = {"empty", "unconnected"}
 
@@ -112,43 +111,65 @@ def _mcp_url_for(conn: ClawConnection) -> str:
     """
     Resolve the Composio MCP server URL for a connection.
 
-    An explicit ``mcp_url`` on the connection is authoritative (the UI stores the
-    URL Composio returns when the MCP server is created).  Otherwise we derive a
-    best-effort URL from the connection id against the configured MCP base.
+    The connection's ``mcp_url`` (the URL Composio gives when you create an MCP
+    server, e.g. ``https://backend.composio.dev/v3/mcp/<server_id>``) is required —
+    Anthropic's connector connects to it directly.  When a ``user_id`` is set it is
+    appended as a query param so Composio selects that user's connected accounts.
     """
-    if _clean_port(conn.mcp_url):
-        return conn.mcp_url.strip()
-    cid = _clean_port(conn.connection_id)
-    if not cid:
+    url = _clean_port(conn.mcp_url)
+    if not url:
         return ""
-    return f"{_COMPOSIO_MCP_BASE}/v3/mcp/{cid}"
+    user_id = _clean_port(conn.user_id)
+    if user_id and "user_id=" not in url:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}user_id={user_id}"
+    return url
+
+
+def _server_name_for(conn: ClawConnection, index: int) -> str:
+    base = (_clean_port(conn.app) or f"app{index}").replace(" ", "_")
+    return f"{base}_{index}"  # unique per server (Anthropic requires unique names)
 
 
 def build_mcp_servers(spec: ClawSpec) -> List[Dict[str, Any]]:
     """
     Build the ``mcp_servers`` array for Anthropic's remote-MCP connector from the
-    claw's enabled connections.  Returns ``[]`` when there are no usable
-    connections or no Composio key (the runtime then falls back to a plain call).
+    claw's enabled connections.  Returns ``[]`` when no connection carries an
+    ``mcp_url`` (the runtime then falls back to a plain call).
+
+    Note: the Composio MCP server must be self-authenticating (api-key requirement
+    disabled) because Anthropic's connector can only send an OAuth bearer via
+    ``authorization_token`` — it cannot send Composio's ``x-api-key`` header. We set
+    ``authorization_token`` only when the connection provides an explicit bearer.
     """
-    key = resolve_composio_key(spec)
-    if not key:
-        return []
     servers: List[Dict[str, Any]] = []
-    for conn in parse_connections(spec):
+    for i, conn in enumerate(parse_connections(spec)):
         if not conn.enabled:
             continue
         url = _mcp_url_for(conn)
         if not url:
             continue
-        servers.append(
-            {
-                "type": "url",
-                "url": url,
-                "name": (_clean_port(conn.app) or "app").replace(" ", "_"),
-                "authorization_token": key,
-            }
-        )
+        entry: Dict[str, Any] = {
+            "type": "url",
+            "url": url,
+            "name": _server_name_for(conn, i),
+        }
+        token = _clean_port(conn.auth_token)
+        if token:
+            entry["authorization_token"] = token
+        servers.append(entry)
     return servers
+
+
+def build_mcp_toolsets(servers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build the matching ``tools`` array (one ``mcp_toolset`` per server).
+
+    The 2025-11-20 connector requires every entry in ``mcp_servers`` to be referenced
+    by exactly one toolset; with no per-tool config this enables all of the server's
+    tools.
+    """
+    return [{"type": "mcp_toolset", "mcp_server_name": s["name"]} for s in servers]
 
 
 def describe_connections(spec: ClawSpec) -> str:

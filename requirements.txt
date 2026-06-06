@@ -1,4 +1,9 @@
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 websockets>=12.0
-anthropic>=0.40
+# anthropic >= 0.69 is required for the remote-MCP connector used by claws
+# (client.beta.messages with mcp_servers + the "mcp-client-2025-11-20" beta).
+anthropic>=0.69
+# httpx powers the Composio REST calls in openclaw/connections.py. It is not pulled
+# in transitively by the base server, so it is pinned here (Render installs this file).
+httpx>=0.23

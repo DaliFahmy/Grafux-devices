@@ -57,11 +57,27 @@ class ClawConnection(BaseModel):
     """A single external-app connection wired to a claw (one entry of ``connections``)."""
 
     app: str = Field("", description="App / toolkit name, e.g. 'telegram', 'whatsapp', 'slack'.")
-    connection_id: str = Field("", description="Composio connected-account id for this app.")
+    mcp_url: str = Field(
+        "",
+        description=(
+            "The Composio MCP server URL for this app, e.g. "
+            "'https://backend.composio.dev/v3/mcp/<server_id>'. This is the primary field — the "
+            "claw passes it to Anthropic's MCP connector to gain real tools. The Composio server "
+            "should have its api-key requirement disabled so the URL is self-authenticating."
+        ),
+    )
+    user_id: str = Field(
+        "",
+        description="Composio user id appended to the MCP URL (?user_id=…) to select connected accounts.",
+    )
+    auth_token: str = Field(
+        "",
+        description="Optional OAuth bearer token for the MCP server (sent as Authorization: Bearer).",
+    )
+    connection_id: str = Field("", description="Composio connected-account id (used for inbound replies).")
     account_label: str = Field("", description="Human-friendly label for the connected account.")
     enabled: bool = Field(True, description="Whether the claw may use this connection's tools.")
     channel: bool = Field(False, description="True if this connection is the inbound messaging channel.")
-    mcp_url: str = Field("", description="Explicit Composio MCP server URL override (optional).")
 
 
 class CreateClawResponse(BaseModel):

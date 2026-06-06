@@ -18,3 +18,8 @@ services:
       # sync:false => set the secret value in the Render dashboard, not in the repo.
       - key: ANTHROPIC_API_KEY
         sync: false
+      # Composio key — used by the claw connections REST calls (list / send-message
+      # actions). The MCP server URL itself is self-authenticating, so this is only
+      # needed for the inbound-reply / management paths. Set it in the dashboard.
+      - key: COMPOSIO_API_KEY
+        sync: false

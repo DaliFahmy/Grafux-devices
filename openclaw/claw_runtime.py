@@ -221,9 +221,11 @@ async def run_claw(
         if mcp_servers:
             # Remote-MCP connector: Claude calls the Composio app tools server-side,
             # so a single round-trip still yields the final text (no local loop).
+            # The 2025-11-20 connector requires a matching mcp_toolset per server.
             message = await client.beta.messages.create(
                 betas=[connections.MCP_CONNECTOR_BETA],
                 mcp_servers=mcp_servers,
+                tools=connections.build_mcp_toolsets(mcp_servers),
                 **request_kwargs,
             )
         else:

@@ -1,8 +1,8 @@
 # OpenClaw runtime dependencies (in addition to the devices-server requirements).
-# anthropic >= 0.49 is required for the remote-MCP connector (client.beta.messages
-# with the mcp_servers param + the "mcp-client-2025-04-04" beta) used to give a
-# claw real tools on its connected apps.
-anthropic>=0.49
+# anthropic >= 0.69 is required for the remote-MCP connector (client.beta.messages
+# with the mcp_servers + tools params and the "mcp-client-2025-11-20" beta) used to
+# give a claw real tools on its connected apps.
+anthropic>=0.69
 # httpx powers the Composio REST calls in connections.py (OAuth, send-message). It
 # is not a runtime dependency of the base devices server, so it is pinned here.
 httpx>=0.23
