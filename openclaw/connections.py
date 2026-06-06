@@ -283,7 +283,16 @@ async def run_local_agent_loop(
         for i, conn in enumerate(conns):
             url = _mcp_url_for(conn)
             key = _header_key_for(conn, spec)
-            headers = {COMPOSIO_API_KEY_HEADER: key} if key else None
+            if not key:
+                # Without a key we would send no auth header and Composio answers an
+                # opaque 401 — fail fast with an actionable message instead.
+                raise RuntimeError(
+                    "No Composio API key found for header-auth connection "
+                    f"'{_clean_port(conn.app) or url}'. Set COMPOSIO_API_KEY on the devices "
+                    'server, add {"composio": "<key>"} to the claw\'s api_keys port, or set '
+                    "the connection's api_key field."
+                )
+            headers = {COMPOSIO_API_KEY_HEADER: key}
 
             # Streamable-HTTP is Composio's transport; fall back to SSE for ``…/sse`` URLs.
             if url.rstrip("/").endswith("/sse"):
