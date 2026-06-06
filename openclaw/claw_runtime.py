@@ -161,6 +161,32 @@ def _build_user_turn(task: str, memory: str, text_message: str = "") -> str:
 # Run
 # ---------------------------------------------------------------------------
 
+def _describe_exception(exc: BaseException) -> str:
+    """
+    Render an exception for the ``errors`` port, unwrapping ExceptionGroups.
+
+    The ``mcp`` SDK runs over anyio task groups, so a failed MCP handshake/tool call
+    surfaces as an ExceptionGroup whose ``str()`` is the useless "unhandled errors in a
+    TaskGroup (N sub-exceptions)". We recurse into ``.exceptions`` and join the real
+    leaf errors so the actual cause (401, 404, connection refused, …) is visible.
+    """
+    leaves: List[str] = []
+
+    def walk(e: BaseException) -> None:
+        sub = getattr(e, "exceptions", None)
+        if sub:
+            for child in sub:
+                walk(child)
+        else:
+            leaves.append(f"{type(e).__name__}: {e}".strip())
+
+    walk(exc)
+    # No sub-exceptions (plain error) → just its own message.
+    if len(leaves) == 1 and not getattr(exc, "exceptions", None):
+        return str(exc) or type(exc).__name__
+    return " | ".join(dict.fromkeys(leaves)) or (str(exc) or type(exc).__name__)
+
+
 async def run_claw(
     spec: ClawSpec,
     task: str,
@@ -242,7 +268,7 @@ async def run_claw(
             message = await client.messages.create(**request_kwargs)
     except Exception as exc:  # noqa: BLE001 — surface any SDK/API error to the block
         logger.exception("claw run failed")
-        return {"status": "error", "response": "", "errors": str(exc)}
+        return {"status": "error", "response": "", "errors": _describe_exception(exc)}
 
     text = "".join(
         block.text for block in message.content if getattr(block, "type", None) == "text"
