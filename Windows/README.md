@@ -22,7 +22,7 @@ pip install -r requirements.txt
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AGENT_HOST` | Yes | WebSocket URL of the devices server, e.g. `wss://devices-agent-server.onrender.com` |
+| `AGENT_HOST` | Yes | WebSocket URL of the devices server, e.g. `wss://grafux.onrender.com` |
 | `DEVICE_ID` | Yes | Unique identifier for this Windows machine, e.g. `win-001` |
 | `AGENT_TOKEN` | Yes | Shared secret — must match the server's `AGENT_TOKEN` |
 | `AWS_ACCESS_KEY_ID` | For S3 | AWS credentials for downloading code files |
@@ -34,7 +34,7 @@ pip install -r requirements.txt
 Create a `.env` file or set them in PowerShell:
 
 ```powershell
-$env:AGENT_HOST     = "wss://devices-agent-server.onrender.com"
+$env:AGENT_HOST     = "wss://grafux.onrender.com"
 $env:DEVICE_ID      = "win-001"
 $env:AGENT_TOKEN    = "YOUR_AGENT_TOKEN"
 $env:AWS_ACCESS_KEY_ID     = "AKIA..."
@@ -53,7 +53,7 @@ Or with explicit flags:
 
 ```powershell
 python agent.py `
-  --host wss://devices-agent-server.onrender.com `
+  --host wss://grafux.onrender.com `
   --device-id win-001 `
   --token YOUR_AGENT_TOKEN
 ```
@@ -191,9 +191,9 @@ Open an elevated (Administrator) PowerShell:
 ```powershell
 nssm install GrafuxWindowsAgent python.exe
 nssm set GrafuxWindowsAgent AppDirectory "C:\path\to\windows"
-nssm set GrafuxWindowsAgent AppParameters "agent.py --host wss://devices-agent-server.onrender.com --device-id win-001 --token YOUR_TOKEN"
+nssm set GrafuxWindowsAgent AppParameters "agent.py --host wss://grafux.onrender.com --device-id win-001 --token YOUR_TOKEN"
 nssm set GrafuxWindowsAgent AppEnvironmentExtra `
-  "AGENT_HOST=wss://devices-agent-server.onrender.com" `
+  "AGENT_HOST=wss://grafux.onrender.com" `
   "DEVICE_ID=win-001" `
   "AGENT_TOKEN=YOUR_TOKEN" `
   "AWS_ACCESS_KEY_ID=AKIA..." `
@@ -225,29 +225,29 @@ nssm remove  GrafuxWindowsAgent confirm
 ```powershell
 # Ping the agent
 Invoke-RestMethod -Method POST `
-  -Uri "https://devices-agent-server.onrender.com/devices/win-001/ping"
+  -Uri "https://grafux.onrender.com/devices/win-001/ping"
 
 # Capture a camera image
 Invoke-RestMethod -Method POST `
-  -Uri "https://devices-agent-server.onrender.com/devices/win-001/command" `
+  -Uri "https://grafux.onrender.com/devices/win-001/command" `
   -ContentType "application/json" `
   -Body '{"type":"capture_image","payload":{"camera_index":0,"quality":90}}'
 
 # Take a screenshot
 Invoke-RestMethod -Method POST `
-  -Uri "https://devices-agent-server.onrender.com/devices/win-001/command" `
+  -Uri "https://grafux.onrender.com/devices/win-001/command" `
   -ContentType "application/json" `
   -Body '{"type":"screenshot","payload":{}}'
 
 # Get system info
 Invoke-RestMethod -Method POST `
-  -Uri "https://devices-agent-server.onrender.com/devices/win-001/command" `
+  -Uri "https://grafux.onrender.com/devices/win-001/command" `
   -ContentType "application/json" `
   -Body '{"type":"get_system_info","payload":{}}'
 
 # Run a PowerShell snippet
 Invoke-RestMethod -Method POST `
-  -Uri "https://devices-agent-server.onrender.com/devices/win-001/command" `
+  -Uri "https://grafux.onrender.com/devices/win-001/command" `
   -ContentType "application/json" `
   -Body '{"type":"run_powershell","payload":{"script":"Get-Date"}}'
 ```

@@ -13,7 +13,7 @@ Run:
 You can also use environment variables instead of flags:
 
 ```bash
-export AGENT_HOST=wss://devices-agent-server.onrender.com
+export AGENT_HOST=wss://grafux.onrender.com
 export DEVICE_ID=pi-001
 export AGENT_TOKEN=YOUR_AGENT_TOKEN
 python client_example.py

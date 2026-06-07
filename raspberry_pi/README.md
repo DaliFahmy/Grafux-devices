@@ -20,7 +20,7 @@ pip install -r requirements.txt
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `AGENT_HOST` | Yes | WebSocket URL of the devices server, e.g. `wss://devices-agent-server.onrender.com` |
+| `AGENT_HOST` | Yes | WebSocket URL of the devices server, e.g. `wss://grafux.onrender.com` |
 | `DEVICE_ID` | Yes | Unique identifier for this Pi, e.g. `pi-001` |
 | `AGENT_TOKEN` | Yes | Shared secret — must match the server's `AGENT_TOKEN` |
 | `AWS_ACCESS_KEY_ID` | For S3 | AWS credentials for downloading code files |
@@ -32,7 +32,7 @@ pip install -r requirements.txt
 Create a `.env` file or export them in your shell:
 
 ```bash
-export AGENT_HOST=wss://devices-agent-server.onrender.com
+export AGENT_HOST=wss://grafux.onrender.com
 export DEVICE_ID=pi-001
 export AGENT_TOKEN=YOUR_AGENT_TOKEN
 export AWS_ACCESS_KEY_ID=AKIA...
@@ -51,7 +51,7 @@ Or with flags:
 
 ```bash
 python agent.py \
-  --host wss://devices-agent-server.onrender.com \
+  --host wss://grafux.onrender.com \
   --device-id pi-001 \
   --token YOUR_AGENT_TOKEN
 ```

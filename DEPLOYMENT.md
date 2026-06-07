@@ -64,7 +64,7 @@ In the Render dashboard, go to your service → **Environment**:
 
 ### Step 4 — Deploy
 
-Click **Deploy**. Render will build and start the service. Copy the public URL shown in the dashboard (e.g. `https://devices-agent-server.onrender.com`).
+Click **Deploy**. Render will build and start the service. Copy the public URL shown in the dashboard — the live production deployment is `https://grafux.onrender.com`.
 
 ---
 
@@ -80,7 +80,7 @@ pip install websockets
 
 ```bash
 python client_example.py \
-  --host wss://devices-agent-server.onrender.com \
+  --host wss://grafux.onrender.com \
   --device-id pi-001 \
   --token YOUR_AGENT_TOKEN
 ```
@@ -88,7 +88,7 @@ python client_example.py \
 You can also use environment variables instead of flags:
 
 ```bash
-export AGENT_HOST=wss://devices-agent-server.onrender.com
+export AGENT_HOST=wss://grafux.onrender.com
 export DEVICE_ID=pi-001
 export AGENT_TOKEN=YOUR_AGENT_TOKEN
 python client_example.py
@@ -105,7 +105,7 @@ All REST endpoints are available at your Render URL.
 ### List connected devices
 
 ```bash
-curl https://devices-agent-server.onrender.com/devices
+curl https://grafux.onrender.com/devices
 ```
 
 ```json
@@ -115,19 +115,19 @@ curl https://devices-agent-server.onrender.com/devices
 ### Ping a device
 
 ```bash
-curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/ping
+curl -X POST https://grafux.onrender.com/devices/pi-001/ping
 ```
 
 ### Get device status
 
 ```bash
-curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/status
+curl -X POST https://grafux.onrender.com/devices/pi-001/status
 ```
 
 ### Run Python code on a device
 
 ```bash
-curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/run_code \
+curl -X POST https://grafux.onrender.com/devices/pi-001/run_code \
      -H "Content-Type: application/json" \
      -d '{"code": "print(1 + 1)", "timeout": 10}'
 ```
@@ -135,7 +135,7 @@ curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/run_code \
 ### Run a shell command on a device
 
 ```bash
-curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/shell \
+curl -X POST https://grafux.onrender.com/devices/pi-001/shell \
      -H "Content-Type: application/json" \
      -d '{"command": "uptime", "timeout": 5}'
 ```
@@ -143,7 +143,7 @@ curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/shell \
 ### Send a raw command block
 
 ```bash
-curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/command \
+curl -X POST https://grafux.onrender.com/devices/pi-001/command \
      -H "Content-Type: application/json" \
      -d '{"type": "shell", "payload": {"command": "hostname -I"}}'
 ```
@@ -151,7 +151,7 @@ curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/command \
 ### Broadcast to all devices
 
 ```bash
-curl -X POST https://devices-agent-server.onrender.com/broadcast \
+curl -X POST https://grafux.onrender.com/broadcast \
      -H "Content-Type: application/json" \
      -d '{"type": "ping"}'
 ```
@@ -178,7 +178,7 @@ curl -X POST https://devices-agent-server.onrender.com/broadcast \
 
 ```bash
 # Download a Python file from S3 and run it on pi-001
-curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/download_and_run \
+curl -X POST https://grafux.onrender.com/devices/pi-001/download_and_run \
      -H "Content-Type: application/json" \
      -d '{
        "s3_key": "users/42/alice/myproject/logic.py",
@@ -190,7 +190,7 @@ curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/download_a
 
 ```bash
 # Download a C program from a pre-signed URL and run it
-curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/download_and_run \
+curl -X POST https://grafux.onrender.com/devices/pi-001/download_and_run \
      -H "Content-Type: application/json" \
      -d '{
        "file_url": "https://grafux-user-files.s3.amazonaws.com/users/42/alice/myproject/sort.c?X-Amz-...",
@@ -205,8 +205,8 @@ curl -X POST https://devices-agent-server.onrender.com/devices/pi-001/download_a
 
 FastAPI generates interactive docs automatically:
 
-- **Swagger UI:** `https://devices-agent-server.onrender.com/docs`
-- **ReDoc:** `https://devices-agent-server.onrender.com/redoc`
+- **Swagger UI:** `https://grafux.onrender.com/docs`
+- **ReDoc:** `https://grafux.onrender.com/redoc`
 
 ---
 

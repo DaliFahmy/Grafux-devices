@@ -16,7 +16,7 @@ Run:
     python agent.py
 
 Or with explicit flags:
-    python agent.py --host wss://devices-agent-server.onrender.com --device-id win-001 --token topsecret
+    python agent.py --host wss://grafux.onrender.com --device-id win-001 --token topsecret
 
 Environment variables:
 
@@ -73,7 +73,7 @@ logger = logging.getLogger("windows.agent")
 # Config defaults
 # ---------------------------------------------------------------------------
 
-DEFAULT_HOST      = "ws://localhost:8000"
+DEFAULT_HOST      = "wss://grafux.onrender.com"
 DEFAULT_DEVICE_ID = "win-001"
 DEFAULT_TOKEN     = "changeme"
 RECONNECT_DELAY   = 5  # seconds between reconnect attempts
