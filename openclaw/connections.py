@@ -88,8 +88,24 @@ def resolve_composio_key(spec: ClawSpec) -> Optional[str]:
 
 
 def parse_connections(spec: ClawSpec) -> List[ClawConnection]:
-    """Parse the ``connections`` port into ClawConnection objects (best-effort)."""
+    """
+    Parse the ``connections`` port into ClawConnection objects (best-effort).
+
+    Two shapes are accepted:
+
+      * **Standard MCP client config** — the JSON Composio (and other MCP hosts) hand you::
+
+            {"mcpServers": {"composio": {"url": "https://…/mcp",
+                                          "headers": {"x-consumer-api-key": "ck_…"}}}}
+
+        Each server becomes a connection; any ``headers`` route it through the local MCP
+        loop (Anthropic's connector cannot send custom headers).
+
+      * **Legacy list** — ``[{"app", "mcp_url", "header_auth", "api_key", …}]``.
+    """
     parsed = _maybe_json(_clean_port(spec.connections))
+    if isinstance(parsed, dict) and isinstance(parsed.get("mcpServers"), dict):
+        return _connections_from_mcp_servers(parsed["mcpServers"])
     if not isinstance(parsed, list):
         return []
     out: List[ClawConnection] = []
@@ -100,6 +116,30 @@ def parse_connections(spec: ClawSpec) -> List[ClawConnection]:
             out.append(ClawConnection(**item))
         except Exception as exc:  # noqa: BLE001 — skip malformed entries, keep the rest
             logger.warning("connections: skipping malformed entry %r (%s)", item, exc)
+    return out
+
+
+def _connections_from_mcp_servers(servers: Dict[str, Any]) -> List[ClawConnection]:
+    """Turn a standard ``mcpServers`` config map into ClawConnection objects."""
+    out: List[ClawConnection] = []
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            continue
+        url = str(cfg.get("url", "")).strip()
+        if not url:
+            continue
+        raw_headers = cfg.get("headers") if isinstance(cfg.get("headers"), dict) else {}
+        headers = {str(k): str(v) for k, v in raw_headers.items()}
+        out.append(
+            ClawConnection(
+                app=str(name),
+                mcp_url=url,
+                user_id=str(cfg.get("user_id", "")),
+                headers=headers,
+                header_auth=bool(headers),  # custom headers ⇒ local loop
+                enabled=bool(cfg.get("enabled", True)),
+            )
+        )
     return out
 
 
@@ -146,7 +186,7 @@ def build_mcp_servers(spec: ClawSpec) -> List[Dict[str, Any]]:
     for i, conn in enumerate(parse_connections(spec)):
         if not conn.enabled:
             continue
-        if conn.header_auth:
+        if _is_local_loop(conn):
             # Header-authenticated servers (e.g. Composio's Connect/Tool-Router URL) cannot
             # go through Anthropic's connector — it only sends a bearer, never a custom
             # header. They are handled by the local MCP loop instead (run_local_agent_loop).
@@ -203,12 +243,17 @@ COMPOSIO_API_KEY_HEADER = "x-consumer-api-key"
 _MAX_TOOL_ITERATIONS = 8
 
 
+def _is_local_loop(conn: ClawConnection) -> bool:
+    """True if this connection must be driven by the local MCP loop (carries custom headers)."""
+    return bool(conn.header_auth or conn.headers)
+
+
 def local_loop_connections(spec: ClawSpec) -> List[ClawConnection]:
-    """Enabled connections that must be driven by the local MCP loop (header_auth)."""
+    """Enabled connections that must be driven by the local MCP loop (header auth)."""
     return [
         c
         for c in parse_connections(spec)
-        if c.enabled and c.header_auth and _mcp_url_for(c)
+        if c.enabled and _is_local_loop(c) and _mcp_url_for(c)
     ]
 
 
@@ -216,6 +261,24 @@ def _header_key_for(conn: ClawConnection, spec: ClawSpec) -> str:
     """The ``x-consumer-api-key`` value: the connection's own key, else the claw's Composio key."""
     explicit = _clean_port(conn.api_key)
     return explicit or (resolve_composio_key(spec) or "")
+
+
+def _resolve_headers(conn: ClawConnection, spec: ClawSpec) -> Dict[str, str]:
+    """
+    The full header set to send to this connection's MCP server.
+
+    Explicit ``headers`` (from the mcpServers config) are used as-is. When ``header_auth``
+    is set but no ``x-consumer-api-key`` was supplied, one is synthesized from the
+    connection's ``api_key`` / the claw's resolved Composio key, so the legacy
+    "tick header-auth + key in api_keys port" path keeps working.
+    """
+    headers = {str(k): str(v) for k, v in (conn.headers or {}).items()}
+    has_composio = any(k.lower() == COMPOSIO_API_KEY_HEADER for k in headers)
+    if conn.header_auth and not has_composio:
+        key = _header_key_for(conn, spec)
+        if key:
+            headers[COMPOSIO_API_KEY_HEADER] = key
+    return headers
 
 
 def _sanitize_tool_name(name: str) -> str:
@@ -282,17 +345,15 @@ async def run_local_agent_loop(
     async with AsyncExitStack() as stack:
         for i, conn in enumerate(conns):
             url = _mcp_url_for(conn)
-            key = _header_key_for(conn, spec)
-            if not key:
-                # Without a key we would send no auth header and Composio answers an
-                # opaque 401 — fail fast with an actionable message instead.
+            headers = _resolve_headers(conn, spec)
+            if not headers:
+                # No auth header at all would draw an opaque 401 — fail fast instead.
                 raise RuntimeError(
-                    "No Composio API key found for header-auth connection "
-                    f"'{_clean_port(conn.app) or url}'. Set COMPOSIO_API_KEY on the devices "
-                    'server, add {"composio": "<key>"} to the claw\'s api_keys port, or set '
-                    "the connection's api_key field."
+                    "No auth header for connection "
+                    f"'{_clean_port(conn.app) or url}'. Provide it in the mcpServers config "
+                    '(headers: {"x-consumer-api-key": "<key>"}), set COMPOSIO_API_KEY on the '
+                    'devices server, or add {"composio": "<key>"} to the claw\'s api_keys port.'
                 )
-            headers = {COMPOSIO_API_KEY_HEADER: key}
 
             # Streamable-HTTP is Composio's transport; fall back to SSE for ``…/sse`` URLs.
             if url.rstrip("/").endswith("/sse"):
@@ -307,6 +368,13 @@ async def run_local_agent_loop(
 
             prefix = _server_name_for(conn, i)
             listed = await session.list_tools()
+            logger.info(
+                "local MCP '%s' (%s) exposed %d tool(s): %s",
+                _clean_port(conn.app) or prefix,
+                url,
+                len(listed.tools),
+                ", ".join(t.name for t in listed.tools) or "(none)",
+            )
             for tool in listed.tools:
                 # Prefix when there is more than one server so names stay unique.
                 raw = f"{prefix}__{tool.name}" if len(conns) > 1 else tool.name
@@ -320,6 +388,18 @@ async def run_local_agent_loop(
                         "input_schema": schema or {"type": "object", "properties": {}},
                     }
                 )
+
+        if not tool_defs:
+            # Connected and authenticated, but the server(s) advertised no tools — the
+            # model would then claim it "has no integration". Surface the real cause.
+            apps = ", ".join(_clean_port(c.app) or _mcp_url_for(c) for c in conns)
+            raise RuntimeError(
+                f"Connected to the MCP server(s) for [{apps}] but they exposed no tools. "
+                "For Composio: enable the toolkit (e.g. Telegram) on the MCP server / "
+                "Tool-Router config, and make sure the user_id has a connected, ACTIVE "
+                "account for that toolkit. A generic Tool-Router URL can surface no toolkit "
+                "tools — prefer a per-toolkit MCP server URL for the app."
+            )
 
         messages = list(base_kwargs.get("messages", []))
         loop_kwargs = {k: v for k, v in base_kwargs.items() if k != "messages"}

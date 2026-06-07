@@ -19,7 +19,7 @@ tools_config -> ClawSpec.tools_config  (tool/server configuration; text or JSON)
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -92,6 +92,15 @@ class ClawConnection(BaseModel):
             "Composio API key sent as 'x-consumer-api-key' when header_auth is True. When empty, "
             "the claw falls back to the Composio key resolved from its api_keys/credentials ports "
             "or the COMPOSIO_API_KEY env var, so the secret can live in api_keys rather than here."
+        ),
+    )
+    headers: Dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Arbitrary HTTP headers to send to the MCP server (e.g. {'x-consumer-api-key': '…'}). "
+            "Populated when the connections port uses the standard MCP config shape "
+            "({'mcpServers': {'<name>': {'url', 'headers'}}}). Any non-empty headers force the "
+            "local MCP loop (Anthropic's connector cannot send custom headers)."
         ),
     )
     connection_id: str = Field("", description="Composio connected-account id (used for inbound replies).")
