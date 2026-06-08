@@ -23,3 +23,12 @@ services:
       # needed for the inbound-reply / management paths. Set it in the dashboard.
       - key: COMPOSIO_API_KEY
         sync: false
+      # RunPod key — used by the GPU runtime to provision pods and SSH in. With this
+      # set, the user can create a gpu block and connect with no per-block key. Set
+      # the secret value in the Render dashboard.
+      - key: RUNPOD_API_KEY
+        sync: false
+      # Idle reaper: terminate a provisioned GPU pod after this many minutes with no
+      # run, so a forgotten pod cannot bill forever. Set to 0 to disable.
+      - key: GPU_IDLE_TIMEOUT_MIN
+        value: "30"

@@ -1,0 +1,3 @@
+# Device-side WebSocket server dependencies.
+# Compilers/interpreters (gcc, g++, python3, bash) come from the OS, not pip.
+websockets>=11.0

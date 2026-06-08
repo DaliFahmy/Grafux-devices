@@ -1,0 +1,2 @@
+httpx>=0.23        # RunPod REST API calls
+paramiko>=3.0      # SSH into the pod to compile + run code

@@ -79,6 +79,16 @@ try:
 except Exception as exc:  # noqa: BLE001 — never let claw imports break device serving
     logger.warning("OpenClaw router not mounted: %s", exc)
 
+# GPU — server-side cloud-GPU runtime (provision a real RunPod GPU, compile + run
+# C++/CUDA code on it). Mounted as a router so it shares host/port and CORS config.
+try:
+    from GPU.router import router as gpu_router
+
+    app.include_router(gpu_router)
+    logger.info("GPU router mounted at /gpu")
+except Exception as exc:  # noqa: BLE001 — never let GPU imports break device serving
+    logger.warning("GPU router not mounted: %s", exc)
+
 manager = ConnectionManager()
 
 # ---------------------------------------------------------------------------
