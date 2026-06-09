@@ -15,6 +15,7 @@ import pytest
 from GPU import runtime, runpod_client
 from GPU.models import GpuRunRequest, GpuSpec
 from GPU.registry import registry
+from GPU.runpod_client import _ssh_endpoint
 
 
 @pytest.fixture(autouse=True)
@@ -207,3 +208,48 @@ def test_terminate_removes_and_terminates(monkeypatch, fake_runpod):
 
 def test_terminate_unknown_id_returns_false():
     assert runtime.terminate_gpu("nope") is False
+
+
+# ---------------------------------------------------------------------------
+# SSH endpoint extraction — must handle every RunPod payload shape.
+# ---------------------------------------------------------------------------
+
+def test_ssh_endpoint_port_mappings_dict():
+    pod = {"publicIp": "1.2.3.4", "portMappings": {"22": 40022}}
+    assert _ssh_endpoint(pod) == ("1.2.3.4", 40022)
+
+
+def test_ssh_endpoint_port_mappings_tcp_key():
+    pod = {"publicIp": "1.2.3.4", "portMappings": {"22/tcp": 40022}}
+    assert _ssh_endpoint(pod) == ("1.2.3.4", 40022)
+
+
+def test_ssh_endpoint_runtime_ports_list():
+    # publicIp null at top level, but the port entry carries the public IP.
+    pod = {
+        "publicIp": None,
+        "runtime": {"ports": [
+            {"privatePort": 22, "publicPort": 40022, "ip": "5.6.7.8",
+             "isIpPublic": True, "type": "tcp"},
+        ]},
+    }
+    assert _ssh_endpoint(pod) == ("5.6.7.8", 40022)
+
+
+def test_ssh_endpoint_top_level_ports_list_picks_22():
+    pod = {"ports": [
+        {"privatePort": 8888, "publicPort": 1, "ip": "9.9.9.9"},
+        {"privatePort": 22, "publicPort": 50022, "ip": "9.9.9.9", "isIpPublic": True},
+    ]}
+    assert _ssh_endpoint(pod) == ("9.9.9.9", 50022)
+
+
+def test_ssh_endpoint_none_when_not_public():
+    pod = {"publicIp": None, "runtime": {"ports": [
+        {"privatePort": 22, "publicPort": 40022, "ip": "10.0.0.1", "isIpPublic": False},
+    ]}}
+    assert _ssh_endpoint(pod) is None
+
+
+def test_ssh_endpoint_none_when_empty():
+    assert _ssh_endpoint({"publicIp": None, "portMappings": {}}) is None

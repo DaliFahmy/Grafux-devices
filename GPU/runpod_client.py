@@ -203,13 +203,64 @@ def terminate_pod(api_key: str, pod_id: str) -> None:
 
 
 def _ssh_endpoint(pod: Dict[str, Any]) -> Optional[Tuple[str, int]]:
-    """Extract (public_ip, ssh_port) from a pod payload, or None if not ready."""
+    """
+    Extract (public_ip, ssh_port) for port 22 from a pod payload.
+
+    RunPod returns pod networking in several shapes depending on API version /
+    machine, so we try them all:
+      1. top-level ``portMappings`` dict: {"22": 40022} or {"22/tcp": 40022}
+      2. nested ``runtime.ports`` list: [{ip, isIpPublic, privatePort, publicPort,
+         type}] — the (old GraphQL-style) shape the REST API can still echo
+      3. top-level ``ports`` list with the same per-entry fields
+
+    Returns None until a public-IP TCP mapping for port 22 is available.
+    """
     public_ip = pod.get("publicIp") or pod.get("ip")
-    mappings = pod.get("portMappings") or {}
-    ssh_port = mappings.get("22") if isinstance(mappings, dict) else None
-    if public_ip and ssh_port:
-        return str(public_ip), int(ssh_port)
+
+    # Shape 1: portMappings dict.
+    mappings = pod.get("portMappings")
+    if isinstance(mappings, dict) and public_ip:
+        ssh_port = mappings.get("22") or mappings.get("22/tcp")
+        if ssh_port:
+            try:
+                return str(public_ip), int(ssh_port)
+            except (TypeError, ValueError):
+                pass
+
+    # Shapes 2 & 3: a list of port entries (prefer a public one).
+    runtime = pod.get("runtime") or {}
+    port_lists = []
+    if isinstance(runtime, dict) and isinstance(runtime.get("ports"), list):
+        port_lists.append(runtime["ports"])
+    if isinstance(pod.get("ports"), list):
+        port_lists.append(pod["ports"])
+    for ports in port_lists:
+        for entry in ports:
+            if not isinstance(entry, dict):
+                continue
+            if int(entry.get("privatePort") or 0) != 22:
+                continue
+            ip = entry.get("ip") or public_ip
+            pub_port = entry.get("publicPort")
+            is_public = entry.get("isIpPublic", True)
+            if ip and pub_port and is_public:
+                try:
+                    return str(ip), int(pub_port)
+                except (TypeError, ValueError):
+                    continue
     return None
+
+
+def _net_summary(pod: Dict[str, Any]) -> str:
+    """A compact dump of a pod's networking fields, for timeout diagnostics."""
+    runtime = pod.get("runtime") or {}
+    parts = [
+        f"publicIp={pod.get('publicIp')!r}",
+        f"portMappings={pod.get('portMappings')!r}",
+        f"ports={pod.get('ports')!r}",
+        f"runtime.ports={runtime.get('ports') if isinstance(runtime, dict) else None!r}",
+    ]
+    return ", ".join(parts)
 
 
 def wait_until_ready(
@@ -235,9 +286,20 @@ def wait_until_ready(
         if status == "RUNNING" and endpoint:
             return endpoint
         time.sleep(poll_s)
+    status = (last.get("desiredStatus") or last.get("status") or "").upper()
+    if status == "RUNNING":
+        # The pod is up but never exposed a public TCP port for SSH — usually it
+        # was placed on a machine without public-IP support (more common on
+        # Community Cloud / certain datacenters). Surface the raw networking fields
+        # so the cause is visible, and suggest a retry on a different tier.
+        raise RuntimeError(
+            f"Pod {pod_id} is RUNNING but never got a public SSH port within "
+            f"{timeout_s}s. The machine likely has no public IP. Try Regenerate "
+            f"again (placement varies) or set the gpu block's 'cloud_type' port to "
+            f"'SECURE'. Networking: {_net_summary(last)}"
+        )
     raise RuntimeError(
-        f"Pod {pod_id} not ready within {timeout_s}s (last status="
-        f"{last.get('desiredStatus') or last.get('status')!r})"
+        f"Pod {pod_id} not ready within {timeout_s}s (last status={status!r})"
     )
 
 
