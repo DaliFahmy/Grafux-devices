@@ -312,13 +312,19 @@ def run_remote(
         # with "command not found" (exit 127).  Run everything through a login shell
         # (bash -lc) AND explicitly export the CUDA bin/lib dirs so nvcc + the
         # runtime libs resolve regardless of how the image sets up PATH.
+        # NOTE on flag order: user ``compile_flags`` go AFTER the source + ``-o``
+        # output so that ``-l`` libraries (e.g. ``-lcublas -lcurand``) link
+        # correctly.  The linker resolves symbols left-to-right, so a library must
+        # follow the object that references it — putting ``-lcublas`` before the
+        # source yields "undefined reference" errors.  Compilation-only flags
+        # (-O3, -std=…, -arch) work in this position too.
         flags = (compile_flags or "").strip()
         if is_cuda:
             arch = arch_for(gpu_model)
             arch_flag = f"-arch={arch} " if arch else ""
-            compile_inner = f"{_CUDA_ENV}nvcc {flags} {arch_flag}{src_path} -o {bin_path}"
+            compile_inner = f"{_CUDA_ENV}nvcc {arch_flag}{src_path} -o {bin_path} {flags}"
         else:
-            compile_inner = f"{_CUDA_ENV}g++ {flags} {src_path} -o {bin_path}"
+            compile_inner = f"{_CUDA_ENV}g++ {src_path} -o {bin_path} {flags}"
         compile_cmd = "bash -lc '" + compile_inner + "'"
 
         t0 = time.monotonic()
