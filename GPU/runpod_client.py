@@ -159,6 +159,11 @@ def create_pod(api_key: str, spec, public_key: str) -> str:
         "containerDiskInGb": int(spec.container_disk_gb or 20),
         "volumeInGb": 0,
         "ports": ["22/tcp"],
+        # Guarantee a public IP + TCP port mapping for SSH.  Without this, pods —
+        # especially on Community cloud — come up RUNNING with publicIp="" and
+        # portMappings=null, so we can never SSH in.  On Secure cloud it's a no-op;
+        # on Community it's required to expose a public IP. (RunPod REST v1 field.)
+        "supportPublicIp": True,
         "env": {"PUBLIC_KEY": public_key},
         "interruptible": False,
     }
