@@ -24,6 +24,14 @@ logger = logging.getLogger("gpu.runpod")
 
 REST_BASE = "https://rest.runpod.io/v1"
 
+# Prepended to compile/run commands so the CUDA toolkit resolves over SSH.  A
+# non-login exec session does not inherit the image's Docker ENV PATH, so we add
+# the standard CUDA bin/lib dirs explicitly (nvcc lives in /usr/local/cuda/bin).
+_CUDA_ENV = (
+    'export PATH="/usr/local/cuda/bin:$PATH"; '
+    'export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"; '
+)
+
 # Curated list of common RunPod GPU types offered in the creation-dialog dropdown.
 # ``id`` is what RunPod expects in ``gpuTypeIds`` (and what the block stores in its
 # gpu_model port); ``label`` is the human-friendly name shown to the user.
@@ -298,23 +306,40 @@ def run_remote(
             sftp.close()
 
         # 2) Compile.  Pick the compiler + best-effort -arch.
+        #
+        # A non-login SSH exec session does NOT inherit the image's Docker ENV PATH,
+        # so the CUDA toolkit at /usr/local/cuda/bin is invisible and ``nvcc`` fails
+        # with "command not found" (exit 127).  Run everything through a login shell
+        # (bash -lc) AND explicitly export the CUDA bin/lib dirs so nvcc + the
+        # runtime libs resolve regardless of how the image sets up PATH.
         flags = (compile_flags or "").strip()
         if is_cuda:
             arch = arch_for(gpu_model)
             arch_flag = f"-arch={arch} " if arch else ""
-            compile_cmd = f"nvcc {flags} {arch_flag}{src_path} -o {bin_path}"
+            compile_inner = f"{_CUDA_ENV}nvcc {flags} {arch_flag}{src_path} -o {bin_path}"
         else:
-            compile_cmd = f"g++ {flags} {src_path} -o {bin_path}"
+            compile_inner = f"{_CUDA_ENV}g++ {flags} {src_path} -o {bin_path}"
+        compile_cmd = "bash -lc '" + compile_inner + "'"
 
         t0 = time.monotonic()
         c_code, _c_out, c_err = _exec(client, compile_cmd, timeout=timeout)
         compile_ms = int((time.monotonic() - t0) * 1000)
 
         if c_code != 0:
+            errors = c_err.strip() or f"compilation failed (exit {c_code})"
+            # exit 127 = compiler not found even after the PATH fix → the image has
+            # no CUDA toolkit.  Give the user an actionable message.
+            if c_code == 127 and is_cuda and "not found" in errors.lower():
+                errors = (
+                    "nvcc not found on the pod — the selected image does not include "
+                    "the CUDA toolkit. Point the gpu block's 'image' port at a CUDA "
+                    "-devel image (e.g. nvidia/cuda:12.6.3-devel-ubuntu22.04) and "
+                    "Regenerate. Underlying error: " + errors
+                )
             return {
                 "status": "error",
                 "response": "",
-                "errors": c_err.strip() or f"compilation failed (exit {c_code})",
+                "errors": errors,
                 "warnings": "",
                 "benchmark": {
                     "compile_ms": compile_ms,
@@ -332,6 +357,7 @@ def run_remote(
         argv = (args or "").strip()
         run_cmd = (
             "bash -lc '"
+            f"{_CUDA_ENV}"
             f"start=$(date +%s%N); {bin_path} {argv}; rc=$?; end=$(date +%s%N); "
             'echo $rc > /tmp/exit; echo $(( (end - start) / 1000000 )) > /tmp/ms'
             "'"
