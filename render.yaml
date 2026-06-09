@@ -32,3 +32,8 @@ services:
       # run, so a forgotten pod cannot bill forever. Set to 0 to disable.
       - key: GPU_IDLE_TIMEOUT_MIN
         value: "30"
+      # How long (seconds) to wait for a freshly-created pod to come up with a
+      # public SSH endpoint. Large CUDA -devel images take minutes to pull on a
+      # cold machine, so this is generous; raise it if Regenerate times out.
+      - key: GPU_PROVISION_TIMEOUT
+        value: "600"

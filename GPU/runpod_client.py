@@ -17,12 +17,18 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("gpu.runpod")
 
 REST_BASE = "https://rest.runpod.io/v1"
+
+# How long to wait for a pod to come up with a public SSH endpoint.  Large CUDA
+# -devel images can take several minutes to pull on a cold machine, so this is
+# generous and overridable via env.
+_PROVISION_TIMEOUT = int(os.environ.get("GPU_PROVISION_TIMEOUT", "600") or "600")
 
 # Prepended to compile/run commands so the CUDA toolkit resolves over SSH.  A
 # non-login exec session does not inherit the image's Docker ENV PATH, so we add
@@ -268,43 +274,56 @@ def _net_summary(pod: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+def _status_summary(pod: Dict[str, Any]) -> str:
+    """Lifecycle + networking dump for diagnostics (image-pull vs no-public-IP)."""
+    parts = [
+        f"desiredStatus={pod.get('desiredStatus')!r}",
+        f"lastStatusChange={pod.get('lastStatusChange')!r}",
+        f"costPerHr={pod.get('costPerHr')!r}",
+        f"machineId={pod.get('machineId')!r}",
+        f"image={pod.get('image') or pod.get('imageName')!r}",
+    ]
+    return "Pod: " + ", ".join(parts) + ". Networking: " + _net_summary(pod)
+
+
 def wait_until_ready(
     api_key: str,
     pod_id: str,
     *,
-    timeout_s: int = 240,
+    timeout_s: Optional[int] = None,
     poll_s: float = 5.0,
 ) -> Tuple[str, int]:
     """
     Poll a pod until it is RUNNING with an SSH endpoint, returning (ip, port).
 
-    Raises RuntimeError on timeout or if the pod enters a terminal failure state.
+    The timeout defaults to ``GPU_PROVISION_TIMEOUT`` (env, default 600s) because a
+    large CUDA -devel image can take several minutes to pull on a cold machine, and
+    the public IP / port-22 mapping only populates once the container is actually
+    up.  Raises RuntimeError on timeout or if the pod enters a terminal state.
     """
+    if timeout_s is None:
+        timeout_s = _PROVISION_TIMEOUT
     deadline = time.monotonic() + timeout_s
     last: Dict[str, Any] = {}
     while time.monotonic() < deadline:
         last = get_pod(api_key, pod_id)
         status = (last.get("desiredStatus") or last.get("status") or "").upper()
         if status in ("TERMINATED", "FAILED"):
-            raise RuntimeError(f"Pod {pod_id} entered status {status}")
+            raise RuntimeError(
+                f"Pod {pod_id} entered status {status}. {_status_summary(last)}"
+            )
         endpoint = _ssh_endpoint(last)
-        if status == "RUNNING" and endpoint:
+        if endpoint:
             return endpoint
         time.sleep(poll_s)
-    status = (last.get("desiredStatus") or last.get("status") or "").upper()
-    if status == "RUNNING":
-        # The pod is up but never exposed a public TCP port for SSH — usually it
-        # was placed on a machine without public-IP support (more common on
-        # Community Cloud / certain datacenters). Surface the raw networking fields
-        # so the cause is visible, and suggest a retry on a different tier.
-        raise RuntimeError(
-            f"Pod {pod_id} is RUNNING but never got a public SSH port within "
-            f"{timeout_s}s. The machine likely has no public IP. Try Regenerate "
-            f"again (placement varies) or set the gpu block's 'cloud_type' port to "
-            f"'SECURE'. Networking: {_net_summary(last)}"
-        )
+    # Timed out.  Dump the full lifecycle + networking so the cause is visible:
+    # still pulling the image? never allocated a public IP? wrong datacenter?
     raise RuntimeError(
-        f"Pod {pod_id} not ready within {timeout_s}s (last status={status!r})"
+        f"Pod {pod_id} not ready within {timeout_s}s — no public SSH endpoint "
+        f"appeared. If it is still pulling a large image, raise GPU_PROVISION_TIMEOUT "
+        f"or use a smaller 'image'. If publicIp stays empty, the placement has no "
+        f"public IP — Regenerate to retry, set 'cloud_type' to 'SECURE', or pick a "
+        f"different GPU. {_status_summary(last)}"
     )
 
 
