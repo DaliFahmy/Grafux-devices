@@ -52,8 +52,11 @@ def create_gpu(spec: GpuSpec) -> CreateGpuResponse:
 @router.post("/{gpu_id}/run", response_model=GpuRunResponse)
 def run_gpu(gpu_id: str, body: GpuRunRequest) -> GpuRunResponse:
     """Compile + run code on an already-provisioned pod (Run)."""
+    # ``run_gpu`` decides the reported gpu_id: "" in the default ephemeral mode
+    # (pod is terminated after the run, so the block re-provisions next time) or
+    # the live id when GPU_EPHEMERAL=0 keeps the pod warm.
     result = runtime.run_gpu(gpu_id, body)
-    return GpuRunResponse(gpu_id=gpu_id, **result)
+    return GpuRunResponse(**result)
 
 
 @router.get("/models", response_model=GpuModelsResponse)

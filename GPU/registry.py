@@ -32,8 +32,12 @@ logger = logging.getLogger("gpu.registry")
 _PERSIST_DIR = os.path.join(os.path.dirname(__file__), "_gpus")
 _PERSIST_ENABLED = os.environ.get("GPU_PERSIST", "").lower() in ("1", "true", "yes")
 
-# Idle reaper: terminate pods unused for this many minutes (0 disables).
-_IDLE_TIMEOUT_MIN = int(os.environ.get("GPU_IDLE_TIMEOUT_MIN", "30") or "0")
+# Idle reaper: terminate pods unused for this many minutes (0 disables).  This is
+# a safety-net backstop only: ephemeral runs (see runtime._EPHEMERAL) already
+# self-terminate the instant a run finishes, so the reaper just catches pods that
+# were provisioned (Regenerate / auto-provision) but never followed by a Run, plus
+# warm pods when GPU_EPHEMERAL=0.  Kept short so a forgotten pod stops billing fast.
+_IDLE_TIMEOUT_MIN = int(os.environ.get("GPU_IDLE_TIMEOUT_MIN", "10") or "0")
 _REAP_INTERVAL_S = 60
 
 

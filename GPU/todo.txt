@@ -1,0 +1,10 @@
+please implement in the folder Grafux-devices/GPU : create a new block type called gpu, when the user create a new gpu block then it the block represent a connected real running gpu on the cloud. you can use RunPod as a gpu provider. 
+
+
+the idea is that the user can compile c++/cuda code on the gpu and check the perforamce of his c++/cuda code. The user can choose the gpu that he want his code to run on, the options of gpus can be choosed from the unifiedwindow during creating gpu block.
+
+all the configuration of connecting to a gpu from RunPod should already be done sothat the user can simply create a gpu block and connect to the gpu on the cloud. 
+
+The gpu block contain input ports that represent the configuration of the gpu. when the user press on regenetration then it should connect to the gpu of this configuration. it has also input port called code, that hold c++/cuda code that should be running on the gpu.
+
+the output should be the response, status, errors, warnings, improvement and all the benmark infromation of the performation, e.g. execution time.

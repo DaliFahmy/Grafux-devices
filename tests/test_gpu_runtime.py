@@ -166,18 +166,67 @@ def test_run_maps_result(monkeypatch, fake_runpod):
     assert fake_runpod["run"][0]["language"] == "cuda"
 
 
+def test_run_ephemeral_terminates_pod_after_success(monkeypatch, fake_runpod):
+    """The cost fix: a successful run frees the pod immediately and clears gpu_id."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
+
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(code="int main(){}"))
+    assert out["status"] == "ok"
+    # Pod terminated and dropped from the registry the instant the run finished.
+    assert ("rp_env_key", "pod-123") in fake_runpod["terminate"]
+    assert registry.get(gpu_id) is None
+    # Empty gpu_id tells the block to re-provision on the next Run.
+    assert out["gpu_id"] == ""
+
+
+def test_run_ephemeral_terminates_pod_after_failure(monkeypatch, fake_runpod):
+    """A failed run must still free the pod — no orphan billing on errors."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
+
+    def boom(*a, **k):
+        raise OSError("ssh connection refused")
+
+    monkeypatch.setattr(runpod_client, "run_remote", boom)
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(code="int main(){}"))
+    assert out["status"] == "error"
+    assert ("rp_env_key", "pod-123") in fake_runpod["terminate"]
+    assert registry.get(gpu_id) is None
+    assert out["gpu_id"] == ""
+
+
+def test_run_keep_alive_does_not_terminate(monkeypatch, fake_runpod):
+    """GPU_EPHEMERAL=0 restores warm reuse: the pod survives the run."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    monkeypatch.setattr(runtime, "_EPHEMERAL", False)
+    gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
+
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(code="int main(){}"))
+    assert out["status"] == "ok"
+    # Pod kept warm: not terminated, still in the registry, live id reported back.
+    assert fake_runpod["terminate"] == []
+    assert registry.get(gpu_id) is not None
+    assert out["gpu_id"] == gpu_id
+
+
 def test_run_unknown_id_errors():
     out = runtime.run_gpu("does-not-exist", GpuRunRequest(code="x"))
     assert out["status"] == "error"
     assert "No GPU with id" in out["errors"]
+    # Empty gpu_id so the next Run provisions a fresh pod instead of re-erroring.
+    assert out["gpu_id"] == ""
 
 
-def test_run_empty_code_errors(monkeypatch, fake_runpod):
+def test_run_empty_code_terminates_and_errors(monkeypatch, fake_runpod):
     monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
     gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
     out = runtime.run_gpu(gpu_id, GpuRunRequest(code="   "))
     assert out["status"] == "error"
     assert "code" in out["errors"].lower()
+    # Even a no-op run must not leave a billing pod behind.
+    assert ("rp_env_key", "pod-123") in fake_runpod["terminate"]
+    assert registry.get(gpu_id) is None
 
 
 def test_run_remote_failure_is_reported(monkeypatch, fake_runpod):

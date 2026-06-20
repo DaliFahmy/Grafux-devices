@@ -28,10 +28,18 @@ services:
       # the secret value in the Render dashboard.
       - key: RUNPOD_API_KEY
         sync: false
-      # Idle reaper: terminate a provisioned GPU pod after this many minutes with no
-      # run, so a forgotten pod cannot bill forever. Set to 0 to disable.
+      # Ephemeral GPU lifecycle (default on): terminate the pod the instant a run
+      # finishes so a GPU only costs money while it is actually compiling/running
+      # (idle cost $0; the block re-provisions automatically on the next Run). Set
+      # to 0 to keep pods warm between runs (create-once/run-many) instead.
+      - key: GPU_EPHEMERAL
+        value: "1"
+      # Idle reaper backstop: terminate a provisioned-but-never-run GPU pod after
+      # this many minutes idle, so a forgotten pod cannot bill forever. Ephemeral
+      # runs already self-terminate; this only catches Regenerate-and-walk-away
+      # pods (and warm pods when GPU_EPHEMERAL=0). Set to 0 to disable.
       - key: GPU_IDLE_TIMEOUT_MIN
-        value: "30"
+        value: "10"
       # How long (seconds) to wait for a freshly-created pod to come up with a
       # public SSH endpoint. Large CUDA -devel images take minutes to pull on a
       # cold machine, so this is generous; raise it if Regenerate times out.

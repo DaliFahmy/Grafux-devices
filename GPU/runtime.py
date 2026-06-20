@@ -30,6 +30,15 @@ logger = logging.getLogger("gpu.runtime")
 # block runner).  Treat them as an empty port.
 _PLACEHOLDER_VALUES = {"empty", "unconnected"}
 
+# Ephemeral lifecycle (default ON): terminate the pod the moment a run finishes —
+# on success AND on every failure path — so a GPU only costs money while it is
+# actually compiling/running.  The run then reports gpu_id="" back to the block,
+# which clears its cached gpu_id port so the *next* Run transparently provisions a
+# fresh pod (the frontend already auto-provisions on an empty gpu_id).  Idle cost
+# is therefore $0.  Set ``GPU_EPHEMERAL=0`` to restore the warm create-once /
+# run-many model (pods stay up between runs and are only freed by the idle reaper).
+_EPHEMERAL = os.environ.get("GPU_EPHEMERAL", "1").lower() not in ("0", "false", "no")
+
 
 def _clean_port(text: Optional[str]) -> str:
     """Return the port's real value, mapping placeholder sentinels to ``""``."""
@@ -150,72 +159,114 @@ def provision_gpu(spec: GpuSpec) -> Dict[str, Any]:
 # Run — compile + execute on an already-provisioned pod.
 # ---------------------------------------------------------------------------
 
+def _teardown_after_run(gpu_id: str, record: GpuRecord) -> None:
+    """
+    Terminate a pod and drop it from the registry once a run is done.
+
+    Best-effort and never raises — teardown must not turn a successful run into a
+    failure.  Called from ``run_gpu``'s ``finally`` in ephemeral mode so a pod
+    only ever bills for the duration of an actual run.
+    """
+    try:
+        if record.pod_id and record.api_key:
+            runpod_client.terminate_pod(record.api_key, record.pod_id)
+    except Exception as exc:  # noqa: BLE001 — teardown is best-effort.
+        logger.warning("gpu post-run teardown failed for %s: %s", gpu_id, exc)
+    finally:
+        registry.delete(gpu_id)
+
+
 def run_gpu(gpu_id: str, req: GpuRunRequest) -> Dict[str, Any]:
     """
     Compile and run code on the pod identified by ``gpu_id``.
 
-    Returns {status, response, errors, warnings, benchmark(JSON string)}.
+    Returns {gpu_id, status, response, errors, warnings, benchmark(JSON string)}.
     Never raises.
+
+    In the default ephemeral mode (``GPU_EPHEMERAL``) the pod is terminated as soon
+    as the run finishes — on success or failure — and the returned ``gpu_id`` is ""
+    so the block clears its cached pod id and re-provisions on the next Run.
     """
     record = registry.get(gpu_id)
     if record is None:
+        # Unknown / already-torn-down pod: report an empty gpu_id so the next Run
+        # provisions a fresh pod instead of repeating this error.
         return {
+            "gpu_id": "",
             "status": "error",
             "response": "",
-            "errors": f"No GPU with id '{gpu_id}'. Press Regenerate to provision a pod.",
-            "warnings": "",
-            "benchmark": "",
-        }
-    if not record.is_running:
-        return {
-            "status": "error",
-            "response": "",
-            "errors": "GPU pod is not running. Press Regenerate to provision it.",
-            "warnings": "",
-            "benchmark": "",
-        }
-
-    registry.touch(gpu_id)
-    code = _clean_port(req.code)
-    if not code:
-        return {
-            "status": "error",
-            "response": "",
-            "errors": "The 'code' input port is empty — nothing to compile.",
+            "errors": (
+                f"No GPU with id '{gpu_id}'. A fresh pod will be provisioned on the "
+                f"next run."
+            ),
             "warnings": "",
             "benchmark": "",
         }
 
+    # In ephemeral mode the pod is gone after this call, so report "" to clear the
+    # block's cached gpu_id; otherwise keep reporting the live id (warm reuse).
+    report_id = "" if _EPHEMERAL else gpu_id
     try:
-        result = runpod_client.run_remote(
-            record.public_ip,
-            record.ssh_port,
-            record.private_key_pem,
-            source=code,
-            language=req.language,
-            gpu_model=record.spec.gpu_model,
-            compile_flags=record.spec.compile_flags,
-            args=req.args,
-            timeout=int(req.timeout or 120),
-        )
-    except Exception as exc:  # noqa: BLE001 — connection/SSH failures → error result.
-        logger.warning("gpu run failed: %s", exc)
-        return {
-            "status": "error",
-            "response": "",
-            "errors": _describe_exception(exc),
-            "warnings": "",
-            "benchmark": "",
-        }
+        if not record.is_running:
+            return {
+                "gpu_id": report_id,
+                "status": "error",
+                "response": "",
+                "errors": "GPU pod is not running — a fresh pod will be provisioned on the next run.",
+                "warnings": "",
+                "benchmark": "",
+            }
 
-    benchmark = result.get("benchmark") or {}
-    return {
-        "status": result.get("status", "ok"),
-        "response": result.get("response", ""),
-        "errors": result.get("errors", ""),
-        "warnings": result.get("warnings", ""),
-        "benchmark": json.dumps(benchmark) if benchmark else "",
-    }
+        registry.touch(gpu_id)
+        code = _clean_port(req.code)
+        if not code:
+            return {
+                "gpu_id": report_id,
+                "status": "error",
+                "response": "",
+                "errors": "The 'code' input port is empty — nothing to compile.",
+                "warnings": "",
+                "benchmark": "",
+            }
+
+        try:
+            result = runpod_client.run_remote(
+                record.public_ip,
+                record.ssh_port,
+                record.private_key_pem,
+                source=code,
+                language=req.language,
+                gpu_model=record.spec.gpu_model,
+                compile_flags=record.spec.compile_flags,
+                args=req.args,
+                timeout=int(req.timeout or 120),
+            )
+        except Exception as exc:  # noqa: BLE001 — connection/SSH failures → error result.
+            logger.warning("gpu run failed: %s", exc)
+            return {
+                "gpu_id": report_id,
+                "status": "error",
+                "response": "",
+                "errors": _describe_exception(exc),
+                "warnings": "",
+                "benchmark": "",
+            }
+
+        benchmark = result.get("benchmark") or {}
+        return {
+            "gpu_id": report_id,
+            "status": result.get("status", "ok"),
+            "response": result.get("response", ""),
+            "errors": result.get("errors", ""),
+            "warnings": result.get("warnings", ""),
+            "benchmark": json.dumps(benchmark) if benchmark else "",
+        }
+    finally:
+        # The big cost fix: free the pod the instant the run is done so it never
+        # bills while idle.  Runs only on a record we actually hold (not the
+        # unknown-id early return above).
+        if _EPHEMERAL:
+            _teardown_after_run(gpu_id, record)
 
 
 # ---------------------------------------------------------------------------
