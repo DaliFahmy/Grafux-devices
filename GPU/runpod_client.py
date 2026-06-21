@@ -376,8 +376,10 @@ def run_remote(
     Returns a dict with keys: status, response, errors, warnings, benchmark(dict).
     Never raises for a compile/run failure — those are reported in the result.
     """
-    is_cuda = (language or "cuda").lower() in ("cuda", "cu")
-    ext = "cu" if is_cuda else "cpp"
+    lang = (language or "cuda").lower()
+    is_python = lang in ("python", "py")
+    is_cuda = lang in ("cuda", "cu")
+    ext = "py" if is_python else ("cu" if is_cuda else "cpp")
     src_path = f"/tmp/job.{ext}"
     bin_path = "/tmp/job"
 
@@ -404,44 +406,53 @@ def run_remote(
         # follow the object that references it — putting ``-lcublas`` before the
         # source yields "undefined reference" errors.  Compilation-only flags
         # (-O3, -std=…, -arch) work in this position too.
-        flags = (compile_flags or "").strip()
-        if is_cuda:
-            arch = arch_for(gpu_model)
-            arch_flag = f"-arch={arch} " if arch else ""
-            compile_inner = f"{_CUDA_ENV}nvcc {arch_flag}{src_path} -o {bin_path} {flags}"
+        # Python is interpreted — there is no compile step.  We run the source
+        # directly with ``python3`` (PyTorch is preinstalled in the default image).
+        # The compiled path (cuda/cpp) still nvcc/g++-compiles into ``bin_path``.
+        if is_python:
+            compile_ms = 0
+            compile_warnings = ""
+            run_target = f"python3 {src_path}"
         else:
-            compile_inner = f"{_CUDA_ENV}g++ {src_path} -o {bin_path} {flags}"
-        compile_cmd = "bash -lc '" + compile_inner + "'"
+            flags = (compile_flags or "").strip()
+            if is_cuda:
+                arch = arch_for(gpu_model)
+                arch_flag = f"-arch={arch} " if arch else ""
+                compile_inner = f"{_CUDA_ENV}nvcc {arch_flag}{src_path} -o {bin_path} {flags}"
+            else:
+                compile_inner = f"{_CUDA_ENV}g++ {src_path} -o {bin_path} {flags}"
+            compile_cmd = "bash -lc '" + compile_inner + "'"
 
-        t0 = time.monotonic()
-        c_code, _c_out, c_err = _exec(client, compile_cmd, timeout=timeout)
-        compile_ms = int((time.monotonic() - t0) * 1000)
+            t0 = time.monotonic()
+            c_code, _c_out, c_err = _exec(client, compile_cmd, timeout=timeout)
+            compile_ms = int((time.monotonic() - t0) * 1000)
 
-        if c_code != 0:
-            errors = c_err.strip() or f"compilation failed (exit {c_code})"
-            # exit 127 = compiler not found even after the PATH fix → the image has
-            # no CUDA toolkit.  Give the user an actionable message.
-            if c_code == 127 and is_cuda and "not found" in errors.lower():
-                errors = (
-                    "nvcc not found on the pod — the selected image does not include "
-                    "the CUDA toolkit. Point the gpu block's 'image' port at a CUDA "
-                    "-devel image (e.g. nvidia/cuda:12.6.3-devel-ubuntu22.04) and "
-                    "Regenerate. Underlying error: " + errors
-                )
-            return {
-                "status": "error",
-                "response": "",
-                "errors": errors,
-                "warnings": "",
-                "benchmark": {
-                    "compile_ms": compile_ms,
-                    "exec_ms": 0,
-                    "exit_code": c_code,
-                    "gpu_model": gpu_model,
-                    "stage": "compile",
-                },
-            }
-        compile_warnings = c_err.strip()  # nvcc/g++ warnings go to stderr on success
+            if c_code != 0:
+                errors = c_err.strip() or f"compilation failed (exit {c_code})"
+                # exit 127 = compiler not found even after the PATH fix → the image
+                # has no CUDA toolkit.  Give the user an actionable message.
+                if c_code == 127 and is_cuda and "not found" in errors.lower():
+                    errors = (
+                        "nvcc not found on the pod — the selected image does not include "
+                        "the CUDA toolkit. Point the gpu block's 'image' port at a CUDA "
+                        "-devel image (e.g. nvidia/cuda:12.6.3-devel-ubuntu22.04) and "
+                        "Regenerate. Underlying error: " + errors
+                    )
+                return {
+                    "status": "error",
+                    "response": "",
+                    "errors": errors,
+                    "warnings": "",
+                    "benchmark": {
+                        "compile_ms": compile_ms,
+                        "exec_ms": 0,
+                        "exit_code": c_code,
+                        "gpu_model": gpu_model,
+                        "stage": "compile",
+                    },
+                }
+            compile_warnings = c_err.strip()  # nvcc/g++ warnings go to stderr on success
+            run_target = bin_path
 
         # 3) Run, timing execution on-device (nanosecond clock) to exclude network
         #    latency from the benchmark.  The program's own stdout/stderr come back
@@ -450,7 +461,7 @@ def run_remote(
         run_cmd = (
             "bash -lc '"
             f"{_CUDA_ENV}"
-            f"start=$(date +%s%N); {bin_path} {argv}; rc=$?; end=$(date +%s%N); "
+            f"start=$(date +%s%N); {run_target} {argv}; rc=$?; end=$(date +%s%N); "
             'echo $rc > /tmp/exit; echo $(( (end - start) / 1000000 )) > /tmp/ms'
             "'"
         )
@@ -486,10 +497,21 @@ def run_remote(
             "gpu_info": gpu_info.strip(),
         }
         if exit_code != 0:
+            errors = r_err.strip() or f"program exited with code {exit_code}"
+            # exit 127 = python3 not found → the selected image has no Python.
+            # The default image ships Python 3.11, so this only hits a custom image.
+            if is_python and exit_code == 127 and "not found" in errors.lower():
+                errors = (
+                    "python3 not found on the pod — the selected image does not include "
+                    "a Python interpreter. Point the gpu block's 'image' port at a "
+                    "Python-capable image (the default "
+                    "runpod/pytorch:...-cuda... image already is) and Regenerate. "
+                    "Underlying error: " + errors
+                )
             return {
                 "status": "error",
                 "response": r_out,
-                "errors": r_err.strip() or f"program exited with code {exit_code}",
+                "errors": errors,
                 "warnings": compile_warnings,
                 "benchmark": benchmark,
             }

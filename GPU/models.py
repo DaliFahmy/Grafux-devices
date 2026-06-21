@@ -70,8 +70,11 @@ class GpuSpec(BaseModel):
 class GpuRunRequest(BaseModel):
     """The live inputs supplied on every run of an existing gpu pod."""
 
-    code: str = Field("", description="C++/CUDA source to compile and run on the GPU.")
-    language: str = Field("cuda", description="'cuda' (compiled with nvcc) or 'cpp' (g++).")
+    code: str = Field("", description="C++/CUDA/Python source to run on the GPU.")
+    language: str = Field(
+        "cuda",
+        description="'cuda' (nvcc), 'cpp' (g++), or 'python' (python3, PyTorch preinstalled).",
+    )
     args: str = Field("", description="Command-line arguments passed to the compiled program.")
     timeout: int = Field(120, description="Per-run wall-clock limit in seconds.")
 

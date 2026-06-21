@@ -302,3 +302,140 @@ def test_ssh_endpoint_none_when_not_public():
 
 def test_ssh_endpoint_none_when_empty():
     assert _ssh_endpoint({"publicIp": None, "portMappings": {}}) is None
+
+
+# ---------------------------------------------------------------------------
+# run_remote — language dispatch (compiled cuda/cpp vs interpreted python)
+#
+# These drive run_remote directly against an in-memory SSH/SFTP fake so we can
+# assert which commands it issues (compile vs python3) without a real pod.
+# ---------------------------------------------------------------------------
+
+
+class _FakeSftpFile:
+    def __init__(self, store, path):
+        self._store, self._path = store, path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def write(self, data):
+        self._store[self._path] = data
+
+
+class _FakeSftp:
+    def __init__(self, store):
+        self._store = store
+
+    def open(self, path, _mode):
+        return _FakeSftpFile(self._store, path)
+
+    def close(self):
+        pass
+
+
+class _FakeSshClient:
+    def __init__(self, store):
+        self._store = store
+
+    def open_sftp(self):
+        return _FakeSftp(self._store)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def fake_ssh(monkeypatch):
+    """Drive run_remote against an in-memory SSH/SFTP fake.
+
+    Records uploaded source + every command, and lets a test set the result of
+    the main run command (the on-device exit code via /tmp/exit + stdout/stderr).
+    """
+    state = {
+        "uploaded": {},   # path -> source written via sftp
+        "commands": [],   # every command passed to _exec, in order
+        "run_out": "ran ok\n",
+        "run_err": "",
+        "exit_txt": "0",  # what `cat /tmp/exit` reports → becomes exit_code
+        "ms_txt": "7",
+    }
+
+    def fake_connect(host, port, key, *, timeout=30.0):
+        return _FakeSshClient(state["uploaded"])
+
+    def fake_exec(client, command, timeout):
+        state["commands"].append(command)
+        if command.startswith("cat /tmp/exit"):
+            return 0, state["exit_txt"], ""
+        if command.startswith("cat /tmp/ms"):
+            return 0, state["ms_txt"], ""
+        if command.startswith("nvidia-smi"):
+            return 0, "NVIDIA GeForce RTX 4090, 100 MiB, 24564 MiB", ""
+        if "date +%s%N" in command:  # the main run command
+            return 0, state["run_out"], state["run_err"]
+        return 0, "", ""  # compile command: success, no warnings
+
+    monkeypatch.setattr(runpod_client, "_connect_ssh", fake_connect)
+    monkeypatch.setattr(runpod_client, "_exec", fake_exec)
+    return state
+
+
+def test_run_remote_python_skips_compile(fake_ssh):
+    result = runpod_client.run_remote(
+        "1.2.3.4", 40022, "PEM",
+        source="import torch\nprint('hi')\n",
+        language="python",
+        gpu_model="NVIDIA GeForce RTX 4090",
+        compile_flags="-O3",
+        args="",
+        timeout=60,
+    )
+    assert result["status"] == "ok"
+    # Source landed in a .py file.
+    assert fake_ssh["uploaded"]["/tmp/job.py"] == "import torch\nprint('hi')\n"
+    joined = "\n".join(fake_ssh["commands"])
+    # No compiler was invoked …
+    assert "nvcc" not in joined
+    assert "g++" not in joined
+    # … and the source ran directly under python3.
+    assert "python3 /tmp/job.py" in joined
+    # Interpreted → no compile time.
+    assert result["benchmark"]["compile_ms"] == 0
+
+
+def test_run_remote_python_missing_interpreter(fake_ssh):
+    fake_ssh["exit_txt"] = "127"
+    fake_ssh["run_err"] = "bash: python3: command not found"
+    result = runpod_client.run_remote(
+        "1.2.3.4", 40022, "PEM",
+        source="print(1)\n",
+        language="python",
+        gpu_model="",
+        compile_flags="",
+        args="",
+        timeout=60,
+    )
+    assert result["status"] == "error"
+    assert "python3 not found" in result["errors"]
+    assert result["benchmark"]["exit_code"] == 127
+
+
+def test_run_remote_cuda_still_compiles(fake_ssh):
+    result = runpod_client.run_remote(
+        "1.2.3.4", 40022, "PEM",
+        source="int main(){return 0;}",
+        language="cuda",
+        gpu_model="NVIDIA GeForce RTX 4090",
+        compile_flags="-O3",
+        args="",
+        timeout=60,
+    )
+    assert result["status"] == "ok"
+    assert fake_ssh["uploaded"]["/tmp/job.cu"] == "int main(){return 0;}"
+    joined = "\n".join(fake_ssh["commands"])
+    assert "nvcc" in joined
+    assert "python3 /tmp/job" not in joined
