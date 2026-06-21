@@ -143,6 +143,85 @@ def test_provision_failure_terminates_pod(monkeypatch, fake_runpod):
     assert fake_runpod["terminate"] == [("rp_env_key", "pod-123")]
 
 
+def test_provision_retries_no_public_ip_then_succeeds(monkeypatch, fake_runpod):
+    """A no-public-IP placement is freed and a fresh pod is created (machine hop)."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    monkeypatch.setattr(runtime, "_RETRY_BACKOFF_S", 0)
+
+    created = []
+
+    def fake_create(api_key, spec, public_key):
+        created.append(f"pod-{len(created)}")
+        return created[-1]
+
+    waits = {"n": 0}
+
+    def fake_wait(api_key, pod_id, **kwargs):
+        waits["n"] += 1
+        if waits["n"] == 1:
+            raise runpod_client.NoEndpointError("machine has no public IP")
+        return ("1.2.3.4", 40022)
+
+    terminated = []
+    monkeypatch.setattr(runpod_client, "create_pod", fake_create)
+    monkeypatch.setattr(runpod_client, "wait_until_ready", fake_wait)
+    monkeypatch.setattr(runpod_client, "terminate_pod",
+                        lambda api_key, pod_id: terminated.append(pod_id))
+
+    result = runtime.provision_gpu(GpuSpec())
+    assert result["status"] == "ok"
+    assert result["pod_id"] == "pod-1"   # the second placement
+    assert terminated == ["pod-0"]       # the no-public-IP pod was freed
+
+
+def test_provision_retries_on_capacity_then_succeeds(monkeypatch, fake_runpod):
+    """A transient 'no instances available' is retried until capacity frees up."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    monkeypatch.setattr(runtime, "_RETRY_BACKOFF_S", 0)
+
+    n = {"create": 0}
+
+    def fake_create(api_key, spec, public_key):
+        n["create"] += 1
+        if n["create"] == 1:
+            raise runpod_client.CapacityError("no instances available")
+        return "pod-ok"
+
+    monkeypatch.setattr(runpod_client, "create_pod", fake_create)
+    monkeypatch.setattr(runpod_client, "wait_until_ready",
+                        lambda api_key, pod_id, **k: ("1.2.3.4", 40022))
+
+    result = runtime.provision_gpu(GpuSpec())
+    assert result["status"] == "ok"
+    assert result["pod_id"] == "pod-ok"
+    assert n["create"] == 2
+    # CapacityError means no pod was created on the first try → nothing to terminate.
+    assert fake_runpod["terminate"] == []
+
+
+def test_provision_gives_up_after_attempts(monkeypatch, fake_runpod):
+    """Exhausting retries returns a helpful error and frees every pod created."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    monkeypatch.setattr(runtime, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(runtime, "_PROVISION_ATTEMPTS", 3)
+
+    created = []
+    terminated = []
+    monkeypatch.setattr(runpod_client, "create_pod",
+                        lambda api_key, spec, pk: created.append(f"pod-{len(created)+1}") or created[-1])
+    monkeypatch.setattr(runpod_client, "wait_until_ready",
+                        lambda api_key, pod_id, **k: (_ for _ in ()).throw(
+                            runpod_client.NoEndpointError("no public IP on this machine")))
+    monkeypatch.setattr(runpod_client, "terminate_pod",
+                        lambda api_key, pod_id: terminated.append(pod_id))
+
+    result = runtime.provision_gpu(GpuSpec())
+    assert result["status"] == "error"
+    assert "after 3 attempts" in result["errors"]
+    assert len(created) == 3
+    assert terminated == ["pod-1", "pod-2", "pod-3"]  # every placement freed
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -302,6 +381,86 @@ def test_ssh_endpoint_none_when_not_public():
 
 def test_ssh_endpoint_none_when_empty():
     assert _ssh_endpoint({"publicIp": None, "portMappings": {}}) is None
+
+
+# ---------------------------------------------------------------------------
+# Provisioning failure classification — capacity + no-public-IP must be retryable.
+# ---------------------------------------------------------------------------
+
+class _FakeResp:
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
+    def json(self):
+        return {}
+
+
+class _FakeHttpxClient:
+    def __init__(self, resp):
+        self._resp = resp
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def post(self, *a, **k):
+        return self._resp
+
+
+def test_create_pod_capacity_error_is_retryable(monkeypatch):
+    """The RunPod '500 no instances available' must surface as a retryable CapacityError."""
+    resp = _FakeResp(
+        500,
+        '{"error":"create pod: There are no instances currently available","status":500}',
+    )
+
+    class FakeHttpx:
+        @staticmethod
+        def Client(*a, **k):
+            return _FakeHttpxClient(resp)
+
+    monkeypatch.setattr(runpod_client, "_httpx", lambda: FakeHttpx)
+    with pytest.raises(runpod_client.CapacityError):
+        runpod_client.create_pod("rp_x", GpuSpec(), "ssh-rsa AAA grafux")
+    # CapacityError is a ProvisionError so provision_gpu's retry path catches it.
+    assert issubclass(runpod_client.CapacityError, runpod_client.ProvisionError)
+
+
+def test_create_pod_other_error_is_not_retryable(monkeypatch):
+    resp = _FakeResp(400, '{"error":"bad image"}')
+
+    class FakeHttpx:
+        @staticmethod
+        def Client(*a, **k):
+            return _FakeHttpxClient(resp)
+
+    monkeypatch.setattr(runpod_client, "_httpx", lambda: FakeHttpx)
+    with pytest.raises(RuntimeError) as ei:
+        runpod_client.create_pod("rp_x", GpuSpec(), "ssh-rsa AAA grafux")
+    # A plain RuntimeError (NOT a ProvisionError) → provision_gpu fails immediately.
+    assert not isinstance(ei.value, runpod_client.ProvisionError)
+
+
+def test_wait_until_ready_fast_fails_when_no_public_ip(monkeypatch):
+    """A pod placed on a machine with no public IP fails fast, well before timeout."""
+    pod = {"desiredStatus": "RUNNING", "machineId": "m1",
+           "publicIp": "", "portMappings": None}
+    monkeypatch.setattr(runpod_client, "get_pod", lambda api_key, pod_id: pod)
+    monkeypatch.setattr(runpod_client, "_PUBLIC_IP_GRACE", 10)
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(runpod_client.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(runpod_client.time, "sleep",
+                        lambda s: clock.__setitem__("t", clock["t"] + s))
+
+    with pytest.raises(runpod_client.NoEndpointError) as ei:
+        runpod_client.wait_until_ready("rp_x", "pod-1", timeout_s=600, poll_s=5)
+    assert "public-IP networking" in str(ei.value)
+    # Bailed at the grace (~10s of fake clock), not the 600s timeout.
+    assert clock["t"] < 600
 
 
 # ---------------------------------------------------------------------------

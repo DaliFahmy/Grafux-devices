@@ -27,8 +27,35 @@ REST_BASE = "https://rest.runpod.io/v1"
 
 # How long to wait for a pod to come up with a public SSH endpoint.  Large CUDA
 # -devel images can take several minutes to pull on a cold machine, so this is
-# generous and overridable via env.
-_PROVISION_TIMEOUT = int(os.environ.get("GPU_PROVISION_TIMEOUT", "600") or "600")
+# generous and overridable via env.  (With retries — see GPU_PROVISION_ATTEMPTS in
+# runtime.py — this is the *per-attempt* cap, so it no longer needs to be huge.)
+_PROVISION_TIMEOUT = int(os.environ.get("GPU_PROVISION_TIMEOUT", "300") or "300")
+
+# A public IP + port-22 NAT mapping is a property of the *machine* a pod lands on,
+# assigned at placement — well before the container image finishes pulling.  So
+# once a pod is placed on a machine, if no public endpoint has appeared within this
+# many seconds, that machine simply has no direct public-IP networking and never
+# will: fail fast (NoEndpointError) so the caller can terminate and hop to a
+# different machine instead of waiting out the full image-pull timeout.  Set to 0
+# to disable early detection and always wait the full GPU_PROVISION_TIMEOUT.
+_PUBLIC_IP_GRACE = int(os.environ.get("GPU_PUBLIC_IP_GRACE", "120") or "120")
+
+
+class ProvisionError(RuntimeError):
+    """
+    Base for *retryable* provisioning failures — ones a fresh placement may fix.
+
+    ``runtime.provision_gpu`` catches this (and only this) to terminate the pod and
+    retry on a new machine; any other exception is treated as fatal.
+    """
+
+
+class CapacityError(ProvisionError):
+    """RunPod had no instances available for the requested GPU type / cloud tier."""
+
+
+class NoEndpointError(ProvisionError):
+    """A pod came up but never exposed a public SSH endpoint (machine has no public IP)."""
 
 # Prepended to compile/run commands so the CUDA toolkit resolves over SSH.  A
 # non-login exec session does not inherit the image's Docker ENV PATH, so we add
@@ -176,8 +203,17 @@ def create_pod(api_key: str, spec, public_key: str) -> str:
     with httpx.Client(timeout=60.0) as client:
         resp = client.post(f"{REST_BASE}/pods", headers=_headers(api_key), json=body)
     if resp.status_code not in (200, 201):
+        text = resp.text or ""
+        # "no instances currently available" is transient capacity scarcity, not a
+        # bad request — raise it as a retryable CapacityError so provision_gpu can
+        # back off and try again (a different machine may free up momentarily).
+        if resp.status_code in (429, 500) and "no instances" in text.lower():
+            raise CapacityError(
+                f"RunPod has no {(spec.cloud_type or 'SECURE').upper()} '{spec.gpu_model}' "
+                f"instances available right now ({resp.status_code})."
+            )
         raise RuntimeError(
-            f"RunPod create_pod failed ({resp.status_code}): {resp.text[:500]}"
+            f"RunPod create_pod failed ({resp.status_code}): {text[:500]}"
         )
     data = resp.json()
     pod_id = data.get("id") or data.get("podId")
@@ -304,21 +340,38 @@ def wait_until_ready(
     if timeout_s is None:
         timeout_s = _PROVISION_TIMEOUT
     deadline = time.monotonic() + timeout_s
+    placed_at: Optional[float] = None  # when we first saw the pod placed on a machine
     last: Dict[str, Any] = {}
     while time.monotonic() < deadline:
         last = get_pod(api_key, pod_id)
         status = (last.get("desiredStatus") or last.get("status") or "").upper()
         if status in ("TERMINATED", "FAILED"):
-            raise RuntimeError(
+            raise NoEndpointError(
                 f"Pod {pod_id} entered status {status}. {_status_summary(last)}"
             )
         endpoint = _ssh_endpoint(last)
         if endpoint:
             return endpoint
+        # Early no-public-IP detection.  The public IP / port-22 mapping is assigned
+        # when the pod is placed on a machine (it has a machineId / is RUNNING), so
+        # if it has not appeared a short grace after placement, this machine has no
+        # public-IP networking and never will — bail now so the caller can hop to a
+        # different machine instead of burning the whole image-pull timeout here.
+        if _PUBLIC_IP_GRACE and (last.get("machineId") or status == "RUNNING"):
+            now = time.monotonic()
+            if placed_at is None:
+                placed_at = now
+            elif now - placed_at >= _PUBLIC_IP_GRACE:
+                raise NoEndpointError(
+                    f"Pod {pod_id} has been placed on machine "
+                    f"{last.get('machineId')!r} for ~{_PUBLIC_IP_GRACE}s with no public "
+                    f"IP — this machine does not provide direct public-IP networking. "
+                    f"{_status_summary(last)}"
+                )
         time.sleep(poll_s)
     # Timed out.  Dump the full lifecycle + networking so the cause is visible:
     # still pulling the image? never allocated a public IP? wrong datacenter?
-    raise RuntimeError(
+    raise NoEndpointError(
         f"Pod {pod_id} not ready within {timeout_s}s — no public SSH endpoint "
         f"appeared. If it is still pulling a large image, raise GPU_PROVISION_TIMEOUT "
         f"or use a smaller 'image'. If publicIp stays empty, the placement has no "

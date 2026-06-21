@@ -40,8 +40,20 @@ services:
       # pods (and warm pods when GPU_EPHEMERAL=0). Set to 0 to disable.
       - key: GPU_IDLE_TIMEOUT_MIN
         value: "10"
-      # How long (seconds) to wait for a freshly-created pod to come up with a
-      # public SSH endpoint. Large CUDA -devel images take minutes to pull on a
-      # cold machine, so this is generous; raise it if Regenerate times out.
+      # How long (seconds) to wait, PER ATTEMPT, for a freshly-created pod to come
+      # up with a public SSH endpoint. Large CUDA -devel images take minutes to pull
+      # on a cold machine; raise it if Regenerate times out mid-pull.
       - key: GPU_PROVISION_TIMEOUT
-        value: "600"
+        value: "300"
+      # supportPublicIp does not GUARANTEE a public IP — it is a per-machine
+      # capability, so a pod can come up RUNNING with publicIp="" forever. Provision
+      # retries this many times, terminating and recreating to hop to a different
+      # machine, on a no-public-IP placement OR transient "no instances available".
+      - key: GPU_PROVISION_ATTEMPTS
+        value: "3"
+      # The public IP/port-22 mapping is assigned at machine placement, before the
+      # image finishes pulling. If it has not appeared this many seconds after the
+      # pod is placed, the machine has no public-IP networking — fail fast and hop
+      # instead of waiting the full GPU_PROVISION_TIMEOUT. Set to 0 to disable.
+      - key: GPU_PUBLIC_IP_GRACE
+        value: "120"

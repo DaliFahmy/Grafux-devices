@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from . import runpod_client
@@ -38,6 +39,17 @@ _PLACEHOLDER_VALUES = {"empty", "unconnected"}
 # is therefore $0.  Set ``GPU_EPHEMERAL=0`` to restore the warm create-once /
 # run-many model (pods stay up between runs and are only freed by the idle reaper).
 _EPHEMERAL = os.environ.get("GPU_EPHEMERAL", "1").lower() not in ("0", "false", "no")
+
+# Provisioning is best-effort on RunPod: a create can hit transient capacity
+# scarcity ("no instances available"), and even with supportPublicIp the pod can
+# land on a machine that has no public-IP networking (RUNNING forever with an empty
+# publicIp).  Both are *placement* problems a fresh pod usually escapes, so we
+# terminate and retry up to this many times before giving up.
+_PROVISION_ATTEMPTS = max(1, int(os.environ.get("GPU_PROVISION_ATTEMPTS", "3") or "3"))
+
+# Seconds to wait between retryable provisioning attempts (lets scarce capacity
+# free up; a no-public-IP machine is escaped immediately on the next create).
+_RETRY_BACKOFF_S = float(os.environ.get("GPU_RETRY_BACKOFF_S", "3") or "3")
 
 
 def _clean_port(text: Optional[str]) -> str:
@@ -120,39 +132,73 @@ def provision_gpu(spec: GpuSpec) -> Dict[str, Any]:
             ),
         }
 
-    pod_id = ""
-    try:
-        private_pem, public_key = runpod_client.generate_keypair()
-        pod_id = runpod_client.create_pod(api_key, spec, public_key)
-        public_ip, ssh_port = runpod_client.wait_until_ready(api_key, pod_id)
-        record = GpuRecord(
-            spec=spec,
-            pod_id=pod_id,
-            public_ip=public_ip,
-            ssh_port=ssh_port,
-            private_key_pem=private_pem,
-            api_key=api_key,
-        )
-        gpu_id = registry.create(record)
-        return {
-            "gpu_id": gpu_id,
-            "status": "ok",
-            "pod_id": pod_id,
-            "gpu_model": spec.gpu_model,
-            "errors": "",
-        }
-    except Exception as exc:  # noqa: BLE001 — surface as an error result, never 500.
-        logger.warning("gpu provision failed: %s", exc)
-        # If we created a pod but failed to connect, terminate it so it doesn't bill.
-        if pod_id:
-            runpod_client.terminate_pod(api_key, pod_id)
-        return {
-            "gpu_id": "",
-            "status": "error",
-            "pod_id": "",
-            "gpu_model": spec.gpu_model,
-            "errors": _describe_exception(exc),
-        }
+    last_err = ""
+    for attempt in range(1, _PROVISION_ATTEMPTS + 1):
+        pod_id = ""
+        try:
+            private_pem, public_key = runpod_client.generate_keypair()
+            pod_id = runpod_client.create_pod(api_key, spec, public_key)
+            public_ip, ssh_port = runpod_client.wait_until_ready(api_key, pod_id)
+            record = GpuRecord(
+                spec=spec,
+                pod_id=pod_id,
+                public_ip=public_ip,
+                ssh_port=ssh_port,
+                private_key_pem=private_pem,
+                api_key=api_key,
+            )
+            gpu_id = registry.create(record)
+            if attempt > 1:
+                logger.info(
+                    "gpu provisioned on attempt %d/%d", attempt, _PROVISION_ATTEMPTS
+                )
+            return {
+                "gpu_id": gpu_id,
+                "status": "ok",
+                "pod_id": pod_id,
+                "gpu_model": spec.gpu_model,
+                "errors": "",
+            }
+        except runpod_client.ProvisionError as exc:
+            # Retryable placement failure (no capacity, or a machine with no public
+            # IP).  Free any pod we created so it can't bill, then try a fresh
+            # placement — which usually lands on a different, working machine.
+            last_err = _describe_exception(exc)
+            logger.warning(
+                "gpu provision attempt %d/%d failed (retryable): %s",
+                attempt, _PROVISION_ATTEMPTS, exc,
+            )
+            if pod_id:
+                runpod_client.terminate_pod(api_key, pod_id)
+            if attempt < _PROVISION_ATTEMPTS and _RETRY_BACKOFF_S > 0:
+                time.sleep(_RETRY_BACKOFF_S)
+            continue
+        except Exception as exc:  # noqa: BLE001 — surface as an error result, never 500.
+            logger.warning("gpu provision failed: %s", exc)
+            # If we created a pod but failed to connect, terminate it so it doesn't bill.
+            if pod_id:
+                runpod_client.terminate_pod(api_key, pod_id)
+            return {
+                "gpu_id": "",
+                "status": "error",
+                "pod_id": "",
+                "gpu_model": spec.gpu_model,
+                "errors": _describe_exception(exc),
+            }
+
+    # Every attempt hit a retryable placement failure — surface the last cause plus
+    # the levers the user can pull (different GPU, or the more-available SECURE tier).
+    return {
+        "gpu_id": "",
+        "status": "error",
+        "pod_id": "",
+        "gpu_model": spec.gpu_model,
+        "errors": (
+            f"GPU provisioning failed after {_PROVISION_ATTEMPTS} attempts. {last_err} "
+            "Try a different 'gpu_model', set 'cloud_type' to 'SECURE', or Regenerate "
+            "again in a few minutes."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
