@@ -90,14 +90,19 @@ _CUDA_ENV = (
 # Curated list of common RunPod GPU types offered in the creation-dialog dropdown.
 # ``id`` is what RunPod expects in ``gpuTypeIds`` (and what the block stores in its
 # gpu_model port); ``label`` is the human-friendly name shown to the user.
+# Ordered cheapest -> priciest (typical RunPod $/hr) so cost-conscious users land
+# on an affordable card first; the first entry is also the default selection.
 GPU_TYPES: List[Dict[str, str]] = [
-    {"id": "NVIDIA GeForce RTX 4090", "label": "RTX 4090 (24 GB)"},
-    {"id": "NVIDIA GeForce RTX 5090", "label": "RTX 5090 (32 GB)"},
+    {"id": "NVIDIA RTX A4000", "label": "RTX A4000 (16 GB)"},
+    {"id": "NVIDIA RTX 2000 Ada Generation", "label": "RTX 2000 Ada (16 GB)"},
+    {"id": "NVIDIA RTX A4500", "label": "RTX A4500 (20 GB)"},
     {"id": "NVIDIA GeForce RTX 3090", "label": "RTX 3090 (24 GB)"},
-    {"id": "NVIDIA RTX 6000 Ada Generation", "label": "RTX 6000 Ada (48 GB)"},
-    {"id": "NVIDIA RTX A6000", "label": "RTX A6000 (48 GB)"},
+    {"id": "NVIDIA GeForce RTX 4090", "label": "RTX 4090 (24 GB)"},
     {"id": "NVIDIA L4", "label": "L4 (24 GB)"},
+    {"id": "NVIDIA RTX A6000", "label": "RTX A6000 (48 GB)"},
+    {"id": "NVIDIA RTX 6000 Ada Generation", "label": "RTX 6000 Ada (48 GB)"},
     {"id": "NVIDIA L40S", "label": "L40S (48 GB)"},
+    {"id": "NVIDIA GeForce RTX 5090", "label": "RTX 5090 (32 GB)"},
     {"id": "NVIDIA A100 80GB PCIe", "label": "A100 PCIe (80 GB)"},
     {"id": "NVIDIA A100-SXM4-80GB", "label": "A100 SXM (80 GB)"},
     {"id": "NVIDIA H100 PCIe", "label": "H100 PCIe (80 GB)"},
@@ -111,6 +116,9 @@ GPU_TYPES: List[Dict[str, str]] = [
 # model is confidently known; otherwise nvcc's default arch is used (PTX JIT keeps
 # the binary forward-compatible, so an omitted/older arch still runs correctly).
 _ARCH_BY_GPU: Dict[str, str] = {
+    "NVIDIA RTX A4000": "sm_86",
+    "NVIDIA RTX 2000 Ada Generation": "sm_89",
+    "NVIDIA RTX A4500": "sm_86",
     "NVIDIA GeForce RTX 4090": "sm_89",
     "NVIDIA GeForce RTX 5090": "sm_120",
     "NVIDIA GeForce RTX 3090": "sm_86",
