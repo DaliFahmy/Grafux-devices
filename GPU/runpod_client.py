@@ -91,7 +91,8 @@ _CUDA_ENV = (
 # ``id`` is what RunPod expects in ``gpuTypeIds`` (and what the block stores in its
 # gpu_model port); ``label`` is the human-friendly name shown to the user.
 # Ordered cheapest -> priciest (typical RunPod $/hr) so cost-conscious users land
-# on an affordable card first; the first entry is also the default selection.
+# on an affordable card first; the default selection is RTX 4090 (see
+# DEFAULT_GPU_MODEL in models.py / the creation dialog), not index 0.
 GPU_TYPES: List[Dict[str, str]] = [
     {"id": "NVIDIA RTX A4000", "label": "RTX A4000 (16 GB)"},
     {"id": "NVIDIA RTX 2000 Ada Generation", "label": "RTX 2000 Ada (16 GB)"},

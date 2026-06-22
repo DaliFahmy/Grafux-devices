@@ -52,7 +52,7 @@ DEFAULT_IMAGE = os.environ.get(
     # RunPod 500 "Container image ... was not found on the registry".
     "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
 )
-DEFAULT_GPU_MODEL = "NVIDIA RTX A4000"
+DEFAULT_GPU_MODEL = "NVIDIA GeForce RTX 4090"
 
 
 class GpuSpec(BaseModel):
