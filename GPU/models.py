@@ -27,12 +27,27 @@ timeout        -> GpuRunRequest.timeout   (per-run wall-clock limit, seconds)
 
 from __future__ import annotations
 
+import os
+
 from pydantic import BaseModel, Field
 
-# The default image is a RunPod CUDA *devel* image: it ships ``nvcc`` (devel) and
-# RunPod's start script that installs ``PUBLIC_KEY`` into authorized_keys and
-# starts sshd — so SSH "just works" with no custom image build.
-DEFAULT_IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
+# The default image is a RunPod CUDA *devel* image: it ships ``nvcc`` (devel),
+# Python 3.11 + PyTorch, and RunPod's start script that installs ``PUBLIC_KEY``
+# into authorized_keys and starts sshd — so SSH "just works" with no custom build.
+#
+# CUDA version note (the "cuda>=12.8 driver" gotcha): a CUDA container only starts
+# if the *host* NVIDIA driver is new enough for the image's CUDA toolkit.  The
+# previous default (cuda12.8.1) needs driver R570+, which a large share of RunPod
+# machines — Community especially — don't have yet, so the container init fails
+# with ``nvidia-container-cli: requirement error: unsatisfied condition: cuda>=12.8``
+# and the pod never comes up (RunPod itself advises "use an earlier cuda
+# container").  CUDA 12.4 (driver R550) is far more widely deployed, so it lands on
+# vastly more machines while still shipping a current PyTorch + nvcc.  Override via
+# the gpu block's ``image`` port (or ``GPU_DEFAULT_IMAGE``) to pin a newer CUDA.
+DEFAULT_IMAGE = os.environ.get(
+    "GPU_DEFAULT_IMAGE",
+    "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-cudnn-devel-ubuntu22.04",
+)
 DEFAULT_GPU_MODEL = "NVIDIA GeForce RTX 4090"
 
 

@@ -57,6 +57,27 @@ class CapacityError(ProvisionError):
 class NoEndpointError(ProvisionError):
     """A pod came up but never exposed a public SSH endpoint (machine has no public IP)."""
 
+
+# Substrings (case-insensitive) in a RunPod create error body that mean the failure
+# is a transient *placement* problem a fresh attempt on another machine can fix —
+# capacity scarcity or a machine that can't host the requested pod.  Matching any of
+# these classifies the create as a retryable CapacityError instead of a fatal error.
+_CAPACITY_MARKERS = (
+    "no instances",                 # "There are no instances currently available"
+    "does not have the resources",  # "This machine does not have the resources..."
+    "try a different machine",      # "...Please try a different machine"
+    "no longer any instances",
+    "not enough free gpu",
+    "out of capacity",
+    "insufficient capacity",
+)
+
+
+def _is_capacity_error(text: str) -> bool:
+    """True if a RunPod create error body indicates a retryable placement failure."""
+    low = (text or "").lower()
+    return any(marker in low for marker in _CAPACITY_MARKERS)
+
 # Prepended to compile/run commands so the CUDA toolkit resolves over SSH.  A
 # non-login exec session does not inherit the image's Docker ENV PATH, so we add
 # the standard CUDA bin/lib dirs explicitly (nvcc lives in /usr/local/cuda/bin).
@@ -204,13 +225,18 @@ def create_pod(api_key: str, spec, public_key: str) -> str:
         resp = client.post(f"{REST_BASE}/pods", headers=_headers(api_key), json=body)
     if resp.status_code not in (200, 201):
         text = resp.text or ""
-        # "no instances currently available" is transient capacity scarcity, not a
-        # bad request — raise it as a retryable CapacityError so provision_gpu can
-        # back off and try again (a different machine may free up momentarily).
-        if resp.status_code in (429, 500) and "no instances" in text.lower():
+        # A 429/500 whose body matches one of these is a *placement* failure, not a
+        # bad request: the requested GPU type is momentarily unavailable, or the
+        # machine RunPod tried to place us on can't host the pod ("This machine does
+        # not have the resources to deploy your pod. Please try a different
+        # machine").  Both are escaped by a fresh placement, so raise a retryable
+        # CapacityError and let provision_gpu back off and hop to another machine
+        # instead of failing the whole Run.
+        if resp.status_code in (429, 500) and _is_capacity_error(text):
             raise CapacityError(
-                f"RunPod has no {(spec.cloud_type or 'SECURE').upper()} '{spec.gpu_model}' "
-                f"instances available right now ({resp.status_code})."
+                f"RunPod could not place a {(spec.cloud_type or 'SECURE').upper()} "
+                f"'{spec.gpu_model}' pod right now ({resp.status_code}): "
+                f"{text.strip()[:200]}"
             )
         raise RuntimeError(
             f"RunPod create_pod failed ({resp.status_code}): {text[:500]}"

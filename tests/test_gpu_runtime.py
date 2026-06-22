@@ -429,6 +429,29 @@ def test_create_pod_capacity_error_is_retryable(monkeypatch):
     assert issubclass(runpod_client.CapacityError, runpod_client.ProvisionError)
 
 
+def test_create_pod_no_resources_is_retryable(monkeypatch):
+    """A 500 'this machine does not have the resources' must be a retryable CapacityError.
+
+    RunPod returns this when the machine it tried to place the pod on can't host it
+    ("Please try a different machine") — a placement failure a fresh attempt escapes,
+    so it must hop machines rather than fail the whole Run.
+    """
+    resp = _FakeResp(
+        500,
+        '{"error":"create pod: This machine does not have the resources to deploy '
+        'your pod. Please try a different machine","status":500}',
+    )
+
+    class FakeHttpx:
+        @staticmethod
+        def Client(*a, **k):
+            return _FakeHttpxClient(resp)
+
+    monkeypatch.setattr(runpod_client, "_httpx", lambda: FakeHttpx)
+    with pytest.raises(runpod_client.CapacityError):
+        runpod_client.create_pod("rp_x", GpuSpec(), "ssh-rsa AAA grafux")
+
+
 def test_create_pod_other_error_is_not_retryable(monkeypatch):
     resp = _FakeResp(400, '{"error":"bad image"}')
 

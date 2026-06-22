@@ -28,6 +28,13 @@ services:
       # the secret value in the Render dashboard.
       - key: RUNPOD_API_KEY
         sync: false
+      # Default pod image (CUDA -devel, ships Python 3.11 + PyTorch + nvcc). Pinned
+      # to CUDA 12.4 because a 12.4 container runs on the broadly-deployed R550 host
+      # driver; a 12.8 image needs R570+ which many machines lack, so its container
+      # init fails ("nvidia-container-cli: unsatisfied condition: cuda>=12.8") and the
+      # pod never comes up. Set a newer cuda image only if you need a newer toolkit.
+      - key: GPU_DEFAULT_IMAGE
+        value: "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-cudnn-devel-ubuntu22.04"
       # Ephemeral GPU lifecycle (default on): terminate the pod the instant a run
       # finishes so a GPU only costs money while it is actually compiling/running
       # (idle cost $0; the block re-provisions automatically on the next Run). Set
