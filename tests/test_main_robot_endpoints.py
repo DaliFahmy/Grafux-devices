@@ -26,8 +26,7 @@ import httpx
 from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 
-import devices_server
-from devices_server import app, manager
+from device.app import app, manager
 
 
 # ---------------------------------------------------------------------------

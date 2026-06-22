@@ -7,7 +7,7 @@ it locally**, and the program's output / errors / warnings show up in the block'
 output ports.
 
 ```
-Grafux app  ──ws://device-host:8765/?token=…──►  device_ws_server.py (your device)
+Grafux app  ──ws://device-host:8765/?token=…──►  server.py (your device)
    write C++ here                                    compile + run here
         └──────────────── output ports ◄──────────── results back
 ```
@@ -16,7 +16,7 @@ Grafux app  ──ws://device-host:8765/?token=…──►  device_ws_server.py
 
 | File                   | Purpose                                                         |
 | ---------------------- | -------------------------------------------------------------- |
-| `device_ws_server.py`  | The WebSocket server you run **on the device**.                |
+| `server.py`  | The WebSocket server you run **on the device**.                |
 | `handlers.py`          | Compile/run logic (cpp, c, python, shell) → output-port fields.|
 | `client_example.py`    | Reference client / manual test harness.                        |
 | `requirements.txt`     | `websockets` (compilers come from the OS).                      |
@@ -30,7 +30,7 @@ pip install -r requirements.txt
 #   Debian/Ubuntu/Raspberry Pi OS:  sudo apt install build-essential
 #   macOS:                          xcode-select --install
 
-python device_ws_server.py --port 8765 --token <your-secret> --device-id mydev
+python server.py --port 8765 --token <your-secret> --device-id mydev
 ```
 
 The server binds `0.0.0.0:8765` by default. Clients must supply the same token as
@@ -44,7 +44,7 @@ Environment variables (alternatives to flags): `DEVICE_WS_PORT`, `AGENT_TOKEN`,
 
 ```bash
 # Terminal 1 (device):
-python device_ws_server.py --token test
+python server.py --token test
 
 # Terminal 2:
 python client_example.py --url ws://localhost:8765 --token test
@@ -55,7 +55,7 @@ python client_example.py --url ws://localhost:8765 --token test
 
 ## Wire up a Grafux `devices` block
 
-1. Start `device_ws_server.py` on the device and note its address, e.g.
+1. Start `server.py` on the device and note its address, e.g.
    `ws://192.168.1.50:8765`.
 2. Add a `devices` block in Grafux and set its input ports:
    - **`device_id`** → the device address, e.g. `ws://192.168.1.50:8765`

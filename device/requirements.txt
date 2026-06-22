@@ -1,0 +1,4 @@
+# Device-block server (the hub in device.app) — REST + WebSocket relay.
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+websockets>=12.0

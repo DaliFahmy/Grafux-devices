@@ -20,7 +20,7 @@ import math
 import pytest
 from unittest.mock import AsyncMock, MagicMock, call
 
-from Mitsubishi_MELFA.handlers import (
+from device.agents.melfa.handlers import (
     AgentConfig,
     HANDLERS,
     handle_ping,
@@ -38,7 +38,7 @@ from Mitsubishi_MELFA.handlers import (
     _quaternion_to_euler_deg,
     _parse_text_json,
 )
-from Mitsubishi_MELFA import config as melfa_config
+from device.agents.melfa import config as melfa_config
 
 
 # ===========================================================================

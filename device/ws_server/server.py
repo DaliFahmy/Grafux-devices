@@ -1,5 +1,5 @@
 """
-websocket/device_ws_server.py
+device/ws_server/server.py
 Device-side WebSocket server.
 
 Runs *on the device* (Raspberry Pi, laptop, workstation, …) and lets Grafux
@@ -32,7 +32,7 @@ device → client:
 Usage
 -----
     pip install -r requirements.txt
-    python device_ws_server.py --port 8765 --token <secret> --device-id mydev
+    python server.py --port 8765 --token <secret> --device-id mydev
 
 Environment variables (all optional when flags are used):
     DEVICE_WS_PORT   Port to bind (default 8765)
@@ -57,7 +57,12 @@ except ImportError:
     print("ERROR: websockets is not installed.  Run: pip install -r requirements.txt")
     sys.exit(1)
 
-from handlers import dispatch
+try:
+    # When run as a script from this directory: ``python server.py``
+    from handlers import dispatch
+except ImportError:
+    # When imported as a package member: ``from device.ws_server import server``
+    from device.ws_server.handlers import dispatch
 
 logging.basicConfig(
     level=logging.INFO,

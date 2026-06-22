@@ -14,7 +14,7 @@ import uuid
 
 import pytest
 
-import commands as cmd
+from device import commands as cmd
 
 
 # ---------------------------------------------------------------------------

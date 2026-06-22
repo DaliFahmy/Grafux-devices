@@ -7,9 +7,9 @@ Every ROS2 / WebSocket dependency is replaced by a MagicMock / AsyncMock.
 
 Path setup
 ----------
-This conftest inserts `server/devices/` at the front of sys.path so that
-both the flat imports used by `devices_server.py` (e.g. `import commands`) and the
-package imports used by the Mitsubishi_MELFA package work correctly.
+This conftest inserts `server/devices/` at the front of sys.path so that the
+`device.*` package imports (e.g. `from device import commands`,
+`from device.agents.melfa import ...`) resolve correctly.
 """
 
 import asyncio
@@ -32,9 +32,9 @@ if _DEVICES_DIR not in sys.path:
 # Project imports (available after path setup)
 # ---------------------------------------------------------------------------
 
-from Mitsubishi_MELFA.handlers import AgentConfig  # noqa: E402
-from Mitsubishi_MELFA.ros_bridge import RosBridgeClient  # noqa: E402
-from Mitsubishi_MELFA import config as melfa_config  # noqa: E402
+from device.agents.melfa.handlers import AgentConfig  # noqa: E402
+from device.agents.melfa.ros_bridge import RosBridgeClient  # noqa: E402
+from device.agents.melfa import config as melfa_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

@@ -2,14 +2,14 @@
 websocket/client_example.py
 Reference client / manual test harness for the device-side WebSocket server.
 
-Connects to a running ``device_ws_server.py``, sends an inline C++ program with
+Connects to a running ``server.py``, sends an inline C++ program with
 ``action=compile_and_run`` (the primary Grafux flow), then a quick Python
 ``run_code``, and prints the port-mapped results.
 
 Usage
 -----
     # Terminal 1 — on the device:
-    python device_ws_server.py --token test
+    python server.py --token test
 
     # Terminal 2:
     python client_example.py --url ws://localhost:8765 --token test

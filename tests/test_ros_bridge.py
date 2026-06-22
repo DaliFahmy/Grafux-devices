@@ -22,7 +22,7 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from Mitsubishi_MELFA.ros_bridge import RosBridgeClient
+from device.agents.melfa.ros_bridge import RosBridgeClient
 
 
 # ---------------------------------------------------------------------------

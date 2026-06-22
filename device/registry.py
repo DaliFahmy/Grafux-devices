@@ -59,18 +59,27 @@ class ConnectionManager:
         logger.info("[%s] → sent command type=%s", device_id, payload.get("type"))
 
     async def broadcast(self, payload: dict) -> None:
-        """Send a JSON payload to every connected device."""
+        """Send a JSON payload to every connected device concurrently.
+
+        Sockets are written in parallel via ``asyncio.gather`` so one slow
+        device does not hold up delivery to the rest.  A failed send drops that
+        device from the registry.
+        """
         if not self._connections:
             logger.warning("broadcast called but no devices are connected")
             return
         message = json.dumps(payload)
-        for device_id, websocket in list(self._connections.items()):
+        targets = list(self._connections.items())
+
+        async def _send_one(device_id: str, websocket: WebSocket) -> None:
             try:
                 await websocket.send_text(message)
                 logger.info("[%s] → broadcast type=%s", device_id, payload.get("type"))
             except Exception as exc:  # noqa: BLE001
                 logger.error("[%s] broadcast failed: %s", device_id, exc)
                 self.disconnect(device_id)
+
+        await asyncio.gather(*(_send_one(d, ws) for d, ws in targets))
 
     # ------------------------------------------------------------------
     # Querying
