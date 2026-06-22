@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -136,6 +137,46 @@ def arch_for(gpu_model: str) -> str:
 def list_gpu_types() -> List[Dict[str, str]]:
     """Return the curated GPU dropdown list (id + label)."""
     return list(GPU_TYPES)
+
+
+# Heuristics for guessing the source language when the declared ``language`` does
+# not match the code.  The gpu block's ``language`` port defaults to ``cuda`` (the
+# creation dialog seeds it), so a user who pastes Python into the ``code`` port
+# without also flipping ``language`` to ``python`` would otherwise have their
+# Python written to ``/tmp/job.cu`` and fed to nvcc — which chokes on ``#``
+# comments with "invalid preprocessing directive #...".  We detect that case and
+# run the source through ``python3`` instead.
+_PYTHON_SIGNALS = (
+    re.compile(r"^\s*import\s+\w", re.MULTILINE),
+    re.compile(r"^\s*from\s+\w[\w.]*\s+import\s", re.MULTILINE),
+    re.compile(r"^\s*def\s+\w+\s*\(", re.MULTILINE),
+    re.compile(r"^\s*class\s+\w+\s*[\(:]", re.MULTILINE),
+    re.compile(r"^\s*print\s*\(", re.MULTILINE),
+    re.compile(r"^#!.*\bpython", re.MULTILINE),
+)
+# C / C++ / CUDA structure that means the source is NOT Python — these suppress
+# the Python guess even if a stray ``print(`` slips through.
+_C_SIGNALS = (
+    re.compile(r"^\s*#\s*include\b", re.MULTILINE),
+    re.compile(r"^\s*#\s*define\b", re.MULTILINE),
+    re.compile(r"\b__global__\b|\b__device__\b|\b__host__\b"),
+    re.compile(r"\b(?:int|void)\s+main\s*\("),
+    re.compile(r"\busing\s+namespace\b"),
+)
+
+
+def looks_like_python(source: str) -> bool:
+    """Best-effort guess: does this source read as Python (not C/C++/CUDA)?
+
+    True only when there is at least one strong Python signal and no C-family
+    structural signal.  Conservative on purpose — a false positive would route
+    real CUDA to ``python3``, so when in doubt we say no.
+    """
+    if not source:
+        return False
+    if any(p.search(source) for p in _C_SIGNALS):
+        return False
+    return any(p.search(source) for p in _PYTHON_SIGNALS)
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +499,15 @@ def run_remote(
     lang = (language or "cuda").lower()
     is_python = lang in ("python", "py")
     is_cuda = lang in ("cuda", "cu")
+
+    # The ``language`` port defaults to ``cuda``; if the user pasted Python into
+    # the ``code`` port without flipping it, compiling with nvcc fails on the
+    # ``#`` comments ("invalid preprocessing directive #..."). Auto-correct when
+    # the source unmistakably reads as Python so it runs via ``python3`` instead.
+    lang_autodetected = False
+    if not is_python and looks_like_python(source):
+        is_python, is_cuda, lang_autodetected = True, False, True
+
     ext = "py" if is_python else ("cu" if is_cuda else "cpp")
     src_path = f"/tmp/job.{ext}"
     bin_path = "/tmp/job"
@@ -490,7 +540,11 @@ def run_remote(
         # The compiled path (cuda/cpp) still nvcc/g++-compiles into ``bin_path``.
         if is_python:
             compile_ms = 0
-            compile_warnings = ""
+            compile_warnings = (
+                "Detected Python source but the 'language' port was not set to "
+                "'python' — ran with python3. Set language=python to silence this."
+                if lang_autodetected else ""
+            )
             run_target = f"python3 {src_path}"
         else:
             flags = (compile_flags or "").strip()

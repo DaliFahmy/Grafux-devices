@@ -621,3 +621,38 @@ def test_run_remote_cuda_still_compiles(fake_ssh):
     joined = "\n".join(fake_ssh["commands"])
     assert "nvcc" in joined
     assert "python3 /tmp/job" not in joined
+
+
+def test_run_remote_autodetects_python_when_language_default(fake_ssh):
+    # The exact bug report: Python pasted into a block whose language port is
+    # still the default "cuda" → must run via python3, not nvcc on /tmp/job.cu.
+    source = "# Create two matrices\nimport torch\nprint(torch.zeros(2))\n"
+    result = runpod_client.run_remote(
+        "1.2.3.4", 40022, "PEM",
+        source=source,
+        language="cuda",
+        gpu_model="NVIDIA GeForce RTX 4090",
+        compile_flags="-O3",
+        args="",
+        timeout=60,
+    )
+    assert result["status"] == "ok"
+    # Routed to python, NOT compiled as CUDA.
+    assert "/tmp/job.py" in fake_ssh["uploaded"]
+    assert "/tmp/job.cu" not in fake_ssh["uploaded"]
+    joined = "\n".join(fake_ssh["commands"])
+    assert "nvcc" not in joined
+    assert "python3 /tmp/job.py" in joined
+    # The user is told we corrected the language.
+    assert "language" in result["warnings"].lower()
+
+
+def test_looks_like_python_does_not_misfire_on_cuda():
+    # C/CUDA structure must suppress the Python guess even with a stray print(.
+    assert not runpod_client.looks_like_python(
+        "#include <cstdio>\nint main(){ print(1); return 0; }"
+    )
+    assert not runpod_client.looks_like_python("__global__ void k(){}")
+    # Real Python is recognised.
+    assert runpod_client.looks_like_python("import os\nprint(os.getcwd())")
+    assert not runpod_client.looks_like_python("")
