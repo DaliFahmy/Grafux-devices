@@ -46,7 +46,11 @@ from pydantic import BaseModel, Field
 # the gpu block's ``image`` port (or ``GPU_DEFAULT_IMAGE``) to pin a newer CUDA.
 DEFAULT_IMAGE = os.environ.get(
     "GPU_DEFAULT_IMAGE",
-    "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-cudnn-devel-ubuntu22.04",
+    # NOTE the exact tag: RunPod's 2.4.0 image is published as "...-devel-..." with
+    # NO "-cudnn" segment (cuDNN is bundled but not named in the tag — unlike the
+    # 2.8.0 "...-cudnn-devel..." tag). An invented "-cudnn-devel" tag here yields a
+    # RunPod 500 "Container image ... was not found on the registry".
+    "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
 )
 DEFAULT_GPU_MODEL = "NVIDIA GeForce RTX 4090"
 
