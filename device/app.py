@@ -33,6 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from . import router as device_router_mod
 from . import robot as robot_router_mod
+from .constants import AGENT_TOKEN
 from .router import manager, results  # re-exported for tests / external scripts
 
 # ---------------------------------------------------------------------------
@@ -48,7 +49,7 @@ logger = logging.getLogger("devices.app")
 
 PORT: int = int(os.environ.get("PORT", "8000"))
 
-if device_router_mod.AGENT_TOKEN == "changeme":
+if AGENT_TOKEN == "changeme":
     logger.warning(
         "AGENT_TOKEN is set to the default value 'changeme'. "
         "Set the AGENT_TOKEN environment variable in production!"

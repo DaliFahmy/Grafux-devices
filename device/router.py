@@ -16,12 +16,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from . import commands as cmd_builder
 from . import runtime
+from .constants import AGENT_TOKEN, DOWNLOAD_WAIT_BUFFER_S, RUN_WAIT_BUFFER_S
 from .models import (
     CompileAndRunRequest,
     DownloadAndRunRequest,
@@ -33,12 +33,6 @@ from .registry import ConnectionManager
 from .results import ResultStore
 
 logger = logging.getLogger("devices.server")
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-AGENT_TOKEN: str = os.environ.get("AGENT_TOKEN", "changeme")
 
 # ---------------------------------------------------------------------------
 # Shared singletons (re-exported by device.app)
@@ -76,37 +70,49 @@ async def websocket_endpoint(
         while True:
             raw = await websocket.receive_text()
             try:
-                message = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning("[%s] Received non-JSON message: %s", device_id, raw[:200])
-                continue
-
-            msg_type = message.get("type", "unknown")
-            logger.info("[%s] ← received type=%s", device_id, msg_type)
-            logger.debug("[%s] payload: %s", device_id, message)
-
-            # Make the reply retrievable by REST pollers (the wait=false path).
-            # Devices use one of two id conventions, so index by both:
-            #   - message["id"]         (e.g. device.ws_server echoes the request id)
-            #   - message["command_id"] (e.g. the Pi agent echoes the original id)
-            # plus a re-readable "latest:<device_id>" fallback.
-            cmd_id = message.get("id")
-            if cmd_id and cmd_id != "None":
-                results.put(str(cmd_id), message)
-            results.put(f"latest:{device_id}", message)
-
-            # Deliver to any REST caller awaiting this result (the wait=true path).
-            echo_id = message.get("command_id")
-            if echo_id:
-                resolved = manager.resolve_result(str(echo_id), message)
-                if resolved:
-                    # A Future already delivered it — no need to also cache it.
-                    logger.debug("[%s] resolved pending waiter for command_id=%s", device_id, echo_id)
-                else:
-                    results.put(str(echo_id), message)
-
+                _ingest_device_message(device_id, raw)
+            except Exception:  # noqa: BLE001 — one bad message must not drop the socket
+                logger.exception("[%s] error handling device message (ignored)", device_id)
     except WebSocketDisconnect:
-        manager.disconnect(device_id)
+        pass
+    except Exception:  # noqa: BLE001 — log unexpected socket faults instead of silently dropping
+        logger.exception("[%s] websocket loop error", device_id)
+    finally:
+        # Only evict if we are still the registered socket (a reconnect may have
+        # already replaced us).
+        manager.disconnect(device_id, websocket)
+
+
+def _ingest_device_message(device_id: str, raw: str) -> None:
+    """Parse one inbound device frame and route its result (store + resolve)."""
+    try:
+        message = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("[%s] Received non-JSON message: %s", device_id, raw[:200])
+        return
+
+    msg_type = message.get("type", "unknown")
+    logger.info("[%s] <- received type=%s", device_id, msg_type)
+    logger.debug("[%s] payload: %s", device_id, message)
+
+    # Make the reply retrievable by REST pollers (the wait=false path).
+    # Devices use one of two id conventions, so index by both:
+    #   - message["id"]         (e.g. device.ws_server echoes the request id)
+    #   - message["command_id"] (e.g. the Pi agent echoes the original id)
+    # plus a re-readable "latest:<device_id>" fallback.
+    cmd_id = message.get("id")
+    if cmd_id and cmd_id != "None":
+        results.put(str(cmd_id), message)
+    results.put(f"latest:{device_id}", message)
+
+    # Deliver to any REST caller awaiting this result (the wait=true path).
+    echo_id = message.get("command_id")
+    if echo_id:
+        if manager.resolve_result(str(echo_id), message):
+            # A Future already delivered it — no need to also cache it.
+            logger.debug("[%s] resolved pending waiter for command_id=%s", device_id, echo_id)
+        else:
+            results.put(str(echo_id), message)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +181,7 @@ async def send_run_code(device_id: str, body: RunCodeRequest, wait: bool = True)
     """
     command = cmd_builder.run_code(body.code, body.timeout)
     return await runtime.send_and_maybe_wait(
-        manager, device_id, command, wait=wait, wait_timeout=body.timeout + 10
+        manager, device_id, command, wait=wait, wait_timeout=body.timeout + RUN_WAIT_BUFFER_S
     )
 
 
@@ -219,7 +225,7 @@ async def send_compile_and_run(device_id: str, body: CompileAndRunRequest, wait:
         timeout=body.timeout,
     )
     return await runtime.send_and_maybe_wait(
-        manager, device_id, command, wait=wait, wait_timeout=body.timeout + 10
+        manager, device_id, command, wait=wait, wait_timeout=body.timeout + RUN_WAIT_BUFFER_S
     )
 
 
@@ -240,5 +246,5 @@ async def send_download_and_run(device_id: str, body: DownloadAndRunRequest, wai
         file_url=body.file_url,
     )
     return await runtime.send_and_maybe_wait(
-        manager, device_id, command, wait=wait, wait_timeout=body.timeout + 30
+        manager, device_id, command, wait=wait, wait_timeout=body.timeout + DOWNLOAD_WAIT_BUFFER_S
     )

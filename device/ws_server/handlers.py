@@ -21,8 +21,6 @@ downloaded from S3.  No transport (WebSocket / HTTP / stdin) is assumed here.
 from __future__ import annotations
 
 import base64
-import contextlib
-import io
 import logging
 import mimetypes
 import os
@@ -33,10 +31,21 @@ import tempfile
 
 logger = logging.getLogger("device.handlers")
 
+#: Wall-clock cap on a compile step (seconds).
+COMPILE_TIMEOUT_S = int(os.environ.get("AGENT_COMPILE_TIMEOUT_S", "60"))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _safe_int(value, default: int) -> int:
+    """Coerce *value* to int, falling back to *default* on bad input."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _split_diagnostics(lines: list) -> tuple:
@@ -148,7 +157,7 @@ def handle_compile_and_run(payload: dict) -> dict:
     filename  = (payload.get("filename") or "").strip()
     language  = _normalize_language(payload.get("language", ""), filename)
     args      = (payload.get("args") or "").strip()
-    timeout   = int(payload.get("timeout", 120))
+    timeout   = _safe_int(payload.get("timeout"), 120)
     file_path = (payload.get("file_path") or "").strip()
 
     # Run an existing on-device file when file_path is given (no inline code).
@@ -202,7 +211,7 @@ def _compile_and_run_path(file_path: str, language: str, args: str, timeout: int
             binary = os.path.splitext(file_path)[0]
             compile_result = subprocess.run(
                 ["gcc", "-o", binary, file_path, "-lm"],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=COMPILE_TIMEOUT_S,
             )
             compile_stdout     = compile_result.stdout.splitlines()
             compile_stderr     = compile_result.stderr.splitlines()
@@ -215,7 +224,7 @@ def _compile_and_run_path(file_path: str, language: str, args: str, timeout: int
             binary = os.path.splitext(file_path)[0]
             compile_result = subprocess.run(
                 ["g++", "-o", binary, file_path, "-lm", "-lstdc++"],
-                capture_output=True, text=True, timeout=60,
+                capture_output=True, text=True, timeout=COMPILE_TIMEOUT_S,
             )
             compile_stdout     = compile_result.stdout.splitlines()
             compile_stderr     = compile_result.stderr.splitlines()
@@ -324,31 +333,33 @@ def _compile_error(compile_stdout: list, compile_stderr: list, returncode: int) 
 
 
 def handle_run_code(payload: dict) -> dict:
-    """Execute an inline Python snippet (convenience wrapper)."""
+    """Execute an inline Python snippet in an isolated subprocess with a timeout.
+
+    Running as a subprocess (not in-process ``exec``) means the ``timeout`` is
+    actually enforceable — an infinite loop is killed instead of hanging the
+    device server forever — and user code cannot reach the server's own state.
+    """
     code    = payload.get("code", "")
+    timeout = _safe_int(payload.get("timeout"), 30)
     if not code:
         return _error("run_code_result", "code is required")
 
-    stdout_lines: list = []
-    stderr_lines: list = []
-
     with tempfile.TemporaryDirectory() as tmpdir:
-        old_cwd = os.getcwd()
         try:
-            os.chdir(tmpdir)
-            stdout_buf, stderr_buf = io.StringIO(), io.StringIO()
-            try:
-                with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
-                    exec(compile(code, "<device>", "exec"), {})  # noqa: S102
-                stdout_lines = stdout_buf.getvalue().splitlines()
-                stderr_lines = stderr_buf.getvalue().splitlines()
-                status = "ok"
-            except Exception as exc:  # noqa: BLE001
-                stdout_lines = stdout_buf.getvalue().splitlines()
-                stderr_lines = stderr_buf.getvalue().splitlines() or [str(exc)]
-                status = "error"
-        finally:
-            os.chdir(old_cwd)
+            proc = subprocess.run(
+                [sys.executable, "-I", "-c", code],
+                capture_output=True, text=True, timeout=timeout, cwd=tmpdir,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "type": "run_code_result", "status": "timeout",
+                "output": "", "errors": f"Execution exceeded {timeout}s and was terminated.",
+                "warnings": "", "response": f"timeout — killed after {timeout}s",
+                "stdout": [], "stderr": [], "files": [],
+            }
+        stdout_lines = proc.stdout.splitlines()
+        stderr_lines = proc.stderr.splitlines()
+        status = "ok" if proc.returncode == 0 else "error"
         files = _collect_files(tmpdir)
 
     _warnings, _ = _split_diagnostics(stderr_lines)
@@ -373,7 +384,7 @@ def handle_run_code(payload: dict) -> dict:
 def handle_shell(payload: dict) -> dict:
     """Run an arbitrary shell command."""
     command = payload.get("command", "")
-    timeout = int(payload.get("timeout", 30))
+    timeout = _safe_int(payload.get("timeout"), 30)
     if not command:
         return _error("shell_result", "command is required")
     try:

@@ -1,6 +1,7 @@
 """
-connection_manager.py
-Tracks active WebSocket connections, keyed by device_id.
+device/registry.py
+Tracks active WebSocket connections, keyed by device_id, and the per-command
+Futures that REST callers await on (the request/reply path).
 """
 
 import asyncio
@@ -28,15 +29,33 @@ class ConnectionManager:
     # ------------------------------------------------------------------
 
     async def connect(self, device_id: str, websocket: WebSocket) -> None:
-        """Accept the handshake and register the device."""
+        """Accept the handshake and register the device.
+
+        If a connection already exists for *device_id* (e.g. the device
+        reconnected before the server noticed the old socket died), the stale
+        socket is closed first so it cannot linger half-open or deliver a late
+        result onto the new connection's waiters.
+        """
         await websocket.accept()
-        if device_id in self._connections:
-            logger.warning("[%s] Replacing existing connection", device_id)
+        old = self._connections.get(device_id)
+        if old is not None:
+            logger.warning("[%s] Replacing existing connection — closing the stale socket", device_id)
+            try:
+                await old.close(code=1012)  # 1012 = Service Restart / superseded
+            except Exception as exc:  # noqa: BLE001 — best effort; never block the new connection
+                logger.debug("[%s] error closing stale socket: %s", device_id, exc)
         self._connections[device_id] = websocket
         logger.info("[%s] Connected  (total: %d)", device_id, len(self._connections))
 
-    def disconnect(self, device_id: str) -> None:
-        """Remove a device from the registry."""
+    def disconnect(self, device_id: str, websocket: Optional[WebSocket] = None) -> None:
+        """Remove a device from the registry.
+
+        If *websocket* is given, the device is only removed when it is still the
+        currently-registered socket.  This prevents a closing old connection from
+        evicting a newer one that already replaced it (see ``connect``).
+        """
+        if websocket is not None and self._connections.get(device_id) is not websocket:
+            return
         self._connections.pop(device_id, None)
         logger.info("[%s] Disconnected  (total: %d)", device_id, len(self._connections))
 
@@ -47,7 +66,9 @@ class ConnectionManager:
     async def send(self, device_id: str, payload: dict) -> None:
         """Send a JSON payload to one specific device.
 
-        Raises HTTPException(404) if the device is not connected.
+        Raises HTTPException(404) if the device is not connected, or HTTPException(503)
+        if the socket is dead — in which case the device is dropped from the
+        registry so it is not reported as connected until it reconnects.
         """
         websocket = self._connections.get(device_id)
         if websocket is None:
@@ -55,8 +76,16 @@ class ConnectionManager:
                 status_code=404,
                 detail=f"Device '{device_id}' is not connected.",
             )
-        await websocket.send_text(json.dumps(payload))
-        logger.info("[%s] → sent command type=%s", device_id, payload.get("type"))
+        try:
+            await websocket.send_text(json.dumps(payload))
+        except Exception as exc:  # noqa: BLE001 — a dead socket must not look "sent"
+            logger.warning("[%s] send failed (%s) — dropping stale connection", device_id, exc)
+            self.disconnect(device_id)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Device '{device_id}' connection is no longer usable.",
+            ) from exc
+        logger.info("[%s] -> sent command type=%s", device_id, payload.get("type"))
 
     async def broadcast(self, payload: dict) -> None:
         """Send a JSON payload to every connected device concurrently.
@@ -74,7 +103,7 @@ class ConnectionManager:
         async def _send_one(device_id: str, websocket: WebSocket) -> None:
             try:
                 await websocket.send_text(message)
-                logger.info("[%s] → broadcast type=%s", device_id, payload.get("type"))
+                logger.info("[%s] -> broadcast type=%s", device_id, payload.get("type"))
             except Exception as exc:  # noqa: BLE001
                 logger.error("[%s] broadcast failed: %s", device_id, exc)
                 self.disconnect(device_id)
@@ -130,6 +159,14 @@ class ConnectionManager:
             return None
         finally:
             self._pending.pop(command_id, None)
+
+    def cancel_waiter(self, command_id: str) -> None:
+        """Drop a pre-registered waiter that will never be awaited.
+
+        Call this if ``send()`` fails after ``register_waiter()`` so the orphaned
+        Future does not accumulate in ``_pending`` (a slow memory leak otherwise).
+        """
+        self._pending.pop(command_id, None)
 
     def resolve_result(self, command_id: str, result: dict) -> bool:
         """Deliver *result* to any caller waiting on *command_id*.

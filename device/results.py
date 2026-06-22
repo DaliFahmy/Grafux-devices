@@ -27,9 +27,9 @@ import logging
 import time
 from typing import Optional
 
-logger = logging.getLogger("devices.results")
+from .constants import RESULT_TTL_S as DEFAULT_TTL_S
 
-DEFAULT_TTL_S: int = 120  # seconds before an uncollected result is discarded
+logger = logging.getLogger("devices.results")
 
 
 class ResultStore:

@@ -59,7 +59,14 @@ async def send_and_maybe_wait(
     if wait:
         manager.register_waiter(command_id)  # register BEFORE send to avoid a race
 
-    await manager.send(device_id, command)
+    try:
+        await manager.send(device_id, command)
+    except Exception:
+        # send failed (device gone / dead socket).  Drop the pre-registered
+        # waiter so it doesn't leak in _pending, then let the error propagate.
+        if wait:
+            manager.cancel_waiter(command_id)
+        raise
 
     if not wait:
         return {"status": "sent", "command_id": command_id, "command": command}
