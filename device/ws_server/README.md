@@ -18,8 +18,9 @@ Grafux app  ──ws://device-host:8765/?token=…──►  server.py (your dev
 | ---------------------- | -------------------------------------------------------------- |
 | `server.py`  | The WebSocket server you run **on the device**.                |
 | `handlers.py`          | Compile/run logic (cpp, c, python, shell) → output-port fields.|
+| `discovery.py`         | Optional LAN mDNS advertisement so the app auto-finds the device.|
 | `client_example.py`    | Reference client / manual test harness.                        |
-| `requirements.txt`     | `websockets` (compilers come from the OS).                      |
+| `requirements.txt`     | `websockets` (+ optional `zeroconf`; compilers come from the OS).|
 
 ## Run the server on the device
 
@@ -94,6 +95,28 @@ Device → device after compiling/running:
 
 `status` is `ok` | `compile_error` | `runtime_error` | `timeout` | `error`. For
 `compile_error`, the compiler diagnostics are split into `errors` vs `warnings`.
+
+### Live progress frames
+
+Before the single final result frame, `compile_and_run` and `run_code` stream
+zero or more **progress** frames over the same socket so the block can show
+`Compiling…` / `Running…` and live stdout instead of a frozen "Running":
+
+```json
+{ "id": "<uuid>", "type": "progress", "phase": "compiling" }
+{ "id": "<uuid>", "type": "progress", "phase": "running", "line": "42" }
+```
+
+A frame is a progress frame **iff** `type == "progress"`; the terminal result
+frame never carries that type. Clients that ignore progress frames (and a server
+build that only sends the final frame) keep working unchanged.
+
+### LAN discovery (mDNS)
+
+The server advertises `_grafux-device._tcp.local.` (TXT: `device_id`, `type`,
+`version`) so the desktop app's **Select Device…** picker finds it automatically.
+This needs the optional `zeroconf` package; it is skipped silently when `zeroconf`
+is absent or when `DEVICE_MDNS_DISABLE` is set / `--no-mdns` is passed.
 
 ## Notes & limitations
 

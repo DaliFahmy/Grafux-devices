@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +51,22 @@ _PROVISION_ATTEMPTS = max(1, int(os.environ.get("GPU_PROVISION_ATTEMPTS", "3") o
 # Seconds to wait between retryable provisioning attempts (lets scarce capacity
 # free up; a no-public-IP machine is escaped immediately on the next create).
 _RETRY_BACKOFF_S = float(os.environ.get("GPU_RETRY_BACKOFF_S", "3") or "3")
+
+# Server-side default keep-warm window (minutes) applied when neither the run
+# request nor the block's spec sets one.  0 keeps today's ephemeral behavior.
+_DEFAULT_KEEP_WARM_MIN = int(os.environ.get("GPU_DEFAULT_KEEP_WARM_MIN", "0") or "0")
+
+
+def _keep_warm_minutes(*candidates: Any) -> int:
+    """First positive keep-warm window among the candidates, else the env default."""
+    for value in candidates:
+        try:
+            minutes = int(value or 0)
+        except (TypeError, ValueError):
+            minutes = 0
+        if minutes > 0:
+            return minutes
+    return max(0, _DEFAULT_KEEP_WARM_MIN)
 
 
 def _clean_port(text: Optional[str]) -> str:
@@ -113,51 +130,87 @@ def _describe_exception(exc: BaseException) -> str:
 # Provision (Regenerate) — create a pod and cache it.
 # ---------------------------------------------------------------------------
 
-def provision_gpu(spec: GpuSpec) -> Dict[str, Any]:
+def provision_gpu(spec: GpuSpec, *, gpu_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Provision a RunPod pod from a GpuSpec and register it.
 
-    Returns {gpu_id, status, pod_id, gpu_model, errors}.  Never raises.
+    When ``gpu_id`` is given, an already-registered (stub) record is populated in
+    place and its ``phase`` is advanced as provisioning progresses — this is how
+    ``provision_gpu_async`` exposes live ``creating -> pulling_image -> ready``
+    phases.  When omitted, a fresh record is created and its new id returned.
+
+    A positive ``keep_warm_minutes`` on the spec also pre-warms the pod (holds it
+    past the idle reaper), so a Regenerate/create doubles as a pre-warm.
+
+    Returns {gpu_id, status, pod_id, gpu_model, errors, usd_per_hr, warm_until}.
+    Never raises.
     """
     api_key = _resolve_runpod_key(spec)
     if not api_key:
+        msg = (
+            "No RunPod API key found. Set the gpu block's api_keys port "
+            "({\"runpod\": \"rp_...\"}) or the RUNPOD_API_KEY env var on the server."
+        )
+        if gpu_id:
+            registry.set_phase(gpu_id, "error", msg)
         return {
-            "gpu_id": "",
+            "gpu_id": gpu_id or "",
             "status": "error",
             "pod_id": "",
             "gpu_model": spec.gpu_model,
-            "errors": (
-                "No RunPod API key found. Set the gpu block's api_keys port "
-                "({\"runpod\": \"rp_...\"}) or the RUNPOD_API_KEY env var on the server."
-            ),
+            "errors": msg,
+            "usd_per_hr": 0.0,
+            "warm_until": 0.0,
         }
 
+    rate = runpod_client.price_for(spec.gpu_model)
     last_err = ""
     for attempt in range(1, _PROVISION_ATTEMPTS + 1):
         pod_id = ""
         try:
+            if gpu_id:
+                registry.set_phase(gpu_id, "creating", f"placing pod (attempt {attempt})")
             private_pem, public_key = runpod_client.generate_keypair()
             pod_id = runpod_client.create_pod(api_key, spec, public_key)
+            if gpu_id:
+                registry.set_connection(
+                    gpu_id, pod_id=pod_id, private_key_pem=private_pem,
+                    api_key=api_key, usd_per_hr=rate,
+                )
+                registry.set_phase(gpu_id, "pulling_image", "starting container")
             public_ip, ssh_port = runpod_client.wait_until_ready(api_key, pod_id)
-            record = GpuRecord(
-                spec=spec,
-                pod_id=pod_id,
-                public_ip=public_ip,
-                ssh_port=ssh_port,
-                private_key_pem=private_pem,
-                api_key=api_key,
-            )
-            gpu_id = registry.create(record)
+
+            if gpu_id:
+                registry.set_connection(gpu_id, public_ip=public_ip, ssh_port=ssh_port)
+                registry.set_phase(gpu_id, "ready")
+                new_id = gpu_id
+            else:
+                record = GpuRecord(
+                    spec=spec,
+                    pod_id=pod_id,
+                    public_ip=public_ip,
+                    ssh_port=ssh_port,
+                    private_key_pem=private_pem,
+                    api_key=api_key,
+                    usd_per_hr=rate,
+                    phase="ready",
+                )
+                new_id = registry.create(record)
+
+            warm_min = _keep_warm_minutes(spec.keep_warm_minutes)
+            warm_until = registry.set_keep_warm(new_id, warm_min) if warm_min > 0 else 0.0
             if attempt > 1:
                 logger.info(
                     "gpu provisioned on attempt %d/%d", attempt, _PROVISION_ATTEMPTS
                 )
             return {
-                "gpu_id": gpu_id,
+                "gpu_id": new_id,
                 "status": "ok",
                 "pod_id": pod_id,
                 "gpu_model": spec.gpu_model,
                 "errors": "",
+                "usd_per_hr": rate,
+                "warm_until": warm_until,
             }
         except runpod_client.ProvisionError as exc:
             # Retryable placement failure (no capacity, or a machine with no public
@@ -178,26 +231,86 @@ def provision_gpu(spec: GpuSpec) -> Dict[str, Any]:
             # If we created a pod but failed to connect, terminate it so it doesn't bill.
             if pod_id:
                 runpod_client.terminate_pod(api_key, pod_id)
+            err = _describe_exception(exc)
+            if gpu_id:
+                registry.set_phase(gpu_id, "error", err)
             return {
-                "gpu_id": "",
+                "gpu_id": gpu_id or "",
                 "status": "error",
                 "pod_id": "",
                 "gpu_model": spec.gpu_model,
-                "errors": _describe_exception(exc),
+                "errors": err,
+                "usd_per_hr": rate,
+                "warm_until": 0.0,
             }
 
     # Every attempt hit a retryable placement failure — surface the last cause plus
     # the levers the user can pull (different GPU, or the more-available SECURE tier).
+    msg = (
+        f"GPU provisioning failed after {_PROVISION_ATTEMPTS} attempts. {last_err} "
+        "Try a different 'gpu_model', set 'cloud_type' to 'SECURE', or Regenerate "
+        "again in a few minutes."
+    )
+    if gpu_id:
+        registry.set_phase(gpu_id, "error", msg)
     return {
-        "gpu_id": "",
+        "gpu_id": gpu_id or "",
         "status": "error",
         "pod_id": "",
         "gpu_model": spec.gpu_model,
-        "errors": (
-            f"GPU provisioning failed after {_PROVISION_ATTEMPTS} attempts. {last_err} "
-            "Try a different 'gpu_model', set 'cloud_type' to 'SECURE', or Regenerate "
-            "again in a few minutes."
-        ),
+        "errors": msg,
+        "usd_per_hr": rate,
+        "warm_until": 0.0,
+    }
+
+
+def provision_gpu_async(spec: GpuSpec) -> Dict[str, Any]:
+    """
+    Begin provisioning in the background and return immediately with a gpu_id.
+
+    Registers a stub record with ``phase="creating"`` and spawns a daemon thread
+    (same pattern as the idle reaper) that runs the normal ``provision_gpu`` body,
+    advancing the record's phase as it goes.  The block then polls
+    ``GET /gpu/{id}/status`` until the phase is ``ready`` (or ``error``) and only
+    then issues the Run — so the cold start is visible instead of an opaque wait.
+
+    Returns {gpu_id, status:"creating", pod_id:"", gpu_model, errors}.  An immediate
+    failure (no API key) returns status="error" with an empty gpu_id.
+    """
+    api_key = _resolve_runpod_key(spec)
+    if not api_key:
+        return {
+            "gpu_id": "",
+            "status": "error",
+            "pod_id": "",
+            "gpu_model": spec.gpu_model,
+            "errors": (
+                "No RunPod API key found. Set the gpu block's api_keys port "
+                "({\"runpod\": \"rp_...\"}) or the RUNPOD_API_KEY env var on the server."
+            ),
+            "usd_per_hr": 0.0,
+            "warm_until": 0.0,
+        }
+
+    stub = GpuRecord(spec=spec, phase="creating", usd_per_hr=runpod_client.price_for(spec.gpu_model))
+    gpu_id = registry.create(stub)
+
+    def _job() -> None:
+        try:
+            provision_gpu(spec, gpu_id=gpu_id)
+        except Exception as exc:  # noqa: BLE001 — never let the daemon thread die loud.
+            logger.warning("background gpu provision crashed for %s: %s", gpu_id, exc)
+            registry.set_phase(gpu_id, "error", _describe_exception(exc))
+
+    threading.Thread(target=_job, name=f"gpu-provision-{gpu_id}", daemon=True).start()
+    return {
+        "gpu_id": gpu_id,
+        "status": "creating",
+        "pod_id": "",
+        "gpu_model": spec.gpu_model,
+        "errors": "",
+        "usd_per_hr": stub.usd_per_hr,
+        "warm_until": 0.0,
     }
 
 
@@ -226,12 +339,18 @@ def run_gpu(gpu_id: str, req: GpuRunRequest) -> Dict[str, Any]:
     """
     Compile and run code on the pod identified by ``gpu_id``.
 
-    Returns {gpu_id, status, response, errors, warnings, benchmark(JSON string)}.
+    Returns {gpu_id, status, response, errors, warnings, benchmark(JSON string),
+    artifacts(JSON string), kept_warm, warm_until, usd_per_hr, cost_estimate_usd}.
     Never raises.
 
-    In the default ephemeral mode (``GPU_EPHEMERAL``) the pod is terminated as soon
-    as the run finishes — on success or failure — and the returned ``gpu_id`` is ""
-    so the block clears its cached pod id and re-provisions on the next Run.
+    Teardown is decided per run: by default (ephemeral) the pod is terminated the
+    instant the run finishes — on success or failure — and the returned ``gpu_id``
+    is "" so the block re-provisions on the next Run.  A positive
+    ``keep_warm_minutes`` (on the request, else the block's spec, else the env
+    default) keeps the pod alive after a *successful* run for instant re-runs: the
+    live ``gpu_id`` is reported so the block reuses the warm pod, and the idle
+    reaper frees it once the warm window expires.  Failures always tear down (no
+    orphan billing).
     """
     record = registry.get(gpu_id)
     if record is None:
@@ -249,32 +368,46 @@ def run_gpu(gpu_id: str, req: GpuRunRequest) -> Dict[str, Any]:
             "benchmark": "",
         }
 
-    # In ephemeral mode the pod is gone after this call, so report "" to clear the
-    # block's cached gpu_id; otherwise keep reporting the live id (warm reuse).
-    report_id = "" if _EPHEMERAL else gpu_id
+    warm_min = _keep_warm_minutes(req.keep_warm_minutes, record.spec.keep_warm_minutes)
+    rate = record.usd_per_hr or runpod_client.price_for(record.spec.gpu_model)
+    did_keep_warm = False
+    warm_until = 0.0
+    # Whether the pod survives this call.  A keep-warm hold is only applied on a
+    # clean success (did_keep_warm, set below); failing that, the pod survives only
+    # in warm mode (GPU_EPHEMERAL=0).  report_id is the live id when it survives, ""
+    # otherwise (so the block re-provisions next Run).  Recomputed after the run once
+    # did_keep_warm is known.
+    report_id = gpu_id if not _EPHEMERAL else ""
+
+    def _result(**extra: Any) -> Dict[str, Any]:
+        base = {
+            "gpu_id": report_id,
+            "status": "error",
+            "response": "",
+            "errors": "",
+            "warnings": "",
+            "benchmark": "",
+            "artifacts": "",
+            "kept_warm": did_keep_warm,
+            "warm_until": warm_until,
+            "usd_per_hr": rate,
+            "cost_estimate_usd": record.cost_estimate_usd,
+        }
+        base.update(extra)
+        return base
+
     try:
         if not record.is_running:
-            return {
-                "gpu_id": report_id,
-                "status": "error",
-                "response": "",
-                "errors": "GPU pod is not running — a fresh pod will be provisioned on the next run.",
-                "warnings": "",
-                "benchmark": "",
-            }
+            return _result(
+                errors="GPU pod is not running — a fresh pod will be provisioned on the next run.",
+            )
 
         registry.touch(gpu_id)
         code = _clean_port(req.code)
         if not code:
-            return {
-                "gpu_id": report_id,
-                "status": "error",
-                "response": "",
-                "errors": "The 'code' input port is empty — nothing to compile.",
-                "warnings": "",
-                "benchmark": "",
-            }
+            return _result(errors="The 'code' input port is empty — nothing to compile.")
 
+        registry.set_phase(gpu_id, "running", "compiling / executing")
         try:
             result = runpod_client.run_remote(
                 record.public_ip,
@@ -286,32 +419,39 @@ def run_gpu(gpu_id: str, req: GpuRunRequest) -> Dict[str, Any]:
                 compile_flags=record.spec.compile_flags,
                 args=req.args,
                 timeout=int(req.timeout or 120),
+                input_files=list(req.input_files or []),
+                output_globs=list(req.output_globs or []),
+                working_dir=req.working_dir or "/workspace",
             )
         except Exception as exc:  # noqa: BLE001 — connection/SSH failures → error result.
             logger.warning("gpu run failed: %s", exc)
-            return {
-                "gpu_id": report_id,
-                "status": "error",
-                "response": "",
-                "errors": _describe_exception(exc),
-                "warnings": "",
-                "benchmark": "",
-            }
+            registry.set_phase(gpu_id, "error", _describe_exception(exc))
+            return _result(errors=_describe_exception(exc))
+
+        status = result.get("status", "ok")
+        # Keep the pod warm only on a clean success — a broken pod is not worth
+        # holding.  This flips report_id to the live id and skips the teardown below.
+        if status == "ok" and warm_min > 0:
+            warm_until = registry.set_keep_warm(gpu_id, warm_min)
+            did_keep_warm = True
+            report_id = gpu_id
+        registry.set_phase(gpu_id, "ready")
 
         benchmark = result.get("benchmark") or {}
-        return {
-            "gpu_id": report_id,
-            "status": result.get("status", "ok"),
-            "response": result.get("response", ""),
-            "errors": result.get("errors", ""),
-            "warnings": result.get("warnings", ""),
-            "benchmark": json.dumps(benchmark) if benchmark else "",
-        }
+        artifacts = result.get("artifacts") or []
+        return _result(
+            status=status,
+            response=result.get("response", ""),
+            errors=result.get("errors", ""),
+            warnings=result.get("warnings", ""),
+            benchmark=json.dumps(benchmark) if benchmark else "",
+            artifacts=json.dumps(artifacts) if artifacts else "",
+        )
     finally:
-        # The big cost fix: free the pod the instant the run is done so it never
-        # bills while idle.  Runs only on a record we actually hold (not the
-        # unknown-id early return above).
-        if _EPHEMERAL:
+        # Free the pod the instant the run is done so it never bills while idle —
+        # unless this run kept it warm for fast re-runs (did_keep_warm), or warm
+        # mode (GPU_EPHEMERAL=0) is keeping it for the idle reaper.
+        if _EPHEMERAL and not did_keep_warm:
             _teardown_after_run(gpu_id, record)
 
 
@@ -328,3 +468,87 @@ def terminate_gpu(gpu_id: str) -> bool:
         runpod_client.terminate_pod(record.api_key, record.pod_id)
     registry.delete(gpu_id)
     return True
+
+
+# ---------------------------------------------------------------------------
+# Status — live phase / uptime / cost for a pod (polled by the block).
+# ---------------------------------------------------------------------------
+
+# Exposing the pod's SSH host/port + private key lets a user open their own
+# terminal, but the key is a secret the rest of the API never echoes — so it is
+# OFF unless explicitly enabled on a trusted-network deployment.
+_EXPOSE_SSH = os.environ.get("GPU_EXPOSE_SSH", "").lower() in ("1", "true", "yes")
+
+
+def ssh_exposed() -> bool:
+    return _EXPOSE_SSH
+
+
+def _ssh_hint(record: GpuRecord) -> str:
+    """A copy-pasteable ssh command for the pod (host/port only, no key)."""
+    if not (record.public_ip and record.ssh_port):
+        return ""
+    return f"ssh -p {record.ssh_port} root@{record.public_ip}"
+
+
+def gpu_status(gpu_id: str, *, live: bool = False) -> Optional[Dict[str, Any]]:
+    """
+    Return a live status dict for a pod, or None if the id is unknown.
+
+    With ``live=True`` and a placed pod, do one RunPod ``get_pod`` to refine the
+    phase from the cloud's own view (creating/pulling_image/ready/error) and pick up
+    the live hourly rate.  Without it, report the cached record phase only (no REST
+    call) so a fast frontend poll cannot hammer the RunPod API.
+    """
+    record = registry.get(gpu_id)
+    if record is None:
+        return None
+
+    phase, detail = record.phase, record.phase_detail
+    rate = record.usd_per_hr or runpod_client.price_for(record.spec.gpu_model)
+    if live and record.pod_id and record.api_key:
+        try:
+            pod = runpod_client.get_pod(record.api_key, record.pod_id)
+            phase, detail = runpod_client.phase_from_pod(pod)
+            live_rate = runpod_client.cost_per_hr_of(pod)
+            if live_rate:
+                rate = live_rate
+                registry.set_connection(gpu_id, usd_per_hr=live_rate)
+        except Exception as exc:  # noqa: BLE001 — status must never raise.
+            logger.debug("gpu live status lookup failed for %s: %s", gpu_id, exc)
+
+    return {
+        "gpu_id": gpu_id,
+        "phase": phase or ("ready" if record.is_running else ""),
+        "phase_detail": detail,
+        "pod_id": record.pod_id,
+        "gpu_model": record.spec.gpu_model,
+        "pod_status": "running" if record.is_running else "pending",
+        "uptime_s": record.uptime_s,
+        "warm_until": record.warm_until,
+        "usd_per_hr": rate,
+        "cost_estimate_usd": round(rate * record.uptime_s / 3600.0, 4),
+        "ssh": _ssh_hint(record) if _EXPOSE_SSH else "",
+    }
+
+
+def gpu_ssh(gpu_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Return SSH connection details (incl. the private key) for a running pod.
+
+    Gated by ``GPU_EXPOSE_SSH`` (the caller checks ``ssh_exposed()``).  Returns
+    None for an unknown or not-yet-running pod.  Touches keep-warm so an
+    interactive session is not reaped out from under the user.
+    """
+    record = registry.get(gpu_id)
+    if record is None or not record.is_running:
+        return None
+    registry.touch(gpu_id)
+    return {
+        "gpu_id": gpu_id,
+        "host": record.public_ip,
+        "port": record.ssh_port,
+        "username": "root",
+        "private_key_pem": record.private_key_pem,
+        "connect_hint": _ssh_hint(record),
+    }

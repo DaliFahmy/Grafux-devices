@@ -93,25 +93,32 @@ _CUDA_ENV = (
 # Ordered cheapest -> priciest (typical RunPod $/hr) so cost-conscious users land
 # on an affordable card first; the default selection is RTX 4090 (see
 # DEFAULT_GPU_MODEL in models.py / the creation dialog), not index 0.
-GPU_TYPES: List[Dict[str, str]] = [
-    {"id": "NVIDIA RTX A4000", "label": "RTX A4000 (16 GB)"},
-    {"id": "NVIDIA RTX 2000 Ada Generation", "label": "RTX 2000 Ada (16 GB)"},
-    {"id": "NVIDIA RTX A4500", "label": "RTX A4500 (20 GB)"},
-    {"id": "NVIDIA GeForce RTX 3090", "label": "RTX 3090 (24 GB)"},
-    {"id": "NVIDIA GeForce RTX 4090", "label": "RTX 4090 (24 GB)"},
-    {"id": "NVIDIA L4", "label": "L4 (24 GB)"},
-    {"id": "NVIDIA RTX A6000", "label": "RTX A6000 (48 GB)"},
-    {"id": "NVIDIA RTX 6000 Ada Generation", "label": "RTX 6000 Ada (48 GB)"},
-    {"id": "NVIDIA L40S", "label": "L40S (48 GB)"},
-    {"id": "NVIDIA GeForce RTX 5090", "label": "RTX 5090 (32 GB)"},
-    {"id": "NVIDIA A100 80GB PCIe", "label": "A100 PCIe (80 GB)"},
-    {"id": "NVIDIA A100-SXM4-80GB", "label": "A100 SXM (80 GB)"},
-    {"id": "NVIDIA H100 PCIe", "label": "H100 PCIe (80 GB)"},
-    {"id": "NVIDIA H100 80GB HBM3", "label": "H100 SXM (80 GB)"},
-    {"id": "NVIDIA H100 NVL", "label": "H100 NVL (94 GB)"},
-    {"id": "NVIDIA H200", "label": "H200 (141 GB)"},
-    {"id": "NVIDIA B200", "label": "B200 (180 GB)"},
+# ``usd_per_hr`` is an *advisory* reference price (RunPod Secure on-demand, approx.)
+# shown in the picker so cost-conscious users can choose with eyes open — it is not
+# billing-authoritative (the real rate is the live pod ``costPerHr``, which varies by
+# Secure/Community and machine).  Update here as RunPod pricing drifts.
+GPU_TYPES: List[Dict[str, Any]] = [
+    {"id": "NVIDIA RTX A4000", "label": "RTX A4000 (16 GB)", "usd_per_hr": 0.17},
+    {"id": "NVIDIA RTX 2000 Ada Generation", "label": "RTX 2000 Ada (16 GB)", "usd_per_hr": 0.23},
+    {"id": "NVIDIA RTX A4500", "label": "RTX A4500 (20 GB)", "usd_per_hr": 0.26},
+    {"id": "NVIDIA GeForce RTX 3090", "label": "RTX 3090 (24 GB)", "usd_per_hr": 0.43},
+    {"id": "NVIDIA GeForce RTX 4090", "label": "RTX 4090 (24 GB)", "usd_per_hr": 0.69},
+    {"id": "NVIDIA L4", "label": "L4 (24 GB)", "usd_per_hr": 0.43},
+    {"id": "NVIDIA RTX A6000", "label": "RTX A6000 (48 GB)", "usd_per_hr": 0.49},
+    {"id": "NVIDIA RTX 6000 Ada Generation", "label": "RTX 6000 Ada (48 GB)", "usd_per_hr": 0.74},
+    {"id": "NVIDIA L40S", "label": "L40S (48 GB)", "usd_per_hr": 0.86},
+    {"id": "NVIDIA GeForce RTX 5090", "label": "RTX 5090 (32 GB)", "usd_per_hr": 0.94},
+    {"id": "NVIDIA A100 80GB PCIe", "label": "A100 PCIe (80 GB)", "usd_per_hr": 1.19},
+    {"id": "NVIDIA A100-SXM4-80GB", "label": "A100 SXM (80 GB)", "usd_per_hr": 1.74},
+    {"id": "NVIDIA H100 PCIe", "label": "H100 PCIe (80 GB)", "usd_per_hr": 2.39},
+    {"id": "NVIDIA H100 80GB HBM3", "label": "H100 SXM (80 GB)", "usd_per_hr": 2.99},
+    {"id": "NVIDIA H100 NVL", "label": "H100 NVL (94 GB)", "usd_per_hr": 2.79},
+    {"id": "NVIDIA H200", "label": "H200 (141 GB)", "usd_per_hr": 3.99},
+    {"id": "NVIDIA B200", "label": "B200 (180 GB)", "usd_per_hr": 5.99},
 ]
+
+# id -> advisory usd_per_hr, built from GPU_TYPES for O(1) lookup in price_for().
+_PRICE_BY_GPU: Dict[str, float] = {g["id"]: float(g.get("usd_per_hr", 0.0)) for g in GPU_TYPES}
 
 # Best-effort CUDA compute-capability (-arch) per GPU type.  Used only when the
 # model is confidently known; otherwise nvcc's default arch is used (PTX JIT keeps
@@ -143,9 +150,45 @@ def arch_for(gpu_model: str) -> str:
     return sm or ""
 
 
-def list_gpu_types() -> List[Dict[str, str]]:
-    """Return the curated GPU dropdown list (id + label)."""
+def list_gpu_types() -> List[Dict[str, Any]]:
+    """Return the curated GPU dropdown list (id + label + usd_per_hr)."""
     return list(GPU_TYPES)
+
+
+def price_for(gpu_model: str) -> float:
+    """Advisory hourly price for a GPU model, or 0.0 if unknown."""
+    return _PRICE_BY_GPU.get((gpu_model or "").strip(), 0.0)
+
+
+def cost_per_hr_of(pod: Dict[str, Any]) -> float:
+    """Live hourly rate from a pod payload (RunPod ``costPerHr``), or 0.0."""
+    try:
+        return float(pod.get("costPerHr") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def phase_from_pod(pod: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Derive a (phase, detail) for live status from a RunPod pod payload.
+
+    creating       — placed but not yet RUNNING (still starting the container)
+    pulling_image  — RUNNING but no public SSH endpoint yet (image still pulling /
+                     port mapping not up)
+    ready          — RUNNING with a public SSH endpoint
+    error          — TERMINATED / FAILED
+
+    Mirrors the shapes ``wait_until_ready`` already inspects (``_ssh_endpoint`` +
+    ``desiredStatus``) so status agrees with provisioning.
+    """
+    status = (pod.get("desiredStatus") or pod.get("status") or "").upper()
+    if status in ("TERMINATED", "FAILED"):
+        return "error", f"pod entered status {status}"
+    if _ssh_endpoint(pod):
+        return "ready", ""
+    if status == "RUNNING" or pod.get("machineId"):
+        return "pulling_image", "container starting / image pulling"
+    return "creating", "placing the pod on a machine"
 
 
 # Heuristics for guessing the source language when the declared ``language`` does
@@ -487,6 +530,92 @@ def _exec(client, command: str, timeout: int) -> Tuple[int, str, str]:
     return code, out, err
 
 
+# Cap on artifact bytes pulled back per file and in total, so a stray large output
+# can never bloat the run response / port payload (ports are strings).  Overridable.
+_ARTIFACT_MAX_FILE_BYTES = int(os.environ.get("GPU_ARTIFACT_MAX_FILE_BYTES", str(2 * 1024 * 1024)))
+_ARTIFACT_MAX_TOTAL_BYTES = int(os.environ.get("GPU_ARTIFACT_MAX_TOTAL_BYTES", str(8 * 1024 * 1024)))
+
+
+def _stage_input_files(sftp, input_files: List[Dict[str, Any]]) -> None:
+    """Write caller-supplied files into the pod before the run (best-effort dirs)."""
+    import base64 as _b64
+    for item in input_files or []:
+        if not isinstance(item, dict):
+            continue
+        path = (item.get("path") or "").strip()
+        if not path:
+            continue
+        content = item.get("content") or ""
+        data = _b64.b64decode(content) if item.get("b64") else (
+            content.encode("utf-8") if isinstance(content, str) else content
+        )
+        parent = path.rsplit("/", 1)[0]
+        if parent and parent != path:
+            _sftp_makedirs(sftp, parent)
+        with sftp.open(path, "wb") as fh:
+            fh.write(data)
+
+
+def _sftp_makedirs(sftp, directory: str) -> None:
+    """mkdir -p over SFTP — create each path component, ignoring 'already exists'."""
+    parts = [p for p in directory.split("/") if p]
+    cur = ""
+    for part in parts:
+        cur += "/" + part
+        try:
+            sftp.mkdir(cur)
+        except Exception:  # noqa: BLE001 — exists or no perms; the open() will report real failures
+            pass
+
+
+def _download_artifacts(client, output_globs: List[str]) -> List[Dict[str, Any]]:
+    """
+    Resolve globs on-device and SFTP-read each match, capped in size.
+
+    Returns a list of {path, size, content(base64), b64:true, truncated}.  Best-
+    effort: a glob that matches nothing, or a file that can't be read, is skipped.
+    """
+    import base64 as _b64
+    globs = [g for g in (output_globs or []) if isinstance(g, str) and g.strip()]
+    if not globs:
+        return []
+    # Expand globs to concrete paths via the shell (handles *, ?, brace patterns).
+    listing_cmd = "bash -lc 'for f in " + " ".join(globs) + '; do [ -f "$f" ] && echo "$f"; done\''
+    _code, out, _err = _exec(client, listing_cmd, timeout=30)
+    paths: List[str] = []
+    for line in out.splitlines():
+        p = line.strip()
+        if p and p not in paths:
+            paths.append(p)
+    artifacts: List[Dict[str, Any]] = []
+    total = 0
+    sftp = client.open_sftp()
+    try:
+        for path in paths:
+            try:
+                with sftp.open(path, "rb") as fh:
+                    data = fh.read(_ARTIFACT_MAX_FILE_BYTES + 1)
+            except Exception:  # noqa: BLE001 — unreadable file, skip it
+                continue
+            truncated = len(data) > _ARTIFACT_MAX_FILE_BYTES
+            data = data[:_ARTIFACT_MAX_FILE_BYTES]
+            if total + len(data) > _ARTIFACT_MAX_TOTAL_BYTES:
+                artifacts.append({"path": path, "size": len(data), "content": "",
+                                  "b64": True, "truncated": True})
+                continue
+            total += len(data)
+            artifacts.append({
+                "path": path,
+                "size": len(data),
+                "content": _b64.b64encode(data).decode("ascii"),
+                "b64": True,
+                "truncated": truncated,
+            })
+    finally:
+        sftp.close()
+    return artifacts
+
+
 def run_remote(
     host: str,
     port: int,
@@ -498,12 +627,20 @@ def run_remote(
     compile_flags: str,
     args: str,
     timeout: int,
+    input_files: Optional[List[Dict[str, Any]]] = None,
+    output_globs: Optional[List[str]] = None,
+    working_dir: str = "/workspace",
 ) -> Dict[str, Any]:
     """
     Upload source to the pod, compile it, run it, and capture output + timing.
 
-    Returns a dict with keys: status, response, errors, warnings, benchmark(dict).
-    Never raises for a compile/run failure — those are reported in the result.
+    Optionally stages ``input_files`` into the pod before the run and downloads
+    files matching ``output_globs`` after it (returned base64-encoded under the
+    ``artifacts`` key, size-capped).
+
+    Returns a dict with keys: status, response, errors, warnings, benchmark(dict),
+    artifacts(list).  Never raises for a compile/run failure — those are reported
+    in the result.
     """
     lang = (language or "cuda").lower()
     is_python = lang in ("python", "py")
@@ -523,11 +660,12 @@ def run_remote(
 
     client = _connect_ssh(host, port, private_key_pem, timeout=min(timeout, 60))
     try:
-        # 1) Upload the source.
+        # 1) Upload the source (and any caller-supplied input files).
         sftp = client.open_sftp()
         try:
             with sftp.open(src_path, "w") as fh:
                 fh.write(source or "")
+            _stage_input_files(sftp, input_files or [])
         finally:
             sftp.close()
 
@@ -592,6 +730,7 @@ def run_remote(
                         "gpu_model": gpu_model,
                         "stage": "compile",
                     },
+                    "artifacts": [],
                 }
             compile_warnings = c_err.strip()  # nvcc/g++ warnings go to stderr on success
             run_target = bin_path
@@ -638,6 +777,9 @@ def run_remote(
             "gpu_model": gpu_model,
             "gpu_info": gpu_info.strip(),
         }
+        # 5) Download requested artifacts (after the run, regardless of exit code so
+        #    partial outputs are still retrievable).
+        artifacts = _download_artifacts(client, output_globs or [])
         if exit_code != 0:
             errors = r_err.strip() or f"program exited with code {exit_code}"
             # exit 127 = python3 not found → the selected image has no Python.
@@ -656,6 +798,7 @@ def run_remote(
                 "errors": errors,
                 "warnings": compile_warnings,
                 "benchmark": benchmark,
+                "artifacts": artifacts,
             }
         return {
             "status": "ok",
@@ -663,6 +806,7 @@ def run_remote(
             "errors": r_err.strip(),
             "warnings": compile_warnings,
             "benchmark": benchmark,
+            "artifacts": artifacts,
         }
     finally:
         client.close()

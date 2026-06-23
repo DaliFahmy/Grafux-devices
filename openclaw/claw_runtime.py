@@ -31,8 +31,64 @@ from .models import ClawSpec
 
 logger = logging.getLogger("openclaw.runtime")
 
-DEFAULT_MODEL = "claude-opus-4-8"
+# The claw model is configurable per-deployment (OPENCLAW_DEFAULT_MODEL) so an
+# operator can default every new claw to a cheaper/faster tier without a code
+# change; the user can still override it per-claw via the ``agent`` port.
+DEFAULT_MODEL = os.environ.get("OPENCLAW_DEFAULT_MODEL", "claude-opus-4-8")
 DEFAULT_MAX_TOKENS = 4096
+
+# Model catalog — pricing ($ per 1M tokens) and whether the model accepts the
+# sampling params (temperature/top_p/top_k).  Sourced from the Claude API
+# reference (2026-06).  CRITICAL: the Opus 4.7+/Fable family REJECTS sampling
+# params with HTTP 400, so we must NOT send them for those models (see
+# _model_accepts_sampling / run_claw).  Pricing drives the per-run cost badge.
+#   "in"/"out" = $/1M input/output tokens; "sampling" = accepts temperature etc.
+MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
+    "claude-fable-5":    {"label": "Claude Fable 5",    "in": 10.0, "out": 50.0, "sampling": False},
+    "claude-opus-4-8":   {"label": "Claude Opus 4.8",   "in": 5.0,  "out": 25.0, "sampling": False},
+    "claude-opus-4-7":   {"label": "Claude Opus 4.7",   "in": 5.0,  "out": 25.0, "sampling": False},
+    "claude-opus-4-6":   {"label": "Claude Opus 4.6",   "in": 5.0,  "out": 25.0, "sampling": True},
+    "claude-sonnet-4-6": {"label": "Claude Sonnet 4.6", "in": 3.0,  "out": 15.0, "sampling": True},
+    "claude-haiku-4-5":  {"label": "Claude Haiku 4.5",  "in": 1.0,  "out": 5.0,  "sampling": True},
+}
+
+
+def _model_accepts_sampling(model: str) -> bool:
+    """
+    Whether ``model`` accepts temperature/top_p/top_k.
+
+    The Opus 4.7/4.8 and Fable families return HTTP 400 when sent any sampling
+    param, so the claw must omit them.  Unknown models default to *not* sending
+    sampling params — the safe choice, since the current frontier default
+    (claude-opus-4-8) rejects them and most new models follow suit.
+    """
+    entry = MODEL_CATALOG.get(model)
+    if entry is not None:
+        return bool(entry["sampling"])
+    return False
+
+
+def _estimate_cost_usd(model: str, usage: Any) -> float:
+    """
+    Estimate the USD cost of a run from ``message.usage`` and the model tier.
+
+    Mirrors Anthropic's cache pricing: uncached input + cache *writes* at 1.25x,
+    cache *reads* at 0.1x, output at the output rate.  Returns 0.0 for an unknown
+    model or missing usage (the badge then simply shows token counts).
+    """
+    entry = MODEL_CATALOG.get(model)
+    if entry is None or usage is None:
+        return 0.0
+    in_rate = entry["in"] / 1_000_000.0
+    out_rate = entry["out"] / 1_000_000.0
+    inp = int(getattr(usage, "input_tokens", 0) or 0)
+    out = int(getattr(usage, "output_tokens", 0) or 0)
+    cache_write = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    cache_read = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    return round(
+        inp * in_rate + cache_write * in_rate * 1.25 + cache_read * in_rate * 0.1 + out * out_rate,
+        6,
+    )
 
 # Sentinels the Grafux frontend writes into a port file when nothing is wired to
 # it (see PortDataService::kEmptyPortValue and the "unconnected" literal in the
@@ -232,7 +288,6 @@ async def run_claw(
     request_kwargs: Dict[str, Any] = dict(
         model=params["model"],
         max_tokens=params["max_tokens"],
-        temperature=params.get("temperature", 1.0),
         system=[
             {
                 "type": "text",
@@ -243,6 +298,12 @@ async def run_claw(
         ],
         messages=[{"role": "user", "content": user_turn}],
     )
+    # Only send sampling params when the user explicitly set them AND the model
+    # accepts them — the Opus 4.7+/Fable family returns HTTP 400 otherwise, which
+    # is exactly the default model (claude-opus-4-8).  This is why the claw never
+    # sends a default temperature.
+    if "temperature" in params and _model_accepts_sampling(params["model"]):
+        request_kwargs["temperature"] = params["temperature"]
 
     try:
         if local_conns:
@@ -273,7 +334,103 @@ async def run_claw(
     text = "".join(
         block.text for block in message.content if getattr(block, "type", None) == "text"
     )
-    return {"status": "ok", "response": text, "errors": ""}
+    usage = getattr(message, "usage", None)
+    return {
+        "status": "ok",
+        "response": text,
+        "errors": "",
+        "input_tokens": int(getattr(usage, "input_tokens", 0) or 0)
+        + int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        + int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+        "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+        "cache_read_input_tokens": int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        "cost_usd": _estimate_cost_usd(params["model"], usage),
+    }
+
+
+async def stream_claw(
+    spec: ClawSpec,
+    task: str,
+    memory: str = "",
+    text_message: str = "",
+    from_channel: bool = False,
+):
+    """
+    Stream a claw run as an async generator of ``(kind, payload)`` tuples:
+
+        ("delta", "<text chunk>")   — incremental assistant text
+        ("done",  {usage + status}) — final frame (usage/cost, status, errors)
+        ("error", "<message>")      — terminal error (no further frames)
+
+    The plain (no-connections) path uses Anthropic's token stream so the block can
+    render the answer as it arrives.  Connection paths (MCP connector / local tool
+    loop) can't be token-streamed simply, so they fall back to a single ``delta``
+    with the full text followed by ``done`` — the caller's UX is identical, just
+    without intra-message streaming.  Never raises; errors arrive as an ``error``
+    frame.
+    """
+    try:
+        from anthropic import AsyncAnthropic  # lazy import — see module docstring
+    except ImportError:
+        yield ("error", "The 'anthropic' package is not installed on the devices server.")
+        return
+
+    api_key = _resolve_api_key(spec)
+    if not api_key:
+        yield ("error", "No Anthropic API key found. Set the claw's api_keys port "
+                        "(or the ANTHROPIC_API_KEY env var on the server).")
+        return
+
+    params = _resolve_model_params(spec)
+    mcp_servers = connections.build_mcp_servers(spec)
+    local_conns = connections.local_loop_connections(spec)
+
+    # Connection paths aren't token-streamed — run them normally and emit once.
+    if local_conns or mcp_servers:
+        result = await run_claw(spec, task, memory, text_message, from_channel)
+        if result.get("status") == "ok":
+            if result.get("response"):
+                yield ("delta", result["response"])
+            yield ("done", {k: result.get(k, 0) for k in (
+                "input_tokens", "output_tokens", "cache_read_input_tokens", "cost_usd")}
+                | {"status": "ok", "errors": ""})
+        else:
+            yield ("error", result.get("errors", "claw run failed"))
+        return
+
+    system_prompt = _build_system_prompt(spec, from_channel=from_channel)
+    user_turn = _build_user_turn(task, memory, text_message)
+    client = AsyncAnthropic(api_key=api_key)
+    request_kwargs: Dict[str, Any] = dict(
+        model=params["model"],
+        max_tokens=params["max_tokens"],
+        system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user_turn}],
+    )
+    if "temperature" in params and _model_accepts_sampling(params["model"]):
+        request_kwargs["temperature"] = params["temperature"]
+
+    try:
+        async with client.messages.stream(**request_kwargs) as stream:
+            async for text in stream.text_stream:
+                yield ("delta", text)
+            message = await stream.get_final_message()
+    except Exception as exc:  # noqa: BLE001 — surface to the socket as an error frame
+        logger.exception("claw stream failed")
+        yield ("error", _describe_exception(exc))
+        return
+
+    usage = getattr(message, "usage", None)
+    yield ("done", {
+        "status": "ok",
+        "errors": "",
+        "input_tokens": int(getattr(usage, "input_tokens", 0) or 0)
+        + int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+        + int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+        "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
+        "cache_read_input_tokens": int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+        "cost_usd": _estimate_cost_usd(params["model"], usage),
+    })
 
 
 # ---------------------------------------------------------------------------

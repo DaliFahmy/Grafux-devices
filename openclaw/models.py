@@ -120,6 +120,36 @@ class RunRequest(BaseModel):
     task: str = Field("", description="The task / instruction to run the claw against.")
     memory: str = Field("", description="Prior context prepended to the task.")
     text_message: str = Field("", description="A free-text message the user sends to the claw on this run.")
+    session_id: str = Field(
+        "",
+        description=(
+            "Optional conversation id.  When set, the run is threaded into a rolling "
+            "block-level transcript (provider 'block') so the claw remembers prior turns "
+            "across Run clicks.  Empty ⇒ stateless run, identical to before."
+        ),
+    )
+    remember: bool = Field(
+        True,
+        description="When session_id is set, whether to append this turn to the transcript.",
+    )
+
+
+class ConfigPatchRequest(BaseModel):
+    """
+    Patch the mutable, NON-secret config of an existing claw in place.
+
+    Sent by the block on Run when its config ports changed, so connection / soul /
+    skills / tools_config / agent edits take effect WITHOUT a full Regenerate.
+    Every field is optional; only provided (non-None) fields are applied.  Secret
+    ports (credentials, api_keys) are intentionally absent — those still require
+    Regenerate so they are never silently patched.
+    """
+
+    soul: Optional[str] = None
+    skills: Optional[str] = None
+    agent: Optional[str] = None
+    tools_config: Optional[str] = None
+    connections: Optional[str] = None
 
 
 class RunResponse(BaseModel):
@@ -127,6 +157,25 @@ class RunResponse(BaseModel):
     status: str  # "ok" | "error"
     response: str = ""
     errors: str = ""
+    # Per-run usage for the block's cost badge.  All default 0 so older callers
+    # (and the error / local-loop paths) stay valid.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cost_usd: float = 0.0
+
+
+class ClawModel(BaseModel):
+    """One selectable Claude model for the creation-dialog dropdown."""
+
+    id: str                 # model id passed back in ClawSpec.agent
+    label: str = ""         # human-friendly display name
+    input_per_mtok: float = 0.0   # $ per 1M input tokens
+    output_per_mtok: float = 0.0  # $ per 1M output tokens
+
+
+class ClawModelsResponse(BaseModel):
+    models: list[ClawModel] = []
 
 
 class ClawSummary(BaseModel):
@@ -135,6 +184,10 @@ class ClawSummary(BaseModel):
     claw_id: str
     name: str = ""
     agent: str = ""
+    # Enrichment for the block's badges/tooltips (non-secret, all optional).
+    model: str = ""               # resolved model id the claw will run with
+    apps: list[str] = []          # connected app names (e.g. ["telegram", "slack"])
+    tool_count: int = 0           # number of tools the claw currently exposes
 
 
 class InitiateConnectionRequest(BaseModel):

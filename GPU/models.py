@@ -23,6 +23,11 @@ code           -> GpuRunRequest.code      (C++/CUDA source)
 language       -> GpuRunRequest.language  ("cuda" | "cpp")
 args           -> GpuRunRequest.args      (argv passed to the compiled program)
 timeout        -> GpuRunRequest.timeout   (per-run wall-clock limit, seconds)
+keep_warm_minutes -> GpuRunRequest/GpuSpec (keep the pod alive N min for instant re-runs)
+files          -> GpuRunRequest.input_files (files staged into the pod before the run)
+
+Outputs added alongside response/status/gpu_id/errors/warnings/benchmark:
+artifacts (downloaded files), warm_until (warm-pod hold), cost (run cost estimate).
 """
 
 from __future__ import annotations
@@ -84,6 +89,15 @@ class GpuSpec(BaseModel):
         description="Optional RunPod API key (same shapes as api_keys), used if api_keys is empty.",
     )
     name: str = Field("", description="Optional human-friendly name for the gpu block.")
+    keep_warm_minutes: int = Field(
+        0,
+        description=(
+            "Default keep-warm window (minutes) for this block: keep the pod alive "
+            "this long after a run for instant re-runs; 0 = ephemeral teardown. A per-"
+            "run 'keep_warm_minutes' on the run request overrides this. >0 here also "
+            "makes Regenerate/create double as a pre-warm."
+        ),
+    )
 
 
 class GpuRunRequest(BaseModel):
@@ -96,6 +110,30 @@ class GpuRunRequest(BaseModel):
     )
     args: str = Field("", description="Command-line arguments passed to the compiled program.")
     timeout: int = Field(120, description="Per-run wall-clock limit in seconds.")
+    keep_warm_minutes: int = Field(
+        0,
+        description=(
+            "Keep the pod alive this many minutes after a successful run so the next "
+            "Run reuses it (no cold start); 0 = ephemeral teardown (today's default). "
+            "Falls back to the block's GpuSpec.keep_warm_minutes when 0."
+        ),
+    )
+    # Stage small input files into the pod before the run.  Each item is
+    # {"path": "/workspace/data.csv", "content": "...", "b64": false}.  Large
+    # datasets belong on a network volume, not inline here.
+    input_files: list = Field(
+        default_factory=list,
+        description="Files to write into the pod before running: [{path, content, b64}].",
+    )
+    # Shell globs to download from the pod after the run, e.g. "/workspace/out/*.png".
+    output_globs: list = Field(
+        default_factory=list,
+        description="Globs of artifact files to download after the run, e.g. ['/workspace/*.json'].",
+    )
+    working_dir: str = Field(
+        "/workspace",
+        description="Directory inputs are staged into and globs are resolved from.",
+    )
 
 
 class CreateGpuResponse(BaseModel):
@@ -106,6 +144,8 @@ class CreateGpuResponse(BaseModel):
     pod_id: str = ""
     gpu_model: str = ""
     errors: str = ""
+    usd_per_hr: float = 0.0     # the pod's hourly rate (live, else static reference)
+    warm_until: float = 0.0     # epoch secs the pod is held warm (0 = not pre-warmed)
 
 
 class GpuRunResponse(BaseModel):
@@ -117,6 +157,11 @@ class GpuRunResponse(BaseModel):
     errors: str = ""            # stderr / compile or run failure
     warnings: str = ""          # compiler warnings
     benchmark: str = ""         # JSON: {compile_ms, exec_ms, exit_code, gpu_model, gpu_info}
+    artifacts: str = ""         # JSON: [{path, size, content, b64, truncated}] downloaded
+    kept_warm: bool = False     # True when the pod was kept alive after this run
+    warm_until: float = 0.0     # epoch secs the warm pod is held until (0 = torn down)
+    usd_per_hr: float = 0.0     # the pod's hourly rate
+    cost_estimate_usd: float = 0.0  # rough cost of this Run (rate × billed seconds)
 
 
 class GpuSummary(BaseModel):
@@ -127,6 +172,26 @@ class GpuSummary(BaseModel):
     gpu_model: str = ""
     pod_id: str = ""
     pod_status: str = ""        # "running" once the SSH details are cached
+    phase: str = ""             # creating | pulling_image | ready | running | error
+    uptime_s: float = 0.0       # seconds since the pod record was created
+    usd_per_hr: float = 0.0     # hourly rate
+    warm_until: float = 0.0     # epoch secs held warm (0 = not warm)
+
+
+class GpuStatusResponse(BaseModel):
+    """Live status of one pod, polled by the block during provisioning/run."""
+
+    gpu_id: str
+    phase: str = ""             # creating | pulling_image | ready | running | error
+    phase_detail: str = ""      # optional human-readable detail
+    pod_id: str = ""
+    gpu_model: str = ""
+    pod_status: str = ""        # "running" | "pending"
+    uptime_s: float = 0.0
+    warm_until: float = 0.0
+    usd_per_hr: float = 0.0
+    cost_estimate_usd: float = 0.0  # rate × uptime so far
+    ssh: str = ""               # ssh connect hint (only when GPU_EXPOSE_SSH is on)
 
 
 class GpuModel(BaseModel):
@@ -134,6 +199,7 @@ class GpuModel(BaseModel):
 
     id: str                     # RunPod gpu type id (passed back in GpuSpec.gpu_model)
     label: str = ""             # human-friendly display name
+    usd_per_hr: float = 0.0     # advisory hourly rate (Secure on-demand), 0 = unknown
 
 
 class GpuModelsResponse(BaseModel):

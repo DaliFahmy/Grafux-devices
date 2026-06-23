@@ -507,6 +507,9 @@ class _FakeSftpFile:
     def write(self, data):
         self._store[self._path] = data
 
+    def read(self, _n=-1):
+        return self._store.get(self._path, b"")
+
 
 class _FakeSftp:
     def __init__(self, store):
@@ -514,6 +517,9 @@ class _FakeSftp:
 
     def open(self, path, _mode):
         return _FakeSftpFile(self._store, path)
+
+    def mkdir(self, _path):
+        pass
 
     def close(self):
         pass
@@ -544,6 +550,7 @@ def fake_ssh(monkeypatch):
         "run_err": "",
         "exit_txt": "0",  # what `cat /tmp/exit` reports → becomes exit_code
         "ms_txt": "7",
+        "glob_listing": "",  # newline paths returned for the artifact-glob listing
     }
 
     def fake_connect(host, port, key, *, timeout=30.0):
@@ -557,6 +564,8 @@ def fake_ssh(monkeypatch):
             return 0, state["ms_txt"], ""
         if command.startswith("nvidia-smi"):
             return 0, "NVIDIA GeForce RTX 4090, 100 MiB, 24564 MiB", ""
+        if command.startswith("bash -lc 'for f in"):  # the artifact-glob listing
+            return 0, state["glob_listing"], ""
         if "date +%s%N" in command:  # the main run command
             return 0, state["run_out"], state["run_err"]
         return 0, "", ""  # compile command: success, no warnings
@@ -656,3 +665,273 @@ def test_looks_like_python_does_not_misfire_on_cuda():
     # Real Python is recognised.
     assert runpod_client.looks_like_python("import os\nprint(os.getcwd())")
     assert not runpod_client.looks_like_python("")
+
+
+# ---------------------------------------------------------------------------
+# Keep-warm (per-block) — fast re-runs without paying a cold start each time.
+# ---------------------------------------------------------------------------
+
+def test_run_keep_warm_reports_live_id_and_no_teardown(monkeypatch, fake_runpod):
+    """A keep_warm_minutes>0 run keeps the pod alive and reports the live gpu_id."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
+
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(code="int main(){}", keep_warm_minutes=5))
+    assert out["status"] == "ok"
+    assert out["kept_warm"] is True
+    assert out["warm_until"] > 0
+    # Pod NOT terminated, still registered, live id reported so the block reuses it.
+    assert fake_runpod["terminate"] == []
+    assert registry.get(gpu_id) is not None
+    assert out["gpu_id"] == gpu_id
+    # The warm window set a reaper deadline so it is freed eventually.
+    assert registry.get(gpu_id).keep_warm_deadline > 0
+
+
+def test_run_keep_warm_falls_back_to_spec(monkeypatch, fake_runpod):
+    """With no per-run window, the block's GpuSpec.keep_warm_minutes is honored."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec(keep_warm_minutes=10))["gpu_id"]
+
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(code="int main(){}"))
+    assert out["kept_warm"] is True
+    assert fake_runpod["terminate"] == []
+    assert registry.get(gpu_id) is not None
+
+
+def test_run_keep_warm_failure_still_terminates(monkeypatch, fake_runpod):
+    """A failed run is never kept warm — no orphan billing even with keep_warm set."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
+
+    def boom(*a, **k):
+        raise OSError("ssh connection refused")
+
+    monkeypatch.setattr(runpod_client, "run_remote", boom)
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(code="int main(){}", keep_warm_minutes=5))
+    assert out["status"] == "error"
+    assert out["kept_warm"] is False
+    assert ("rp_env_key", "pod-123") in fake_runpod["terminate"]
+    assert registry.get(gpu_id) is None
+    assert out["gpu_id"] == ""
+
+
+def test_run_keep_warm_zero_is_ephemeral(monkeypatch, fake_runpod):
+    """keep_warm_minutes=0 reproduces today's ephemeral teardown."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(code="int main(){}", keep_warm_minutes=0))
+    assert out["status"] == "ok"
+    assert out["kept_warm"] is False
+    assert ("rp_env_key", "pod-123") in fake_runpod["terminate"]
+    assert registry.get(gpu_id) is None
+    assert out["gpu_id"] == ""
+
+
+def test_provision_prewarm_sets_warm_window(monkeypatch, fake_runpod):
+    """create with keep_warm_minutes>0 doubles as pre-warm: a warm window is set."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    result = runtime.provision_gpu(GpuSpec(keep_warm_minutes=15))
+    assert result["status"] == "ok"
+    assert result["warm_until"] > 0
+    assert registry.get(result["gpu_id"]).keep_warm_deadline > 0
+
+
+# ---------------------------------------------------------------------------
+# Reaper — honors per-record keep-warm deadline (monotonic), testable directly.
+# ---------------------------------------------------------------------------
+
+def test_select_stale_reaps_expired_warm_pod(monkeypatch):
+    from GPU.registry import GpuRecord, GpuRegistry
+    reg = GpuRegistry()
+    rec = GpuRecord(spec=GpuSpec(), pod_id="p", public_ip="1.2.3.4", ssh_port=22)
+    gid = reg.create(rec)
+    # Warm until t=100 (monotonic).  At t=50 it is kept; at t=150 it is reaped.
+    rec.keep_warm_deadline = 100.0
+    assert reg._select_stale(50.0) == []
+    assert reg.get(gid) is not None
+    stale = reg._select_stale(150.0)
+    assert [g for g, _ in stale] == [gid]
+    assert reg.get(gid) is None
+
+
+def test_select_stale_ignores_warm_pod_before_deadline(monkeypatch):
+    from GPU.registry import GpuRecord, GpuRegistry
+    reg = GpuRegistry()
+    rec = GpuRecord(spec=GpuSpec(), pod_id="p", public_ip="1.2.3.4", ssh_port=22)
+    reg.create(rec)
+    rec.keep_warm_deadline = 1e9  # far future
+    assert reg._select_stale(123.0) == []
+
+
+# ---------------------------------------------------------------------------
+# Pricing.
+# ---------------------------------------------------------------------------
+
+def test_price_for_known_and_unknown():
+    assert runpod_client.price_for("NVIDIA GeForce RTX 4090") > 0
+    assert runpod_client.price_for("totally-made-up") == 0.0
+
+
+def test_list_gpu_types_includes_price():
+    types = runpod_client.list_gpu_types()
+    assert all("usd_per_hr" in g for g in types)
+    rtx = next(g for g in types if g["id"] == "NVIDIA GeForce RTX 4090")
+    assert rtx["usd_per_hr"] > 0
+
+
+def test_run_reports_cost_estimate(monkeypatch, fake_runpod):
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec(gpu_model="NVIDIA GeForce RTX 4090"))["gpu_id"]
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(code="int main(){}"))
+    assert out["usd_per_hr"] > 0
+    assert out["cost_estimate_usd"] >= 0
+
+
+# ---------------------------------------------------------------------------
+# Live status + phase derivation.
+# ---------------------------------------------------------------------------
+
+def test_status_unknown_id_is_none():
+    assert runtime.gpu_status("nope") is None
+
+
+def test_status_reports_phase_and_uptime(monkeypatch, fake_runpod):
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec(gpu_model="NVIDIA GeForce RTX 4090"))["gpu_id"]
+    st = runtime.gpu_status(gpu_id)
+    assert st["phase"] == "ready"
+    assert st["pod_status"] == "running"
+    assert st["uptime_s"] >= 0
+    assert st["usd_per_hr"] > 0
+
+
+def test_phase_from_pod_shapes():
+    # Ready: a public SSH endpoint is present.
+    ready = {"desiredStatus": "RUNNING", "publicIp": "1.2.3.4", "portMappings": {"22": 40022}}
+    assert runpod_client.phase_from_pod(ready)[0] == "ready"
+    # Running but no endpoint yet → still pulling image.
+    pulling = {"desiredStatus": "RUNNING", "machineId": "m1", "publicIp": "", "portMappings": None}
+    assert runpod_client.phase_from_pod(pulling)[0] == "pulling_image"
+    # Not placed yet.
+    creating = {"desiredStatus": "PENDING"}
+    assert runpod_client.phase_from_pod(creating)[0] == "creating"
+    # Terminal.
+    dead = {"desiredStatus": "TERMINATED"}
+    assert runpod_client.phase_from_pod(dead)[0] == "error"
+
+
+def test_provision_async_returns_immediately(monkeypatch, fake_runpod):
+    """create_async registers a record and returns a gpu_id without blocking."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    # Run the background "thread" inline so the test is deterministic.
+    monkeypatch.setattr(runtime.threading, "Thread", _InlineThread)
+    result = runtime.provision_gpu_async(GpuSpec())
+    assert result["gpu_id"]
+    assert result["status"] in ("creating", "ok")
+    # With the inline thread, provisioning completed → record is ready.
+    assert registry.get(result["gpu_id"]).phase == "ready"
+
+
+def test_provision_async_no_key_errors(monkeypatch):
+    monkeypatch.delenv("RUNPOD_API_KEY", raising=False)
+    result = runtime.provision_gpu_async(GpuSpec())
+    assert result["status"] == "error"
+    assert result["gpu_id"] == ""
+
+
+class _InlineThread:
+    """A drop-in for threading.Thread that runs the target synchronously on start."""
+
+    def __init__(self, target=None, name=None, daemon=None, **_kw):
+        self._target = target
+
+    def start(self):
+        if self._target:
+            self._target()
+
+
+# ---------------------------------------------------------------------------
+# File staging + artifact download (run_remote SFTP).
+# ---------------------------------------------------------------------------
+
+def test_run_remote_stages_input_files(fake_ssh):
+    runpod_client.run_remote(
+        "1.2.3.4", 40022, "PEM",
+        source="print(1)\n", language="python", gpu_model="", compile_flags="",
+        args="", timeout=60,
+        input_files=[{"path": "/workspace/data.txt", "content": "hello"}],
+    )
+    assert fake_ssh["uploaded"]["/workspace/data.txt"] == b"hello"
+
+
+def test_run_remote_downloads_artifacts(fake_ssh):
+    # The pod "produced" this file; the glob listing resolves it, then it's read back.
+    fake_ssh["uploaded"]["/workspace/out.json"] = b'{"ok": true}'
+    fake_ssh["glob_listing"] = "/workspace/out.json\n"
+    result = runpod_client.run_remote(
+        "1.2.3.4", 40022, "PEM",
+        source="print(1)\n", language="python", gpu_model="", compile_flags="",
+        args="", timeout=60,
+        output_globs=["/workspace/*.json"],
+    )
+    arts = result["artifacts"]
+    assert len(arts) == 1
+    assert arts[0]["path"] == "/workspace/out.json"
+    import base64
+    assert base64.b64decode(arts[0]["content"]) == b'{"ok": true}'
+    assert arts[0]["truncated"] is False
+
+
+def test_run_remote_no_globs_no_artifacts(fake_ssh):
+    result = runpod_client.run_remote(
+        "1.2.3.4", 40022, "PEM",
+        source="print(1)\n", language="python", gpu_model="", compile_flags="",
+        args="", timeout=60,
+    )
+    assert result["artifacts"] == []
+
+
+def test_run_forwards_files_and_returns_artifacts_json(monkeypatch, fake_runpod):
+    """run_gpu forwards input_files/output_globs and json-encodes artifacts."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+
+    def fake_run_remote(host, port, key, **kwargs):
+        assert kwargs["input_files"] == [{"path": "/workspace/a.txt", "content": "x"}]
+        assert kwargs["output_globs"] == ["/workspace/*.png"]
+        return {"status": "ok", "response": "", "errors": "", "warnings": "",
+                "benchmark": {}, "artifacts": [{"path": "/workspace/a.png", "size": 3}]}
+
+    monkeypatch.setattr(runpod_client, "run_remote", fake_run_remote)
+    gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
+    out = runtime.run_gpu(gpu_id, GpuRunRequest(
+        code="x",
+        input_files=[{"path": "/workspace/a.txt", "content": "x"}],
+        output_globs=["/workspace/*.png"],
+    ))
+    assert out["status"] == "ok"
+    assert json.loads(out["artifacts"])[0]["path"] == "/workspace/a.png"
+
+
+# ---------------------------------------------------------------------------
+# SSH access (env-gated).
+# ---------------------------------------------------------------------------
+
+def test_ssh_disabled_by_default(monkeypatch, fake_runpod):
+    monkeypatch.setattr(runtime, "_EXPOSE_SSH", False)
+    assert runtime.ssh_exposed() is False
+
+
+def test_ssh_returns_details_when_running(monkeypatch, fake_runpod):
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    gpu_id = runtime.provision_gpu(GpuSpec())["gpu_id"]
+    details = runtime.gpu_ssh(gpu_id)
+    assert details["host"] == "1.2.3.4"
+    assert details["port"] == 40022
+    assert details["username"] == "root"
+    assert details["private_key_pem"] == "PRIVATE_PEM"
+    assert "ssh -p 40022 root@1.2.3.4" in details["connect_hint"]
+
+
+def test_ssh_unknown_id_is_none():
+    assert runtime.gpu_ssh("nope") is None

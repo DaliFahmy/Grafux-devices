@@ -33,6 +33,7 @@ from .models import (
     GpuRunRequest,
     GpuRunResponse,
     GpuSpec,
+    GpuStatusResponse,
     GpuSummary,
 )
 from .registry import registry
@@ -49,6 +50,18 @@ def create_gpu(spec: GpuSpec) -> CreateGpuResponse:
     return CreateGpuResponse(**result)
 
 
+@router.post("/create_async", response_model=CreateGpuResponse)
+def create_gpu_async(spec: GpuSpec) -> CreateGpuResponse:
+    """
+    Begin provisioning in the background and return a gpu_id immediately.
+
+    The block polls ``GET /gpu/{id}/status`` until the phase is ``ready`` (or
+    ``error``) so the cold start shows live phases instead of a blocking wait.
+    """
+    result = runtime.provision_gpu_async(spec)
+    return CreateGpuResponse(**result)
+
+
 @router.post("/{gpu_id}/run", response_model=GpuRunResponse)
 def run_gpu(gpu_id: str, body: GpuRunRequest) -> GpuRunResponse:
     """Compile + run code on an already-provisioned pod (Run)."""
@@ -61,30 +74,61 @@ def run_gpu(gpu_id: str, body: GpuRunRequest) -> GpuRunResponse:
 
 @router.get("/models", response_model=GpuModelsResponse)
 def list_gpu_models() -> GpuModelsResponse:
-    """Return the selectable GPU types for the creation-dialog dropdown."""
+    """Return the selectable GPU types (id + label + advisory $/hr) for the dropdown."""
     return GpuModelsResponse(
-        models=[GpuModel(id=g["id"], label=g["label"]) for g in runpod_client.list_gpu_types()]
+        models=[
+            GpuModel(id=g["id"], label=g["label"], usd_per_hr=float(g.get("usd_per_hr", 0.0)))
+            for g in runpod_client.list_gpu_types()
+        ]
     )
 
 
 @router.get("", response_model=list[GpuSummary])
 def list_gpus() -> list[GpuSummary]:
-    """List provisioned pods (ids + non-secret summary)."""
+    """List provisioned pods (ids + non-secret summary incl. phase/uptime/cost)."""
     return registry.list()
+
+
+@router.get("/{gpu_id}/status", response_model=GpuStatusResponse)
+def get_gpu_status(gpu_id: str, live: bool = False) -> GpuStatusResponse:
+    """
+    Live status of a pod: phase, uptime, cost so far, warm-until.
+
+    ``?live=1`` does one RunPod lookup to refine the phase + hourly rate from the
+    cloud's own view; without it only the cached record phase is reported (no REST
+    call), so a fast poll loop cannot hammer the RunPod API.
+    """
+    result = runtime.gpu_status(gpu_id, live=live)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No gpu with id '{gpu_id}'")
+    return GpuStatusResponse(**result)
+
+
+@router.get("/{gpu_id}/ssh")
+def get_gpu_ssh(gpu_id: str) -> dict:
+    """
+    SSH connection details (incl. the private key) for a running pod.
+
+    Disabled unless the server sets ``GPU_EXPOSE_SSH=1`` — it returns a secret key,
+    so it is only appropriate on a trusted-network deployment.
+    """
+    if not runtime.ssh_exposed():
+        raise HTTPException(
+            status_code=403,
+            detail="SSH access is disabled. Set GPU_EXPOSE_SSH=1 on the devices server to enable it.",
+        )
+    result = runtime.gpu_ssh(gpu_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"No running gpu with id '{gpu_id}'")
+    return result
 
 
 @router.get("/{gpu_id}", response_model=GpuSummary)
 def get_gpu(gpu_id: str) -> GpuSummary:
-    record = registry.get(gpu_id)
-    if record is None:
+    summary = registry.summary(gpu_id)
+    if summary is None:
         raise HTTPException(status_code=404, detail=f"No gpu with id '{gpu_id}'")
-    return GpuSummary(
-        gpu_id=gpu_id,
-        name=record.spec.name,
-        gpu_model=record.spec.gpu_model,
-        pod_id=record.pod_id,
-        pod_status="running" if record.is_running else "pending",
-    )
+    return summary
 
 
 @router.delete("/{gpu_id}")

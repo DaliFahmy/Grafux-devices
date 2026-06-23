@@ -61,6 +61,22 @@ class ClawRegistry:
                 for cid, spec in self._claws.items()
             ]
 
+    def save(self, claw_id: str) -> bool:
+        """
+        Re-persist a claw after an in-place mutation of its stored spec.
+
+        ``get`` returns the spec by reference, so callers can mutate it directly
+        (e.g. patching connections); call this to flush that change to disk when
+        persistence is enabled.  Returns False if the id is unknown.
+        """
+        with self._lock:
+            spec = self._claws.get(claw_id)
+        if spec is None:
+            return False
+        if _PERSIST_ENABLED:
+            self._save_one(claw_id, spec)
+        return True
+
     def delete(self, claw_id: str) -> bool:
         with self._lock:
             existed = self._claws.pop(claw_id, None) is not None

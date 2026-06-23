@@ -67,7 +67,22 @@ class SessionStore:
         if _PERSIST_ENABLED:
             self._save_one(key, transcript)
 
+    def clear(self, claw_id: str, provider: str, chat_id: str) -> bool:
+        """Drop a conversation's transcript (used by the "reset chat" action)."""
+        key = (claw_id, provider, chat_id)
+        with self._lock:
+            existed = self._sessions.pop(key, None) is not None
+        if existed and _PERSIST_ENABLED:
+            self._delete_one(key)
+        return existed
+
     # -- persistence (best-effort) ---------------------------------------
+
+    def _delete_one(self, key: _Key) -> None:
+        try:
+            os.remove(os.path.join(_PERSIST_DIR, self._fname(key)))
+        except OSError:
+            pass  # already gone / never persisted — nothing to do
 
     def _save_one(self, key: _Key, transcript: str) -> None:
         try:

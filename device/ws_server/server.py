@@ -60,9 +60,14 @@ except ImportError:
 try:
     # When run as a script from this directory: ``python server.py``
     from handlers import dispatch
+    from discovery import start_advertiser, stop_advertiser
 except ImportError:
     # When imported as a package member: ``from device.ws_server import server``
     from device.ws_server.handlers import dispatch
+    from device.ws_server.discovery import start_advertiser, stop_advertiser
+
+#: Advertised protocol version (TXT record); bump on protocol changes.
+VERSION = "1"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -100,6 +105,8 @@ async def _handle_connection(websocket, token: str, device_id: str) -> None:
     peer = getattr(websocket, "remote_address", None)
     logger.info("Client connected from %s (device_id=%s)", peer, device_id)
 
+    loop = asyncio.get_running_loop()
+
     try:
         async for raw in websocket:
             try:
@@ -114,9 +121,25 @@ async def _handle_connection(websocket, token: str, device_id: str) -> None:
             action = message.get("action") or message.get("type") or "ping"
             logger.info("recv action=%s id=%s", action, req_id)
 
+            async def _send_progress(frame: dict) -> None:
+                frame["id"]        = req_id
+                frame["action"]    = action
+                frame["type"]      = "progress"
+                frame["device_id"] = device_id
+                frame["timestamp"] = time.time()
+                try:
+                    await websocket.send(json.dumps(frame))
+                except Exception:  # noqa: BLE001  — socket closed mid-run, ignore
+                    pass
+
+            # Bridge the worker thread's sync progress calls onto the event loop.
+            def on_progress(frame: dict) -> None:
+                asyncio.run_coroutine_threadsafe(_send_progress(frame), loop)
+
             # The clean protocol carries fields at the top level; pass the whole
-            # message as the payload (handlers ignore id/action/type).
-            result = await asyncio.to_thread(dispatch, action, message)
+            # message as the payload (handlers ignore id/action/type). Streaming
+            # actions emit progress frames before this final result frame.
+            result = await asyncio.to_thread(dispatch, action, message, on_progress)
 
             result["id"]        = req_id
             result["action"]    = action
@@ -131,14 +154,19 @@ async def _handle_connection(websocket, token: str, device_id: str) -> None:
         logger.error("Connection error: %s", exc)
 
 
-async def run_server(host: str, port: int, token: str, device_id: str) -> None:
+async def run_server(host: str, port: int, token: str, device_id: str,
+                     advertise: bool = True) -> None:
     async def handler(websocket):
         await _handle_connection(websocket, token, device_id)
 
     logger.info("Device WebSocket server listening on ws://%s:%d  (device_id=%s)",
                 host, port, device_id)
-    async with websockets.serve(handler, host, port):
-        await asyncio.Future()  # run forever
+    mdns = start_advertiser(device_id, port, VERSION) if advertise else None
+    try:
+        async with websockets.serve(handler, host, port):
+            await asyncio.Future()  # run forever
+    finally:
+        stop_advertiser(mdns)
 
 
 def main() -> None:
@@ -149,13 +177,16 @@ def main() -> None:
                         help="Shared secret clients must supply as ?token=…")
     parser.add_argument("--device-id", default=DEFAULT_DEVICE_ID,
                         help="Identifier echoed back in every result")
+    parser.add_argument("--no-mdns", action="store_true",
+                        help="Disable LAN mDNS discovery advertisement")
     args = parser.parse_args()
 
     if args.token == "changeme":
         logger.warning("Token is the default 'changeme' — set --token / AGENT_TOKEN in production!")
 
     try:
-        asyncio.run(run_server(args.host, args.port, args.token, args.device_id))
+        asyncio.run(run_server(args.host, args.port, args.token, args.device_id,
+                               advertise=not args.no_mdns))
     except KeyboardInterrupt:
         logger.info("Server stopped.")
 

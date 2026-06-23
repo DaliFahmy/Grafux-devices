@@ -64,3 +64,21 @@ services:
       # instead of waiting the full GPU_PROVISION_TIMEOUT. Set to 0 to disable.
       - key: GPU_PUBLIC_IP_GRACE
         value: "120"
+      # Default keep-warm window (minutes) when neither the run request nor the
+      # block's spec sets keep_warm_minutes. 0 keeps the ephemeral default; a small
+      # value (e.g. 5) makes iterative dev fast out of the box at a small idle cost.
+      # A per-block keep_warm_minutes input port overrides this.
+      - key: GPU_DEFAULT_KEEP_WARM_MIN
+        value: "0"
+      # Expose a pod's SSH host/port + PRIVATE KEY via GET /gpu/{id}/ssh so a user
+      # can open their own terminal. OFF by default — it returns a secret key, so
+      # only enable it on a trusted-network deployment. The block's "Copy SSH
+      # command" still works without this (it only needs host/port from /status).
+      - key: GPU_EXPOSE_SSH
+        value: "0"
+      # Caps on artifact bytes downloaded from the pod after a run (per file / total)
+      # so a large output can never bloat the run response. Bytes.
+      - key: GPU_ARTIFACT_MAX_FILE_BYTES
+        value: "2097152"
+      - key: GPU_ARTIFACT_MAX_TOTAL_BYTES
+        value: "8388608"

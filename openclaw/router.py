@@ -29,12 +29,15 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from . import claw_runtime, connections
 from .models import (
+    ClawModel,
+    ClawModelsResponse,
     ClawSpec,
     ClawSummary,
+    ConfigPatchRequest,
     ConnectionSummary,
     CreateClawResponse,
     InitiateConnectionRequest,
@@ -79,22 +82,175 @@ async def list_claws() -> list[ClawSummary]:
     return registry.list()
 
 
+@router.get("/models", response_model=ClawModelsResponse)
+async def list_claw_models() -> ClawModelsResponse:
+    """
+    Return the selectable Claude models (id + price tier) for the creation
+    dialog's model dropdown.  Declared before ``/{claw_id}`` so "models" is not
+    captured as a claw id.
+    """
+    return ClawModelsResponse(
+        models=[
+            ClawModel(
+                id=model_id,
+                label=info["label"],
+                input_per_mtok=info["in"],
+                output_per_mtok=info["out"],
+            )
+            for model_id, info in claw_runtime.MODEL_CATALOG.items()
+        ]
+    )
+
+
+def _summarize(claw_id: str, spec: ClawSpec) -> ClawSummary:
+    """Build a non-secret summary enriched with the resolved model + connected apps."""
+    apps = [c.app for c in connections.parse_connections(spec) if c.enabled and c.app]
+    return ClawSummary(
+        claw_id=claw_id,
+        name=spec.name,
+        agent=spec.agent,
+        model=claw_runtime._resolve_model_params(spec)["model"],
+        apps=apps,
+        tool_count=len(apps),  # cheap proxy: one connected app ≈ one toolset
+    )
+
+
 @router.get("/{claw_id}", response_model=ClawSummary)
 async def get_claw(claw_id: str) -> ClawSummary:
     spec = registry.get(claw_id)
     if spec is None:
         raise HTTPException(status_code=404, detail=f"No claw with id '{claw_id}'")
-    return ClawSummary(claw_id=claw_id, name=spec.name, agent=spec.agent)
+    return _summarize(claw_id, spec)
 
 
 @router.post("/{claw_id}/run", response_model=RunResponse)
 async def run_claw(claw_id: str, body: RunRequest) -> RunResponse:
-    """Run an existing claw against a task."""
+    """
+    Run an existing claw against a task.
+
+    When ``session_id`` is set the run is threaded into a rolling block-level
+    transcript (provider ``"block"``) so the claw remembers prior turns across Run
+    clicks.  Empty ``session_id`` ⇒ a stateless run, byte-identical to before.
+    """
     spec = registry.get(claw_id)
     if spec is None:
         raise HTTPException(status_code=404, detail=f"No claw with id '{claw_id}'")
-    result = await claw_runtime.run_claw(spec, body.task, body.memory, body.text_message)
+
+    memory = body.memory
+    sid = body.session_id.strip()
+    if sid:
+        history = sessions.get(claw_id, "block", sid)
+        if history:
+            memory = f"{history}\n\n---\n\n{memory}" if memory else history
+
+    result = await claw_runtime.run_claw(spec, body.task, memory, body.text_message)
+
+    if sid and body.remember and result.get("status") == "ok":
+        user_turn = (body.text_message or body.task or "").strip()
+        if user_turn:
+            sessions.append(claw_id, "block", sid, "User", user_turn)
+        reply = (result.get("response") or "").strip()
+        if reply:
+            sessions.append(claw_id, "block", sid, "Assistant", reply)
+
     return RunResponse(claw_id=claw_id, **result)
+
+
+@router.websocket("/{claw_id}/run/stream")
+async def run_claw_stream(claw_id: str, websocket: WebSocket) -> None:
+    """
+    Stream a claw run over a WebSocket so the block renders the answer live.
+
+    Wire protocol: the client sends one JSON message of run params
+    ({task, memory, text_message, session_id}); the server then sends
+    ``{"type":"delta","text":…}`` frames as tokens arrive, a final
+    ``{"type":"done", …usage, "response":<full text>}`` frame, or
+    ``{"type":"error","error":…}``.  Session memory is threaded exactly like the
+    REST run route, so a streamed turn and a REST turn share one conversation.
+    """
+    await websocket.accept()
+    spec = registry.get(claw_id)
+    if spec is None:
+        await websocket.send_json({"type": "error", "error": f"No claw with id '{claw_id}'"})
+        await websocket.close()
+        return
+
+    try:
+        params = await websocket.receive_json()
+    except Exception:  # noqa: BLE001 — tolerate a bad/empty kickoff frame
+        params = {}
+    if not isinstance(params, dict):
+        params = {}
+    task = str(params.get("task", ""))
+    text_message = str(params.get("text_message", ""))
+    sid = str(params.get("session_id", "")).strip()
+    memory = str(params.get("memory", ""))
+    if sid:
+        history = sessions.get(claw_id, "block", sid)
+        if history:
+            memory = f"{history}\n\n---\n\n{memory}" if memory else history
+
+    chunks: list[str] = []
+    final_status = ""
+    try:
+        async for kind, payload in claw_runtime.stream_claw(spec, task, memory, text_message):
+            if kind == "delta":
+                chunks.append(payload)
+                await websocket.send_json({"type": "delta", "text": payload})
+            elif kind == "done":
+                final_status = payload.get("status", "")
+                await websocket.send_json(
+                    {"type": "done", "response": "".join(chunks), **payload}
+                )
+            elif kind == "error":
+                await websocket.send_json({"type": "error", "error": payload})
+    except WebSocketDisconnect:
+        return  # client went away mid-stream — nothing to persist beyond what we have
+    except Exception as exc:  # noqa: BLE001 — never let the socket handler crash
+        logger.exception("claw stream error for %s", claw_id)
+        try:
+            await websocket.send_json({"type": "error", "error": claw_runtime._describe_exception(exc)})
+        except Exception:  # noqa: BLE001
+            pass
+
+    if sid and final_status == "ok":
+        user_turn = (text_message or task or "").strip()
+        if user_turn:
+            sessions.append(claw_id, "block", sid, "User", user_turn)
+        reply = "".join(chunks).strip()
+        if reply:
+            sessions.append(claw_id, "block", sid, "Assistant", reply)
+
+    try:
+        await websocket.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@router.post("/{claw_id}/config", response_model=ClawSummary)
+async def patch_claw_config(claw_id: str, body: ConfigPatchRequest) -> ClawSummary:
+    """
+    Patch the mutable, non-secret config of an existing claw in place.
+
+    The block calls this on Run when its config ports changed, so connection /
+    soul / skills / tools_config / agent edits take effect WITHOUT a full
+    Regenerate (which would re-provision and lose the cached claw_id + session).
+    Secret ports (credentials, api_keys) are intentionally not patchable here.
+    """
+    spec = _require_spec(claw_id)
+    for field in ("soul", "skills", "agent", "tools_config", "connections"):
+        val = getattr(body, field)
+        if val is not None:
+            setattr(spec, field, val)
+    registry.save(claw_id)  # flush to disk when persistence is enabled
+    return _summarize(claw_id, spec)
+
+
+@router.delete("/{claw_id}/session/{session_id}")
+async def clear_claw_session(claw_id: str, session_id: str) -> dict:
+    """Drop a block conversation's transcript (the "reset chat" action)."""
+    cleared = sessions.clear(claw_id, "block", session_id)
+    return {"status": "cleared" if cleared else "empty", "claw_id": claw_id, "session_id": session_id}
 
 
 @router.post("/create_and_run", response_model=RunResponse)
@@ -156,6 +312,7 @@ async def initiate_connection(claw_id: str, body: InitiateConnectionRequest) -> 
         connections.ClawConnection(app=body.app, connection_id=new_id, enabled=True)
     )
     spec.connections = json.dumps([c.model_dump() for c in updated])
+    registry.save(claw_id)  # flush the mutation so it survives a restart
     return InitiateConnectionResponse(**result)
 
 
@@ -197,6 +354,7 @@ async def delete_claw_connection(claw_id: str, app: str) -> dict:
     remaining = [c for c in connections.parse_connections(spec) if c.app.lower() != app.lower()]
     removed = [c for c in connections.parse_connections(spec) if c.app.lower() == app.lower()]
     spec.connections = json.dumps([c.model_dump() for c in remaining])
+    registry.save(claw_id)
     key = connections.resolve_composio_key(spec)
     if key:
         for c in removed:
@@ -237,6 +395,7 @@ async def register_channel(
     for c in conns:
         c.channel = c.connection_id == body.connection_id and bool(body.connection_id)
     spec.connections = json.dumps([c.model_dump() for c in conns])
+    registry.save(claw_id)
     logger.info("claw %s registered on channel %s (mode=%s)", claw_id, provider, body.mode)
     return RegisterChannelResponse(status="registered", provider=provider, webhook_url=body.webhook_url)
 

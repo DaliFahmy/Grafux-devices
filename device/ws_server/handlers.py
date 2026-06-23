@@ -109,6 +109,62 @@ def _normalize_language(language: str, filename: str) -> str:
     return "unknown"
 
 
+def _emit(on_progress, **frame) -> None:
+    """Best-effort progress callback — never let a send error abort the run."""
+    if not on_progress:
+        return
+    try:
+        on_progress(frame)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("on_progress callback failed: %s", exc)
+
+
+def _run_streaming(run_cmd: list, cwd: str, timeout: int, on_progress) -> tuple:
+    """Run ``run_cmd`` streaming stdout lines through ``on_progress`` as they
+    arrive, while still accumulating the full stdout/stderr for the final frame.
+
+    Returns (stdout_lines, stderr_lines, returncode, timed_out).  stdout and
+    stderr are drained on separate threads so a chatty program cannot deadlock on
+    a full pipe buffer.
+    """
+    import threading
+
+    proc = subprocess.Popen(  # noqa: S603
+        run_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd,
+    )
+    out_lines: list = []
+    err_lines: list = []
+
+    def drain(stream, sink: list, emit: bool) -> None:
+        try:
+            for line in stream:
+                line = line.rstrip("\n")
+                sink.append(line)
+                if emit:
+                    _emit(on_progress, phase="running", line=line)
+        finally:
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    t_out = threading.Thread(target=drain, args=(proc.stdout, out_lines, True), daemon=True)
+    t_err = threading.Thread(target=drain, args=(proc.stderr, err_lines, False), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+    t_out.join(timeout=1)
+    t_err.join(timeout=1)
+    return out_lines, err_lines, proc.returncode, timed_out
+
+
 def _collect_files(directory: str) -> list:
     """Scan a directory and return a list of base64-encoded file objects."""
     files = []
@@ -138,7 +194,7 @@ def _collect_files(directory: str) -> list:
 # ---------------------------------------------------------------------------
 
 
-def handle_compile_and_run(payload: dict) -> dict:
+def handle_compile_and_run(payload: dict, on_progress=None) -> dict:
     """Compile (if needed) and run the *inline source the user wrote*.
 
     Payload fields
@@ -165,7 +221,7 @@ def handle_compile_and_run(payload: dict) -> dict:
         if not os.path.exists(file_path):
             return _error("compile_run_result", f"File not found: {file_path}")
         language = language if language != "unknown" else _detect_language(file_path)
-        return _compile_and_run_path(file_path, language, args, timeout)
+        return _compile_and_run_path(file_path, language, args, timeout, on_progress)
 
     if not code:
         return _error("compile_run_result", "code is required (the source to compile/run)")
@@ -187,14 +243,18 @@ def handle_compile_and_run(payload: dict) -> dict:
         except Exception as exc:  # noqa: BLE001
             return _error("compile_run_result", f"Could not write source file: {exc}")
 
-        return _compile_and_run_path(src_path, language, args, timeout)
+        return _compile_and_run_path(src_path, language, args, timeout, on_progress)
 
 
-def _compile_and_run_path(file_path: str, language: str, args: str, timeout: int) -> dict:
+def _compile_and_run_path(file_path: str, language: str, args: str, timeout: int,
+                          on_progress=None) -> dict:
     """Compile ``file_path`` for ``language`` (if needed) and run the result.
 
     Mirrors the compile/run/diagnostic flow from raspberry_pi/agent.py, returning
-    the same enriched result shape the Grafux block already understands.
+    the same enriched result shape the Grafux block already understands.  When
+    ``on_progress`` is given, intermediate {"phase": …, "line": …} frames are
+    emitted (compiling / running / each stdout line) before the final result; the
+    final dict is byte-for-byte identical to the non-streaming path either way.
     """
     logger.info("compile_and_run: %s (%s)", file_path, language)
 
@@ -208,6 +268,7 @@ def _compile_and_run_path(file_path: str, language: str, args: str, timeout: int
             run_cmd = [sys.executable, file_path] + (args.split() if args else [])
 
         elif language == "c":
+            _emit(on_progress, phase="compiling")
             binary = os.path.splitext(file_path)[0]
             compile_result = subprocess.run(
                 ["gcc", "-o", binary, file_path, "-lm"],
@@ -221,6 +282,7 @@ def _compile_and_run_path(file_path: str, language: str, args: str, timeout: int
             run_cmd = [binary] + (args.split() if args else [])
 
         elif language == "cpp":
+            _emit(on_progress, phase="compiling")
             binary = os.path.splitext(file_path)[0]
             compile_result = subprocess.run(
                 ["g++", "-o", binary, file_path, "-lm", "-lstdc++"],
@@ -244,19 +306,32 @@ def _compile_and_run_path(file_path: str, language: str, args: str, timeout: int
             )
 
         # Run in an isolated dir so we can collect any files the program writes.
+        # With a progress callback, stream stdout lines live; otherwise keep the
+        # original one-shot capture.  Both paths produce the same final fields.
         with tempfile.TemporaryDirectory() as run_outdir:
-            run_result = subprocess.run(
-                run_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=run_outdir,
-            )
+            if on_progress:
+                _emit(on_progress, phase="running")
+                _run_stdout, _run_stderr, _run_rc, _timed_out = _run_streaming(
+                    run_cmd, run_outdir, timeout, on_progress,
+                )
+                if _timed_out:
+                    return {"type": "compile_run_result", "status": "timeout",
+                            "language": language, "errors": f"Execution exceeded {timeout}s",
+                            "response": "timeout"}
+            else:
+                run_result = subprocess.run(
+                    run_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=run_outdir,
+                )
+                _run_stdout = run_result.stdout.splitlines()
+                _run_stderr = run_result.stderr.splitlines()
+                _run_rc = run_result.returncode
             output_files = _collect_files(run_outdir)
 
-        _run_stdout = run_result.stdout.splitlines()
-        _run_stderr = run_result.stderr.splitlines()
-        _run_status = "ok" if run_result.returncode == 0 else "runtime_error"
+        _run_status = "ok" if _run_rc == 0 else "runtime_error"
 
         _c_warnings, _c_errors   = _split_diagnostics(compile_stderr)
         _rt_warnings, _rt_errors = _split_diagnostics(_run_stderr)
@@ -287,7 +362,7 @@ def _compile_and_run_path(file_path: str, language: str, args: str, timeout: int
             "compile_returncode": compile_returncode,
             "stdout":             _run_stdout,
             "stderr":             _run_stderr,
-            "returncode":         run_result.returncode,
+            "returncode":         _run_rc,
             "files":              output_files,
         }
 
@@ -332,34 +407,50 @@ def _compile_error(compile_stdout: list, compile_stderr: list, returncode: int) 
 # ---------------------------------------------------------------------------
 
 
-def handle_run_code(payload: dict) -> dict:
+def handle_run_code(payload: dict, on_progress=None) -> dict:
     """Execute an inline Python snippet in an isolated subprocess with a timeout.
 
     Running as a subprocess (not in-process ``exec``) means the ``timeout`` is
     actually enforceable — an infinite loop is killed instead of hanging the
     device server forever — and user code cannot reach the server's own state.
+    When ``on_progress`` is given, stdout lines stream live before the final dict.
     """
     code    = payload.get("code", "")
     timeout = _safe_int(payload.get("timeout"), 30)
     if not code:
         return _error("run_code_result", "code is required")
 
+    run_cmd = [sys.executable, "-I", "-c", code]
     with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-I", "-c", code],
-                capture_output=True, text=True, timeout=timeout, cwd=tmpdir,
+        if on_progress:
+            _emit(on_progress, phase="running")
+            stdout_lines, stderr_lines, returncode, timed_out = _run_streaming(
+                run_cmd, tmpdir, timeout, on_progress,
             )
-        except subprocess.TimeoutExpired:
-            return {
-                "type": "run_code_result", "status": "timeout",
-                "output": "", "errors": f"Execution exceeded {timeout}s and was terminated.",
-                "warnings": "", "response": f"timeout — killed after {timeout}s",
-                "stdout": [], "stderr": [], "files": [],
-            }
-        stdout_lines = proc.stdout.splitlines()
-        stderr_lines = proc.stderr.splitlines()
-        status = "ok" if proc.returncode == 0 else "error"
+            if timed_out:
+                return {
+                    "type": "run_code_result", "status": "timeout",
+                    "output": "", "errors": f"Execution exceeded {timeout}s and was terminated.",
+                    "warnings": "", "response": f"timeout — killed after {timeout}s",
+                    "stdout": [], "stderr": [], "files": [],
+                }
+        else:
+            try:
+                proc = subprocess.run(
+                    run_cmd,
+                    capture_output=True, text=True, timeout=timeout, cwd=tmpdir,
+                )
+            except subprocess.TimeoutExpired:
+                return {
+                    "type": "run_code_result", "status": "timeout",
+                    "output": "", "errors": f"Execution exceeded {timeout}s and was terminated.",
+                    "warnings": "", "response": f"timeout — killed after {timeout}s",
+                    "stdout": [], "stderr": [], "files": [],
+                }
+            stdout_lines = proc.stdout.splitlines()
+            stderr_lines = proc.stderr.splitlines()
+            returncode = proc.returncode
+        status = "ok" if returncode == 0 else "error"
         files = _collect_files(tmpdir)
 
     _warnings, _ = _split_diagnostics(stderr_lines)
@@ -462,12 +553,23 @@ HANDLERS = {
 }
 
 
-def dispatch(action: str, payload: dict) -> dict:
-    """Run the handler for ``action`` and return its result dict."""
+#: Actions that can stream intermediate progress frames via ``on_progress``.
+STREAMING = {"compile_and_run", "run_code"}
+
+
+def dispatch(action: str, payload: dict, on_progress=None) -> dict:
+    """Run the handler for ``action`` and return its result dict.
+
+    ``on_progress`` (optional) is a callable invoked with progress-frame dicts
+    for streaming actions; non-streaming handlers ignore it, and a two-argument
+    call (no callback) behaves exactly as before.
+    """
     handler = HANDLERS.get(action)
     if handler is None:
         return _error("unknown_command", f"unknown action: {action}")
     try:
+        if on_progress and action in STREAMING:
+            return handler(payload, on_progress)
         return handler(payload)
     except Exception as exc:  # noqa: BLE001
         logger.error("handler for '%s' raised: %s", action, exc)
