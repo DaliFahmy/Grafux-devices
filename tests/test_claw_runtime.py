@@ -116,9 +116,13 @@ def fake_anthropic(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clean_registry():
+    # Reset the per-api-key AsyncAnthropic client cache so each test's freshly-installed
+    # fake client is used (the cache keys on api_key, which is constant across tests).
+    claw_runtime._ANTHROPIC_CLIENTS.clear()
     for s in list(registry.list()):
         registry.delete(s.claw_id)
     yield
+    claw_runtime._ANTHROPIC_CLIENTS.clear()
     for s in list(registry.list()):
         registry.delete(s.claw_id)
 

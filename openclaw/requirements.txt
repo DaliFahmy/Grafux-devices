@@ -10,3 +10,5 @@ httpx>=0.23
 # tool loop in connections.run_local_agent_loop — for Composio's Connect/Tool-Router URL
 # (x-consumer-api-key), which Anthropic's bearer-only connector cannot authenticate to.
 mcp>=1.0.0
+# segno (pure-python QR encoder, no native deps) renders the claw's "qr_code" port in qr.py.
+segno>=1.5.2

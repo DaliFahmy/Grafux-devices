@@ -11,6 +11,9 @@ httpx>=0.23
 # to drive header-authenticated MCP servers (Composio Connect/Tool-Router, x-consumer-api-key)
 # that Anthropic's bearer-only connector cannot reach.
 mcp>=1.0.0
+# segno is a pure-python QR encoder (no Pillow/native deps) used by openclaw/qr.py to render
+# the claw's "qr_code" port — a scannable QR of an app's authorization link.
+segno>=1.5.2
 # paramiko powers the SSH compile-and-run loop in GPU/runpod_client.py (httpx above
 # is reused for the RunPod REST API). Pinned here because Render installs this file.
 paramiko>=3.0

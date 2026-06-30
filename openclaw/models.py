@@ -107,6 +107,16 @@ class ClawConnection(BaseModel):
     account_label: str = Field("", description="Human-friendly label for the connected account.")
     enabled: bool = Field(True, description="Whether the claw may use this connection's tools.")
     channel: bool = Field(False, description="True if this connection is the inbound messaging channel.")
+    tool_router: bool = Field(
+        False,
+        description=(
+            "One-click 'use Composio's Tool-Router for this app's tools'. When True and no "
+            "explicit mcp_url is set, the claw resolves the connection to Composio's Tool-Router "
+            "MCP URL (https://connect.composio.dev/mcp) with header auth (x-consumer-api-key from "
+            "the resolved Composio key) so the local MCP loop exposes the app's tools — no need to "
+            "paste an MCP server URL. The toolkit must be enabled for the user_id on Composio."
+        ),
+    )
 
 
 class CreateClawResponse(BaseModel):
@@ -152,6 +162,15 @@ class ConfigPatchRequest(BaseModel):
     connections: Optional[str] = None
 
 
+class ConnectionStatus(BaseModel):
+    """Per-app readiness, surfaced on the block's ``connections_status`` port."""
+
+    app: str = ""
+    configured: bool = False   # the connection carries enough to expose tools
+    needs_auth: bool = False   # the user still has to connect/authorize the account
+    channel: bool = False      # this connection is the inbound messaging channel
+
+
 class RunResponse(BaseModel):
     claw_id: str
     status: str  # "ok" | "error"
@@ -163,6 +182,11 @@ class RunResponse(BaseModel):
     output_tokens: int = 0
     cache_read_input_tokens: int = 0
     cost_usd: float = 0.0
+    # Guidance surfaces (all optional → older blocks without these ports ignore them).
+    guidance: str = ""                                  # "what to add to which port"
+    setup_status: str = ""                              # one-line readiness, e.g. "Ready"
+    qr_code: str = ""                                   # data: URI to scan-to-connect an app
+    connections_status: list[ConnectionStatus] = []     # per-app readiness
 
 
 class ClawModel(BaseModel):
@@ -258,3 +282,23 @@ class ScaffoldResponse(BaseModel):
     connections: str = ""
     credentials: str = ""
     api_keys: str = ""
+    guidance: str = ""  # drafted "what to fill in next" notes for the create dialog
+
+
+class QrRequest(BaseModel):
+    """Render arbitrary text (usually an app authorization URL) as a QR code."""
+
+    text: str = Field("", description="Text/URL to encode as a scannable QR code.")
+
+
+class QrResponse(BaseModel):
+    data_uri: str = ""  # "data:image/png;base64,…" — empty when QR rendering is unavailable
+
+
+class GuidanceResponse(BaseModel):
+    """Readiness analysis of a (possibly un-provisioned) claw spec."""
+
+    ready: bool = False
+    setup_status: str = ""
+    guidance: str = ""
+    connections_status: list[ConnectionStatus] = []

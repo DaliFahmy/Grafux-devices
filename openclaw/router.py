@@ -31,7 +31,7 @@ import logging
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
 
-from . import claw_runtime, connections
+from . import claw_runtime, connections, guidance, qr
 from .models import (
     ClawModel,
     ClawModelsResponse,
@@ -40,8 +40,11 @@ from .models import (
     ConfigPatchRequest,
     ConnectionSummary,
     CreateClawResponse,
+    GuidanceResponse,
     InitiateConnectionRequest,
     InitiateConnectionResponse,
+    QrRequest,
+    QrResponse,
     RegisterChannelRequest,
     RegisterChannelResponse,
     RunRequest,
@@ -100,6 +103,29 @@ async def list_claw_models() -> ClawModelsResponse:
             for model_id, info in claw_runtime.MODEL_CATALOG.items()
         ]
     )
+
+
+@router.post("/qr", response_model=QrResponse)
+async def make_qr(body: QrRequest) -> QrResponse:
+    """
+    Render text (usually an app's authorization URL) as a scannable QR ``data:`` URI.
+
+    Used by the connections dialog to show a scan-to-connect QR and to fill the block's
+    ``qr_code`` output port.  Declared before ``/{claw_id}`` so "qr" is not captured as an id.
+    """
+    return QrResponse(data_uri=qr.qr_data_uri(body.text))
+
+
+@router.post("/guidance", response_model=GuidanceResponse)
+async def claw_guidance(spec: ClawSpec) -> GuidanceResponse:
+    """
+    Analyze a (possibly un-provisioned) claw spec and return setup guidance.
+
+    Used by the create dialog to show "what to fill in next" before a claw exists, and by
+    the block to refresh guidance without a run.  Pure/sync — no API calls.  Declared before
+    ``/{claw_id}`` so "guidance" is not captured as a claw id.
+    """
+    return GuidanceResponse(**guidance.analyze(spec))
 
 
 def _summarize(claw_id: str, spec: ClawSpec) -> ClawSummary:
@@ -242,6 +268,9 @@ async def patch_claw_config(claw_id: str, body: ConfigPatchRequest) -> ClawSumma
         val = getattr(body, field)
         if val is not None:
             setattr(spec, field, val)
+    # A connections change can alter the MCP tool set — drop the cached schemas so the next
+    # run re-discovers them (cheap; the cache also keys on url+headers, this is belt-and-braces).
+    connections.clear_tool_cache()
     registry.save(claw_id)  # flush to disk when persistence is enabled
     return _summarize(claw_id, spec)
 

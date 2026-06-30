@@ -37,6 +37,20 @@ logger = logging.getLogger("openclaw.runtime")
 DEFAULT_MODEL = os.environ.get("OPENCLAW_DEFAULT_MODEL", "claude-opus-4-8")
 DEFAULT_MAX_TOKENS = 4096
 
+# Reuse one AsyncAnthropic client per API key instead of constructing one per run — each
+# construction spins up an httpx connection pool, so reuse cuts per-run setup cost and lets
+# connections stay warm across runs of the same claw.  Keyed by api_key (process-local).
+_ANTHROPIC_CLIENTS: Dict[str, Any] = {}
+
+
+def _client_for(api_key: str, ctor: Any) -> Any:
+    """Return a cached AsyncAnthropic client for ``api_key`` (constructing one on first use)."""
+    client = _ANTHROPIC_CLIENTS.get(api_key)
+    if client is None:
+        client = ctor(api_key=api_key)
+        _ANTHROPIC_CLIENTS[api_key] = client
+    return client
+
 # Model catalog — pricing ($ per 1M tokens) and whether the model accepts the
 # sampling params (temperature/top_p/top_k).  Sourced from the Claude API
 # reference (2026-06).  CRITICAL: the Opus 4.7+/Fable family REJECTS sampling
@@ -259,6 +273,15 @@ async def run_claw(
     With no connections the call is identical to before (plain Messages request).
     ``from_channel`` tweaks the system prompt for inbound chat replies.
     """
+    from . import guidance as guidance_mod  # lazy — avoids the guidance <-> claw_runtime cycle
+
+    report = guidance_mod.analyze(spec)
+    guide = {
+        "guidance": report["guidance"],
+        "setup_status": report["setup_status"],
+        "connections_status": report["connections_status"],
+    }
+
     try:
         from anthropic import AsyncAnthropic  # lazy import — see module docstring
     except ImportError:
@@ -267,15 +290,20 @@ async def run_claw(
             "response": "",
             "errors": "The 'anthropic' package is not installed on the devices server. "
                       "Add it to requirements.txt (pip install anthropic).",
+            **guide,
         }
 
     api_key = _resolve_api_key(spec)
     if not api_key:
+        # Teach instead of failing: surface the setup guidance as the response so the block
+        # shows the user exactly what to add (API key, persona, connections) rather than a
+        # bare error.  status stays "error" so the block still flags it as not-yet-runnable.
         return {
             "status": "error",
-            "response": "",
+            "response": report["guidance"],
             "errors": "No Anthropic API key found. Set the claw's api_keys port "
-                      "(or the ANTHROPIC_API_KEY env var on the server).",
+                      "({\"anthropic\": \"sk-ant-…\"}) or the ANTHROPIC_API_KEY env var.",
+            **guide,
         }
 
     params = _resolve_model_params(spec)
@@ -284,7 +312,7 @@ async def run_claw(
     mcp_servers = connections.build_mcp_servers(spec)
     local_conns = connections.local_loop_connections(spec)
 
-    client = AsyncAnthropic(api_key=api_key)
+    client = _client_for(api_key, AsyncAnthropic)
     request_kwargs: Dict[str, Any] = dict(
         model=params["model"],
         max_tokens=params["max_tokens"],
@@ -314,7 +342,7 @@ async def run_claw(
             text = await connections.run_local_agent_loop(
                 client, request_kwargs, spec, connector_servers=mcp_servers
             )
-            return {"status": "ok", "response": text, "errors": ""}
+            return {"status": "ok", "response": text, "errors": "", **guide}
         if mcp_servers:
             # Remote-MCP connector: Claude calls the Composio app tools server-side,
             # so a single round-trip still yields the final text (no local loop).
@@ -329,7 +357,7 @@ async def run_claw(
             message = await client.messages.create(**request_kwargs)
     except Exception as exc:  # noqa: BLE001 — surface any SDK/API error to the block
         logger.exception("claw run failed")
-        return {"status": "error", "response": "", "errors": _describe_exception(exc)}
+        return {"status": "error", "response": "", "errors": _describe_exception(exc), **guide}
 
     text = "".join(
         block.text for block in message.content if getattr(block, "type", None) == "text"
@@ -345,6 +373,7 @@ async def run_claw(
         "output_tokens": int(getattr(usage, "output_tokens", 0) or 0),
         "cache_read_input_tokens": int(getattr(usage, "cache_read_input_tokens", 0) or 0),
         "cost_usd": _estimate_cost_usd(params["model"], usage),
+        **guide,
     }
 
 
@@ -400,7 +429,7 @@ async def stream_claw(
 
     system_prompt = _build_system_prompt(spec, from_channel=from_channel)
     user_turn = _build_user_turn(task, memory, text_message)
-    client = AsyncAnthropic(api_key=api_key)
+    client = _client_for(api_key, AsyncAnthropic)
     request_kwargs: Dict[str, Any] = dict(
         model=params["model"],
         max_tokens=params["max_tokens"],
@@ -465,12 +494,24 @@ _SCAFFOLD_SYSTEM = (
 )
 
 
+def _scaffold_guidance(out: Dict[str, str]) -> str:
+    """Compute the setup guidance for scaffolded port values (so the create dialog can show it)."""
+    from . import guidance as guidance_mod  # lazy — avoid import cycle
+
+    fields = {k: out.get(k, "") for k in ("soul", "skills", "agent", "tools_config", "connections")}
+    try:
+        return guidance_mod.analyze(ClawSpec(**fields))["guidance"]
+    except Exception:  # noqa: BLE001 — guidance is best-effort, never break scaffolding
+        return ""
+
+
 def _scaffold_fallback() -> Dict[str, str]:
     """Empty design ports + placeholder secrets, used when the AI is unavailable."""
     out = {k: "" for k in _DESIGN_KEYS}
     out["agent"] = DEFAULT_MODEL
     out["credentials"] = _CREDENTIALS_HINT
     out["api_keys"] = _API_KEYS_HINT
+    out["guidance"] = _scaffold_guidance(out)
     return out
 
 
@@ -537,4 +578,5 @@ async def scaffold_claw(description: str, name: str = "") -> Dict[str, str]:
     # Secrets are ALWAYS placeholders, regardless of what the model returned.
     out["credentials"] = _CREDENTIALS_HINT
     out["api_keys"] = _API_KEYS_HINT
+    out["guidance"] = _scaffold_guidance(out)
     return out

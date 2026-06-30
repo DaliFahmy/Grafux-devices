@@ -21,6 +21,7 @@ consistent across services.  ``httpx`` is imported lazily (like ``anthropic`` in
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -33,12 +34,37 @@ logger = logging.getLogger("openclaw.connections")
 # Composio endpoints (kept identical to the Grafux-mcp integration).
 _COMPOSIO_BACKEND = "https://backend.composio.dev"
 
+# Composio's Tool-Router MCP URL — a single header-authenticated endpoint that exposes the
+# user's enabled toolkits.  Used by the one-click ``tool_router`` connection so a user can get
+# an app's tools without pasting an MCP server URL (driven by the local loop, x-consumer-api-key).
+TOOL_ROUTER_URL = "https://connect.composio.dev/mcp"
+
 # Anthropic beta flag that enables the remote-MCP connector on the Messages API.
 # (mcp-client-2025-04-04 is deprecated; 2025-11-20 requires a matching mcp_toolset
 # entry in the tools array for every server — see claw_runtime.run_claw.)
 MCP_CONNECTOR_BETA = "mcp-client-2025-11-20"
 
 _PLACEHOLDER_VALUES = {"empty", "unconnected"}
+
+# Known apps a claw can connect, keyed by the friendly name the user types/clicks.
+# ``toolkit`` is the Composio toolkit slug; ``supports_qr`` flags apps whose connect flow
+# returns an authorization URL worth showing as a scannable QR.  This catalog drives the
+# app-picker dialog, the per-app guidance, and validation of the simple connections shape.
+APP_CATALOG: Dict[str, Dict[str, Any]] = {
+    "telegram": {"toolkit": "telegram", "label": "Telegram", "supports_qr": True},
+    "whatsapp": {"toolkit": "whatsapp", "label": "WhatsApp", "supports_qr": True},
+    "slack":    {"toolkit": "slack",    "label": "Slack",    "supports_qr": True},
+    "gmail":    {"toolkit": "gmail",    "label": "Gmail",    "supports_qr": True},
+    "discord":  {"toolkit": "discord",  "label": "Discord",  "supports_qr": True},
+    "github":   {"toolkit": "github",   "label": "GitHub",   "supports_qr": True},
+    "notion":   {"toolkit": "notion",   "label": "Notion",   "supports_qr": True},
+    "google_calendar": {"toolkit": "googlecalendar", "label": "Google Calendar", "supports_qr": True},
+}
+
+
+def known_app(app: str) -> bool:
+    """True if ``app`` is in the connect catalog (case-insensitive)."""
+    return (app or "").strip().lower() in APP_CATALOG
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +117,13 @@ def parse_connections(spec: ClawSpec) -> List[ClawConnection]:
     """
     Parse the ``connections`` port into ClawConnection objects (best-effort).
 
-    Two shapes are accepted:
+    Several shapes are accepted (most user-friendly first):
+
+      * **Simple app list** — ``["whatsapp", "telegram"]`` or
+        ``[{"app": "whatsapp", "enabled": true, "tool_router": true}]``. The easiest way to
+        wire apps: just name them. An entry with ``tool_router: true`` (and a resolvable
+        Composio key) is resolved to Composio's Tool-Router MCP URL so the claw gets that
+        app's tools without pasting a server URL.
 
       * **Standard MCP client config** — the JSON Composio (and other MCP hosts) hand you::
 
@@ -110,13 +142,44 @@ def parse_connections(spec: ClawSpec) -> List[ClawConnection]:
         return []
     out: List[ClawConnection] = []
     for item in parsed:
+        if isinstance(item, str):
+            # Bare app name, e.g. "whatsapp" — the friendliest shape.
+            name = item.strip()
+            if name:
+                out.append(ClawConnection(app=name))
+            continue
         if not isinstance(item, dict):
             continue
         try:
             out.append(ClawConnection(**item))
         except Exception as exc:  # noqa: BLE001 — skip malformed entries, keep the rest
             logger.warning("connections: skipping malformed entry %r (%s)", item, exc)
+    _apply_tool_router(out, spec)
     return out
+
+
+def _apply_tool_router(conns: List[ClawConnection], spec: ClawSpec) -> None:
+    """
+    Resolve ``tool_router`` connections to Composio's Tool-Router MCP URL in place.
+
+    A connection with ``tool_router: true`` and no explicit ``mcp_url`` is pointed at
+    ``TOOL_ROUTER_URL`` with header auth (``x-consumer-api-key`` from the claw's resolved
+    Composio key), so the local MCP loop exposes the app's tools without the user pasting a
+    server URL.  No-op when the connection already has a url, or when no Composio key is
+    resolvable (guidance then tells the user to add one).
+    """
+    key = None
+    for conn in conns:
+        if not conn.tool_router or _clean_port(conn.mcp_url):
+            continue
+        if key is None:
+            key = resolve_composio_key(spec) or ""
+        if not key:
+            continue
+        conn.mcp_url = TOOL_ROUTER_URL
+        conn.header_auth = True
+        if not _clean_port(conn.api_key):
+            conn.api_key = key
 
 
 def _connections_from_mcp_servers(servers: Dict[str, Any]) -> List[ClawConnection]:
@@ -225,6 +288,31 @@ def describe_connections(spec: ClawSpec) -> str:
     return ", ".join(dict.fromkeys(apps))  # de-dupe, preserve order
 
 
+def connection_statuses(spec: ClawSpec) -> List[Dict[str, Any]]:
+    """
+    Per-app readiness for the guidance / ``connections_status`` port (sync, no network).
+
+    ``configured`` = the connection carries enough to expose tools right now (an mcp_url, or
+    tool_router with a resolvable Composio key).  ``needs_auth`` = the user still has to
+    connect/authorize the account (no mcp_url and no usable tool-router fallback).
+    """
+    out: List[Dict[str, Any]] = []
+    for conn in parse_connections(spec):
+        app = _clean_port(conn.app)
+        if not app:
+            continue
+        configured = bool(_mcp_url_for(conn))  # tool_router was already resolved to a url
+        out.append(
+            {
+                "app": app,
+                "configured": configured,
+                "needs_auth": (not configured) and conn.enabled,
+                "channel": bool(conn.channel),
+            }
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Local MCP loop — header-authenticated servers (Composio Connect / Tool-Router)
 #
@@ -241,6 +329,22 @@ COMPOSIO_API_KEY_HEADER = "x-consumer-api-key"
 
 # Guard so a tool that keeps asking for more tools cannot loop forever.
 _MAX_TOOL_ITERATIONS = 8
+
+# Cache of an MCP server's advertised tool schemas, keyed by (url, headers-hash).  Lets a
+# repeat run of a connection-claw skip the ``list_tools`` round-trip (the schemas are stable);
+# the live session is still opened so tools can be *called*.  Keyed by a hash of the headers so
+# a credential change is a cache miss.  Cleared on config patch / regenerate via clear_tool_cache.
+_TOOL_SCHEMA_CACHE: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+
+
+def _tool_cache_key(url: str, headers: Dict[str, str]) -> Tuple[str, str]:
+    digest = hashlib.sha256(repr(sorted(headers.items())).encode("utf-8")).hexdigest()[:16]
+    return (url, digest)
+
+
+def clear_tool_cache() -> None:
+    """Drop all cached MCP tool schemas (call when a claw's config/connections change)."""
+    _TOOL_SCHEMA_CACHE.clear()
 
 
 def _is_local_loop(conn: ClawConnection) -> bool:
@@ -367,25 +471,43 @@ async def run_local_agent_loop(
             await session.initialize()
 
             prefix = _server_name_for(conn, i)
-            listed = await session.list_tools()
-            logger.info(
-                "local MCP '%s' (%s) exposed %d tool(s): %s",
-                _clean_port(conn.app) or prefix,
-                url,
-                len(listed.tools),
-                ", ".join(t.name for t in listed.tools) or "(none)",
-            )
-            for tool in listed.tools:
+            cache_key = _tool_cache_key(url, headers)
+            cached = _TOOL_SCHEMA_CACHE.get(cache_key)
+            if cached is None:
+                listed = await session.list_tools()
+                cached = [
+                    {
+                        "name": t.name,
+                        "description": t.description or "",
+                        "schema": t.inputSchema if isinstance(t.inputSchema, dict) else None,
+                    }
+                    for t in listed.tools
+                ]
+                _TOOL_SCHEMA_CACHE[cache_key] = cached
+                logger.info(
+                    "local MCP '%s' (%s) exposed %d tool(s): %s",
+                    _clean_port(conn.app) or prefix,
+                    url,
+                    len(cached),
+                    ", ".join(c["name"] for c in cached) or "(none)",
+                )
+            else:
+                logger.info(
+                    "local MCP '%s' (%s) reusing %d cached tool schema(s)",
+                    _clean_port(conn.app) or prefix,
+                    url,
+                    len(cached),
+                )
+            for entry in cached:
                 # Prefix when there is more than one server so names stay unique.
-                raw = f"{prefix}__{tool.name}" if len(conns) > 1 else tool.name
+                raw = f"{prefix}__{entry['name']}" if len(conns) > 1 else entry["name"]
                 exposed = _sanitize_tool_name(raw)
-                dispatch[exposed] = (session, tool.name)
-                schema = tool.inputSchema if isinstance(tool.inputSchema, dict) else None
+                dispatch[exposed] = (session, entry["name"])
                 tool_defs.append(
                     {
                         "name": exposed,
-                        "description": tool.description or "",
-                        "input_schema": schema or {"type": "object", "properties": {}},
+                        "description": entry["description"],
+                        "input_schema": entry["schema"] or {"type": "object", "properties": {}},
                     }
                 )
 
