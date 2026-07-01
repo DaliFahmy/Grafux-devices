@@ -408,38 +408,23 @@ async def composio_manage(claw_id: str, request: Request) -> str:
             "<code>{&quot;composio&quot;: &quot;ck_…&quot;}</code>, click <b>Regenerate</b>, then reopen this page.</p>"
         )
 
-    conns = composio_tools._rest_connections(spec)
-    if not conns:
-        return page(
-            "<p>No apps in the <b>connections</b> port yet. Set it on the block to e.g. "
-            "<code>[&quot;googlecalendar&quot;, &quot;telegram&quot;]</code>, click <b>Regenerate</b>, "
-            "then reopen this page.</p>"
-        )
-
     all_accounts = await composio_tools.list_connected_accounts(key)
 
-    cards = []
-    for conn in conns:
-        app = connections._clean_port(conn.app)
-        if not app or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", app):
-            continue
-        app_esc = html.escape(app)
+    async def _card(app_display: str, resolved_slug: str, from_port: bool) -> str:
+        """Render one app card: tools list + connected accounts (with Disconnect) + Connect form."""
+        app_esc = html.escape(app_display)
+        connect_slug = html.escape(resolved_slug)
         note = ""
-        connect_slug = app_esc
-        resolved = app
-        try:
-            resolved = await composio_tools.resolve_toolkit_slug(key, app)
-            if resolved != app:
-                connect_slug = html.escape(resolved)
-                note = (f" <span style='color:#888;font-size:13px'>· using toolkit "
-                        f"<b>{connect_slug}</b></span>")
-        except Exception:  # noqa: BLE001
-            pass
+        if from_port and resolved_slug != app_display:
+            note = (f" <span style='color:#888;font-size:13px'>· using toolkit "
+                    f"<b>{connect_slug}</b></span>")
+        elif not from_port:
+            note = " <span style='color:#888;font-size:13px'>· connected in Composio</span>"
 
         # Tools for this toolkit (expandable list).
         tools_html = ""
         try:
-            tools = await composio_tools._list_actions_for_app(key, app)
+            tools = await composio_tools._list_actions_for_app(key, resolved_slug)
             if tools:
                 items = "".join(f"<li>{html.escape(t['name'])}</li>" for t in tools)
                 tools_html = (f"<details style='margin:6px 0'><summary style='cursor:pointer'>"
@@ -451,7 +436,7 @@ async def composio_manage(claw_id: str, request: Request) -> str:
             meta = f"<span style='color:#b00'>tools error: {html.escape(str(exc)[:100])}</span>"
 
         # Connected accounts for this toolkit + a Disconnect link each.
-        app_accounts = [a for a in all_accounts if a.get("toolkit") == resolved.lower()]
+        app_accounts = [a for a in all_accounts if a.get("toolkit") == resolved_slug.lower()]
         active = any(a.get("status", "").upper() == "ACTIVE" for a in app_accounts)
         status = ("<span style='color:#2e7d32'>✅ Connected</span>" if active
                   else "<span style='color:#b26a00'>Not connected</span>")
@@ -474,9 +459,8 @@ async def composio_manage(claw_id: str, request: Request) -> str:
             accounts_html = ("<div style='margin:6px 0;color:#999;font-size:13px'>"
                              "No account connected yet.</div>")
 
-        # Connect under the resolved (canonical) slug so a typo still connects the right toolkit.
         action = f"{base}/claw/{claw_id}/composio/connect/{connect_slug}"
-        cards.append(
+        return (
             "<div style='border:1px solid #e0e0e8;border-radius:10px;padding:14px 16px;margin:12px 0'>"
             f"<div style='display:flex;justify-content:space-between;align-items:center'>"
             f"<b style='font-size:16px'>{app_esc}</b><span>{status}</span></div>"
@@ -490,9 +474,36 @@ async def composio_manage(claw_id: str, request: Request) -> str:
             "</form></div>"
         )
 
-    intro = ("<p style='color:#555'>Click <b>Connect</b> next to an app. OAuth apps (Google Calendar, "
-             "Gmail…) send you to a sign-in page; API-key apps (OpenWeatherMap, Telegram…) — paste the "
-             "key/token first. When it shows ✅ Connected, the claw can use that app.</p>")
+    # Union: apps wired in the connections port first, then any OTHER toolkit that has a connected
+    # account in Composio (orphans / duplicates the user may want to disconnect).
+    port: list = []
+    for conn in composio_tools._rest_connections(spec):
+        app = connections._clean_port(conn.app)
+        if not app or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", app):
+            continue
+        try:
+            resolved = await composio_tools.resolve_toolkit_slug(key, app)
+        except Exception:  # noqa: BLE001
+            resolved = app
+        port.append((app, resolved))
+    seen = {resolved for _, resolved in port}
+    extra = sorted({a["toolkit"] for a in all_accounts
+                    if a.get("toolkit") and a["toolkit"] not in seen
+                    and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", a["toolkit"])})
+
+    if not port and not extra:
+        return page(
+            "<p>No apps in the <b>connections</b> port yet, and no connected accounts. Set the port on "
+            "the block to e.g. <code>[&quot;googlecalendar&quot;, &quot;telegram&quot;]</code>, click "
+            "<b>Regenerate</b>, then reopen this page.</p>"
+        )
+
+    cards = [await _card(app, resolved, True) for (app, resolved) in port]
+    cards += [await _card(slug, slug, False) for slug in extra]
+
+    intro = ("<p style='color:#555'>Apps wired to this claw, plus everything already connected in your "
+             "Composio account. Click <b>Connect</b> to add an account (OAuth → sign-in; API-key apps → "
+             "paste the key), or <b>Disconnect</b> to remove one.</p>")
     return page(intro + "".join(cards))
 
 

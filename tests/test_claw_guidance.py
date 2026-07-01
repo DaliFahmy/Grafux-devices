@@ -516,6 +516,45 @@ def test_composio_manage_page_renders(monkeypatch):
         registry.delete(cid)
 
 
+def test_composio_manage_page_shows_orphan_and_empty_port_accounts(monkeypatch):
+    from openclaw.registry import registry
+
+    async def fake_tools(key, app):
+        return [{"name": f"{app.upper()}_ACTION", "description": "", "input_schema": {}}]
+
+    async def fake_resolve(key, app):
+        return app
+
+    async def fake_accounts(key):
+        return [
+            {"id": "ca_sheets", "toolkit": "googlesheets", "user_id": "default", "status": "ACTIVE"},
+            {"id": "ca_cal", "toolkit": "googlecalendar", "user_id": "default", "status": "ACTIVE"},
+        ]
+
+    monkeypatch.setattr(composio_tools, "_list_actions_for_app", fake_tools)
+    monkeypatch.setattr(composio_tools, "resolve_toolkit_slug", fake_resolve)
+    monkeypatch.setattr(composio_tools, "list_connected_accounts", fake_accounts)
+
+    # Port only has googlesheets, but a googlecalendar account exists (orphan) → BOTH cards show.
+    cid = registry.create(ClawSpec(api_keys='{"composio":"ck"}', connections='["googlesheets"]', name="t"))
+    try:
+        r = _manage_client().get(f"/claw/{cid}/composio")
+        assert f"/claw/{cid}/composio/disconnect/ca_sheets" in r.text   # port app
+        assert f"/claw/{cid}/composio/disconnect/ca_cal" in r.text      # orphan not in port
+        assert "connected in Composio" in r.text                        # orphan-card label
+    finally:
+        registry.delete(cid)
+
+    # Empty connections port, but an account exists → still rendered so it can be disconnected.
+    cid2 = registry.create(ClawSpec(api_keys='{"composio":"ck"}', connections="", name="t2"))
+    try:
+        r2 = _manage_client().get(f"/claw/{cid2}/composio")
+        assert f"/claw/{cid2}/composio/disconnect/ca_sheets" in r2.text
+        assert f"/claw/{cid2}/composio/disconnect/ca_cal" in r2.text
+    finally:
+        registry.delete(cid2)
+
+
 def test_composio_manage_page_no_key():
     from openclaw.registry import registry
     cid = registry.create(ClawSpec(connections='["googlecalendar"]', name="t"))
