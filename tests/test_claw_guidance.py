@@ -351,3 +351,25 @@ async def test_run_claw_uses_composio_tool(tool_anthropic, monkeypatch):
     assert executed["args"] == {"chat_id": "5", "text": "hi"}
     assert executed["account_id"] == "ca_1"          # resolved from list_connections
     assert any("tools" in c for c in tool_anthropic["calls"])
+
+
+async def test_run_claw_surfaces_composio_tool_error(tool_anthropic, monkeypatch):
+    # A failing Composio action must surface its real cause on the errors port (status error),
+    # not just be paraphrased by the model.
+    async def failing_execute(key, action, args, account_id):
+        raise RuntimeError("Composio 'TELEGRAM_SEND_MESSAGE' failed (HTTP 401): invalid api key")
+
+    async def no_discovery(key, app):
+        return []
+
+    async def fake_accounts(key):
+        return [{"app": "telegram", "connection_id": "ca_1", "status": "ACTIVE"}]
+
+    monkeypatch.setattr(composio_tools, "_execute", failing_execute)
+    monkeypatch.setattr(composio_tools, "_list_actions_for_app", no_discovery)
+    monkeypatch.setattr(connections, "list_connections", fake_accounts)
+
+    spec = ClawSpec(api_keys='{"anthropic": "sk-ant", "composio": "ck_bad"}', connections='["telegram"]')
+    result = await claw_runtime.run_claw(spec, task="send hi")
+    assert result["status"] == "error"
+    assert "HTTP 401" in result["errors"]

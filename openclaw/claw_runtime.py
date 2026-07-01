@@ -352,11 +352,18 @@ async def run_claw(
             return {"status": "ok", "response": text, "errors": "", **guide}
         if composio_defs:
             # Real tools for the claw's connected Composio apps, executed via REST. Run a tool
-            # loop so the claw takes the action; any connector servers ride along.
-            text = await composio_tools.run_tool_loop(
+            # loop so the claw takes the action; any connector servers ride along. Any tool
+            # failures (bad key, no connected account, Composio 4xx) are surfaced on the errors
+            # port so the user sees the real cause, not just the model's paraphrase.
+            text, tool_errors = await composio_tools.run_tool_loop(
                 client, request_kwargs, composio_defs, composio_dispatch, connector_servers=mcp_servers
             )
-            return {"status": "ok", "response": text, "errors": "", **guide}
+            return {
+                "status": "error" if tool_errors else "ok",
+                "response": text,
+                "errors": "\n".join(tool_errors),
+                **guide,
+            }
         if mcp_servers:
             # Remote-MCP connector: Claude calls the Composio app tools server-side,
             # so a single round-trip still yields the final text (no local loop).

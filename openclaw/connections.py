@@ -93,8 +93,8 @@ def resolve_composio_key(spec: ClawSpec) -> Optional[str]:
     Find the Composio API key.
 
     Order: the api_keys port (JSON {"composio": "..."}), then credentials (same
-    shape), then the COMPOSIO_API_KEY env var.  Mirrors ``_resolve_api_key`` in
-    claw_runtime but for the Composio key rather than the Anthropic one.
+    shape), then a *bare* Composio key pasted straight into either port (``ck_…`` —
+    so a user who pastes just the key still works), then the COMPOSIO_API_KEY env var.
     """
     for raw in (spec.api_keys, spec.credentials):
         raw = _clean_port(raw)
@@ -105,6 +105,9 @@ def resolve_composio_key(spec: ClawSpec) -> Optional[str]:
             for key in ("composio", "composio_api_key", "COMPOSIO_API_KEY"):
                 if parsed.get(key):
                     return str(parsed[key])
+        elif raw.lower().startswith("ck_"):
+            # A bare Composio key pasted directly (not JSON, not an Anthropic sk- key).
+            return raw
     return os.environ.get("COMPOSIO_API_KEY") or None
 
 

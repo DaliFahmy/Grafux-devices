@@ -203,12 +203,17 @@ async def _execute(key: str, action: str, args: Dict[str, Any], account_id: str)
     Mirrors ``connections.send_channel_reply`` / Grafux-mcp's REST path:
     ``POST /api/v2/actions/{ACTION}/execute`` with ``x-api-key`` and
     ``{"input": {…args…, "connectedAccountId": <id>}}``.
+
+    Raises RuntimeError with a clear message on any failure (no account, HTTP error, Composio
+    error) so the run surfaces the real cause on the block's ``errors`` port — not just to the model.
     """
     import httpx
 
     payload = dict(args or {})
     if account_id and "connectedAccountId" not in payload:
         payload["connectedAccountId"] = account_id
+    logger.info("composio: executing %s (account=%s) args=%s",
+                action, account_id or "(none)", list(payload.keys()))
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
@@ -216,20 +221,24 @@ async def _execute(key: str, action: str, args: Dict[str, Any], account_id: str)
                 headers={"x-api-key": key, "Content-Type": "application/json"},
                 json={"input": payload},
             )
-    except Exception as exc:  # noqa: BLE001 — report to the model as a tool error
-        return f"Composio action {action} could not be reached: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Composio '{action}' could not be reached: {exc}") from exc
     if resp.status_code >= 400:
-        hint = ("" if account_id else
-                f" (no connected {action.split('_')[0].lower()} account was found — connect it in "
-                "Composio, then try again)")
-        return f"Composio action {action} failed ({resp.status_code}): {resp.text[:300]}{hint}"
+        hint = "" if account_id else (
+            f" — no connected '{action.split('_')[0].lower()}' account was found for this Composio "
+            "key. Connect the app in your Composio account, then try again."
+        )
+        raise RuntimeError(
+            f"Composio '{action}' failed (HTTP {resp.status_code}): {resp.text[:300]}{hint}"
+        )
     data = resp.json() if resp.content else {}
     if isinstance(data, dict) and data.get("error"):
-        return f"Composio action {action} error: {data.get('error')}"
+        raise RuntimeError(f"Composio '{action}' returned an error: {data.get('error')}")
     if isinstance(data, dict):
         output = data.get("response") or data.get("output") or data.get("data") or data
     else:
         output = data
+    logger.info("composio: %s succeeded", action)
     return str(output)
 
 
@@ -334,18 +343,20 @@ async def run_tool_loop(
     tool_defs: List[Dict[str, Any]],
     dispatch: Dict[str, Callable[[Dict[str, Any]], Awaitable[str]]],
     connector_servers: Optional[List[Dict[str, Any]]] = None,
-) -> str:
+) -> Tuple[str, List[str]]:
     """
-    Run an Anthropic tool-use loop over python-executed tools and return the final text.
+    Run an Anthropic tool-use loop over python-executed tools.
 
-    ``base_kwargs`` is the dict claw_runtime builds for ``messages.create``.  ``connector_servers``
-    (Composio bearer/self-auth MCP servers, if any) ride along on the same calls so a claw mixing
-    REST tools with connector apps still works.
+    Returns ``(final_text, tool_errors)``.  ``tool_errors`` is a list of human-readable notes for
+    any tool call that failed (e.g. a Composio 401/404 or "no connected account") so the caller can
+    surface the real cause on the block's ``errors`` port — the model also sees each error as a
+    tool_result and can explain it.  ``connector_servers`` ride along on the same calls.
     """
     connector_servers = connector_servers or []
     messages = list(base_kwargs.get("messages", []))
     loop_kwargs = {k: v for k, v in base_kwargs.items() if k != "messages"}
     use_connector = bool(connector_servers)
+    tool_errors: List[str] = []
 
     last_message: Any = None
     for _ in range(_MAX_TOOL_ITERATIONS):
@@ -364,13 +375,14 @@ async def run_tool_loop(
 
         tool_uses = [b for b in last_message.content if getattr(b, "type", None) == "tool_use"]
         if last_message.stop_reason != "tool_use" or not tool_uses:
-            return _extract_text(last_message)
+            return _extract_text(last_message), tool_errors
 
         messages.append({"role": "assistant", "content": last_message.content})
         results: List[Dict[str, Any]] = []
         for tu in tool_uses:
             fn = dispatch.get(tu.name)
             if fn is None:
+                tool_errors.append(f"Unknown tool: {tu.name}")
                 results.append({"type": "tool_result", "tool_use_id": tu.id,
                                 "is_error": True, "content": f"Unknown tool: {tu.name}"})
                 continue
@@ -378,11 +390,12 @@ async def run_tool_loop(
                 out = await fn(tu.input or {})
                 results.append({"type": "tool_result", "tool_use_id": tu.id,
                                 "content": out or "(no output)"})
-            except Exception as exc:  # noqa: BLE001 — report the failure to the model
+            except Exception as exc:  # noqa: BLE001 — report the failure to the model + the port
                 logger.warning("composio tool %s failed: %s", tu.name, exc)
+                tool_errors.append(str(exc))
                 results.append({"type": "tool_result", "tool_use_id": tu.id,
                                 "is_error": True, "content": f"{tu.name} failed: {exc}"})
         messages.append({"role": "user", "content": results})
 
     logger.warning("composio tool loop hit the %d-iteration cap", _MAX_TOOL_ITERATIONS)
-    return _extract_text(last_message)
+    return _extract_text(last_message), tool_errors
