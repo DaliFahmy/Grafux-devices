@@ -20,6 +20,7 @@ it is absent.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -57,12 +58,75 @@ _CURATED_PARAMS: Dict[str, Dict[str, Any]] = {
 _ACTIONS_CACHE: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
 # (key, app) -> (user_id, connected_account_id).  v3 tools are scoped to a user_id.
 _ACCOUNT_CACHE: Dict[Tuple[str, str], Tuple[str, str]] = {}
+# The set of all Composio toolkit slugs (account-independent), fetched once per key.
+_TOOLKIT_SLUGS_CACHE: Dict[str, set] = {}
+# (key, typed_app) -> canonical toolkit slug (fuzzy-resolved).
+_SLUG_RESOLVE_CACHE: Dict[Tuple[str, str], str] = {}
 
 
 def clear_cache() -> None:
     """Drop cached action lists + resolved account ids (call when a claw's config changes)."""
     _ACTIONS_CACHE.clear()
     _ACCOUNT_CACHE.clear()
+    _SLUG_RESOLVE_CACHE.clear()
+    _TOOLKIT_SLUGS_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Toolkit-slug resolution — forgive typos (googlesheet → googlesheets)
+# ---------------------------------------------------------------------------
+
+async def _toolkit_slugs(key: str) -> set:
+    """All Composio toolkit slugs (lowercased), fetched once per key. ``set()`` on any error."""
+    if key in _TOOLKIT_SLUGS_CACHE:
+        return _TOOLKIT_SLUGS_CACHE[key]
+    import httpx
+
+    slugs: set = set()
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{connections._COMPOSIO_BACKEND}/api/v3/toolkits",
+                headers={"x-api-key": key},
+                params={"limit": 500},
+            )
+        if resp.status_code < 400:
+            for it in (resp.json() or {}).get("items", []) or []:
+                s = str(it.get("slug") or "").strip().lower()
+                if s:
+                    slugs.add(s)
+    except Exception as exc:  # noqa: BLE001 — resolution is best-effort
+        logger.warning("composio: toolkits list failed: %s", exc)
+    _TOOLKIT_SLUGS_CACHE[key] = slugs
+    return slugs
+
+
+async def resolve_toolkit_slug(key: str, app: str) -> str:
+    """
+    Resolve a user-typed app name to the canonical Composio toolkit slug.
+
+    Exact (case-insensitive) match wins; otherwise a close match via difflib (cutoff 0.8) fixes
+    typos like ``googlesheet`` → ``googlesheets`` / ``googlecalender`` → ``googlecalendar``.  Returns
+    the input unchanged when toolkits can't be listed or nothing matches (so behavior degrades to
+    today's strict slug).
+    """
+    app = (app or "").strip()
+    ck = (key, app.lower())
+    if ck in _SLUG_RESOLVE_CACHE:
+        return _SLUG_RESOLVE_CACHE[ck]
+    resolved = app
+    slugs = await _toolkit_slugs(key)
+    if slugs:
+        low = app.lower()
+        if low in slugs:
+            resolved = low
+        else:
+            match = difflib.get_close_matches(low, sorted(slugs), n=1, cutoff=0.8)
+            if match:
+                resolved = match[0]
+                logger.info("composio: resolved toolkit slug '%s' → '%s'", app, resolved)
+    _SLUG_RESOLVE_CACHE[ck] = resolved
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +221,8 @@ async def _list_actions_for_app(key: str, app: str) -> List[Dict[str, Any]]:
     """
     import httpx
 
+    app = await resolve_toolkit_slug(key, app)  # forgive typos (googlesheet → googlesheets)
+
     # Composio's filter param name varies (toolkit_slug vs toolkit_slugs) — try both.
     items: List[Dict[str, Any]] = []
     for pkey in ("toolkit_slug", "toolkit_slugs"):
@@ -223,6 +289,7 @@ async def _account_for_app(key: str, app: str, conn: Optional[ClawConnection]) -
     return the user it belongs to (plus its id).  Prefers an ACTIVE account.  Cached per (key, app).
     Returns ``("", "")`` when none — execution then reports a clear "connect the app" error.
     """
+    app = await resolve_toolkit_slug(key, app)  # forgive typos (googlesheet → googlesheets)
     ck = (key, app.lower())
     if ck in _ACCOUNT_CACHE:
         return _ACCOUNT_CACHE[ck]
@@ -343,6 +410,8 @@ async def resolve_or_create_auth_config(key: str, app: str) -> str:
     "use_composio_managed_auth"}}``.  Raises RuntimeError with the raw body on failure.
     """
     import httpx
+
+    app = await resolve_toolkit_slug(key, app)  # create the auth config under the canonical slug
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.get(

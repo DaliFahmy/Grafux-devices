@@ -233,8 +233,11 @@ async def test_composio_build_merges_discovered(monkeypatch):
     assert "GOOGLESHEETS_GET_SPREADSHEET_INFO" in names   # discovered via v3 listing
 
 
-async def test_composio_list_actions_v3(fake_httpx_get):
+async def test_composio_list_actions_v3(fake_httpx_get, monkeypatch):
     # _list_actions_for_app hits the v3 tools endpoint and parses items[].slug/input_parameters.
+    async def _identity(key, app):
+        return app
+    monkeypatch.setattr(composio_tools, "resolve_toolkit_slug", _identity)  # skip toolkit fetch
     fake_httpx_get.payload = {"items": [
         {"slug": "WEATHERMAP_WEATHER", "description": "get weather",
          "input_parameters": {"type": "object", "properties": {"location": {"type": "string"}}},
@@ -248,6 +251,32 @@ async def test_composio_list_actions_v3(fake_httpx_get):
     assert "WEATHERMAP_WEATHER" in names          # kept
     assert "WEATHERMAP_OLD" not in names          # deprecated dropped
     assert next(a for a in out if a["name"] == "WEATHERMAP_WEATHER")["no_auth"] is True
+
+
+# --- toolkit-slug resolution (typo forgiveness) ----------------------------
+
+async def test_resolve_toolkit_slug(monkeypatch):
+    async def fake_slugs(key):
+        return {"googlesheets", "googlecalendar", "gmail", "slack"}
+
+    monkeypatch.setattr(composio_tools, "_toolkit_slugs", fake_slugs)
+    assert await composio_tools.resolve_toolkit_slug("ck", "googlesheet") == "googlesheets"
+    assert await composio_tools.resolve_toolkit_slug("ck", "googlecalender") == "googlecalendar"
+    assert await composio_tools.resolve_toolkit_slug("ck", "gmail") == "gmail"      # exact
+    assert await composio_tools.resolve_toolkit_slug("ck", "zzznope") == "zzznope"  # no match → unchanged
+
+
+async def test_list_actions_uses_resolved_slug(fake_httpx, monkeypatch):
+    async def fake_resolve(key, app):
+        return "googlesheets"
+
+    monkeypatch.setattr(composio_tools, "resolve_toolkit_slug", fake_resolve)
+    fake_httpx.payload = {"items": []}
+    await composio_tools._list_actions_for_app("ck", "googlesheet")
+    # The v3 tools query used the resolved canonical slug.
+    assert any((c.get("params") or {}).get("toolkit_slug") == "googlesheets"
+               or (c.get("params") or {}).get("toolkit_slugs") == "googlesheets"
+               for c in fake_httpx.calls)
 
 
 # --- REST shapes (fake httpx supporting get + post) ------------------------

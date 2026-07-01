@@ -350,6 +350,12 @@ async def composio_probe(claw_id: str) -> dict:
         app = connections._clean_port(conn.app)
         entry: dict = {"app": app}
         try:
+            resolved = await composio_tools.resolve_toolkit_slug(key, app)
+            if resolved != app:
+                entry["resolved_slug"] = resolved  # e.g. "googlesheet" → "googlesheets"
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             actions = await composio_tools._list_actions_for_app(key, app)
             entry["tool_count"] = len(actions)
             entry["sample_tools"] = [a["name"] for a in actions[:5]]
@@ -416,6 +422,16 @@ async def composio_manage(claw_id: str, request: Request) -> str:
         if not app or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", app):
             continue
         app_esc = html.escape(app)
+        note = ""
+        connect_slug = app_esc
+        try:
+            resolved = await composio_tools.resolve_toolkit_slug(key, app)
+            if resolved != app:
+                connect_slug = html.escape(resolved)
+                note = (f" <span style='color:#888;font-size:13px'>· using toolkit "
+                        f"<b>{connect_slug}</b></span>")
+        except Exception:  # noqa: BLE001
+            pass
         try:
             tools = await composio_tools._list_actions_for_app(key, app)
             _uid, account_id = await composio_tools._account_for_app(key, app, conn)
@@ -426,12 +442,13 @@ async def composio_manage(claw_id: str, request: Request) -> str:
         except Exception as exc:  # noqa: BLE001 — never let one app break the page
             status = f"<span style='color:#b00'>status error: {html.escape(str(exc)[:120])}</span>"
             meta = ""
-        action = f"{base}/claw/{claw_id}/composio/connect/{app_esc}"
+        # Connect under the resolved (canonical) slug so a typo still connects the right toolkit.
+        action = f"{base}/claw/{claw_id}/composio/connect/{connect_slug}"
         cards.append(
             "<div style='border:1px solid #e0e0e8;border-radius:10px;padding:14px 16px;margin:12px 0'>"
             f"<div style='display:flex;justify-content:space-between;align-items:center'>"
             f"<b style='font-size:16px'>{app_esc}</b><span>{status}</span></div>"
-            f"<div style='color:#888;font-size:13px;margin:2px 0 10px'>{meta}</div>"
+            f"<div style='color:#888;font-size:13px;margin:2px 0 10px'>{meta}{note}</div>"
             f"<form method='get' action='{action}' style='display:flex;gap:8px;flex-wrap:wrap'>"
             "<input name='api_key' placeholder='API key / bot token (leave blank for OAuth apps)' "
             "style='flex:1;min-width:220px;padding:8px;border:1px solid #ccc;border-radius:6px'>"
