@@ -699,23 +699,24 @@ _SEND_ACTIONS = {
 }
 
 
-def _send_arguments(provider: str, connection_id: str, chat_id: str, text: str) -> Dict[str, Any]:
+def _send_arguments(provider: str, chat_id: str, text: str) -> Dict[str, Any]:
+    """The tool ``arguments`` for a send-message action (the account is passed separately in v3)."""
     provider = (provider or "").lower()
-    if provider == "telegram":
-        return {"connectedAccountId": connection_id, "chat_id": chat_id, "text": text}
     if provider == "whatsapp":
-        return {"connectedAccountId": connection_id, "to": chat_id, "message": text}
+        return {"to": chat_id, "message": text}
     if provider == "slack":
-        return {"connectedAccountId": connection_id, "channel": chat_id, "text": text}
-    return {"connectedAccountId": connection_id, "chat_id": chat_id, "text": text}
+        return {"channel": chat_id, "text": text}
+    return {"chat_id": chat_id, "text": text}  # telegram + generic
 
 
 async def send_channel_reply(
-    provider: str, connection_id: str, chat_id: str, text: str, key: str
+    provider: str, connection_id: str, chat_id: str, text: str, key: str, user_id: str = ""
 ) -> bool:
     """
-    Post ``text`` back to ``chat_id`` on ``provider`` via the Composio send-message
-    action (REST execute, as in composio/client.py).  Returns True on success.
+    Post ``text`` back to ``chat_id`` on ``provider`` via Composio's v3 execute API.
+
+    ``POST /api/v3/tools/execute/{ACTION}`` with ``{"user_id", "connected_account_id"?, "arguments"}``.
+    Returns True on success.
     """
     import httpx
 
@@ -723,11 +724,17 @@ async def send_channel_reply(
     action = _SEND_ACTIONS.get(provider)
     if not action or not chat_id or not text:
         return False
+    body: Dict[str, Any] = {
+        "user_id": user_id or "default",
+        "arguments": _send_arguments(provider, chat_id, text),
+    }
+    if connection_id:
+        body["connected_account_id"] = connection_id
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
-            f"{_COMPOSIO_BACKEND}/api/v2/actions/{action}/execute",
+            f"{_COMPOSIO_BACKEND}/api/v3/tools/execute/{action}",
             headers={"x-api-key": key, "Content-Type": "application/json"},
-            json={"input": _send_arguments(provider, connection_id, chat_id, text)},
+            json=body,
         )
         if resp.status_code >= 400:
             logger.warning("send_channel_reply %s failed: %s %s", provider, resp.status_code, resp.text[:200])

@@ -2,15 +2,16 @@
 composio_tools.py
 Give a claw real tools for its connected Composio apps — via Composio's REST API.
 
-This is the reliable path (the one Grafux-mcp and the claw's own ``send_channel_reply`` already
-use): actions are executed with ``POST /api/v2/actions/{ACTION}/execute`` + the ``x-api-key``
-header, NOT via a Composio MCP-server URL (which returns no tools unless a toolkit is enabled
-server-side).  It generalises to every Composio app.
+This uses Composio's **v3** REST API with the ``x-api-key`` header — tools are listed with
+``GET /api/v3/tools?toolkit_slug=<slug>`` and executed with
+``POST /api/v3/tools/execute/{tool_slug}`` — NOT a Composio MCP-server URL (which returns no tools
+unless a toolkit is enabled server-side).  v3 tools are scoped to a ``user_id``, which the claw
+auto-discovers from the toolkit's connected account.  It generalises to every Composio app.
 
 For each enabled app-name connection (with a resolvable Composio key) the claw exposes that app's
 actions as Anthropic tools:
   * a small **curated** set that is known to exist (e.g. TELEGRAM_SEND_MESSAGE), plus
-  * a **best-effort auto-discovered** set from ``GET /api/v2/actions`` filtered by app.
+  * a **best-effort auto-discovered** set from ``GET /api/v3/tools?toolkit_slug=<app>``.
 Each tool call is executed over REST, injecting the app's connected-account id.
 
 ``httpx`` is imported lazily (like elsewhere in OpenClaw) so the devices server still boots where
@@ -53,7 +54,8 @@ _CURATED_PARAMS: Dict[str, Dict[str, Any]] = {
 # Caches so repeat runs of a connection-claw don't re-list actions / re-resolve accounts.
 # Keyed by (composio_key, app).  Cleared on config patch via clear_cache().
 _ACTIONS_CACHE: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-_ACCOUNT_CACHE: Dict[Tuple[str, str], str] = {}
+# (key, app) -> (user_id, connected_account_id).  v3 tools are scoped to a user_id.
+_ACCOUNT_CACHE: Dict[Tuple[str, str], Tuple[str, str]] = {}
 
 
 def clear_cache() -> None:
@@ -105,52 +107,59 @@ def _curated_actions(app: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _coerce_schema(schema: Any) -> Dict[str, Any]:
+    """Ensure an action's input schema is a valid Anthropic object schema."""
+    s = _strip_account(schema)
+    if not s.get("type"):
+        s = dict(s, type="object")
+    if "properties" not in s:
+        s = dict(s, properties={})
+    return s
+
+
 async def _list_actions_for_app(key: str, app: str) -> List[Dict[str, Any]]:
     """
-    Best-effort: list an app's Composio actions via ``GET /api/v2/actions`` filtered by app.
+    List an app's Composio tools via the v3 API: ``GET /api/v3/tools?toolkit_slug=<app>``.
 
-    Composio's filter param name has varied, so we try ``appNames`` then ``apps``; we also filter
-    client-side by app so a param that is silently ignored can't flood the tool list with unrelated
-    actions.  Returns ``[]`` on any error (the curated set still applies).
+    Listing does NOT require a connected account (it returns the toolkit's available tools), so this
+    works as long as the app name is a valid Composio toolkit slug (e.g. ``googlesheets``,
+    ``weathermap``).  Returns ``[]`` on any error (the curated set still applies).
     """
     import httpx
 
-    prefix = app.upper() + "_"
-    for params in ({"appNames": app, "limit": 100}, {"apps": app, "limit": 100}):
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(
-                    f"{connections._COMPOSIO_BACKEND}/api/v2/actions",
-                    headers={"x-api-key": key},
-                    params=params,
-                )
-            if resp.status_code >= 400:
-                continue
-            items = (resp.json() or {}).get("items", [])
-        except Exception as exc:  # noqa: BLE001 — discovery is best-effort
-            logger.warning("composio: list actions for %s failed: %s", app, exc)
-            continue
-        out: List[Dict[str, Any]] = []
-        for it in items:
-            name = str(it.get("name") or it.get("enum") or "").strip()
-            if not name:
-                continue
-            # Guard against an ignored filter param returning every app's actions.
-            item_app = str(it.get("appName") or it.get("appKey") or "").lower()
-            if item_app and item_app != app.lower() and not name.upper().startswith(prefix):
-                continue
-            out.append(
-                {
-                    "name": name,
-                    "description": str(it.get("description", "")),
-                    "input_schema": _strip_account(it.get("parameters") or it.get("input_schema")),
-                }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{connections._COMPOSIO_BACKEND}/api/v3/tools",
+                headers={"x-api-key": key},
+                params={"toolkit_slug": app, "limit": _MAX_DISCOVERED},
             )
-            if len(out) >= _MAX_DISCOVERED:
-                break
-        if out:
-            return out
-    return []
+        if resp.status_code >= 400:
+            logger.warning("composio: v3 tools list for %s → HTTP %s: %s",
+                           app, resp.status_code, resp.text[:200])
+            return []
+        items = (resp.json() or {}).get("items", [])
+    except Exception as exc:  # noqa: BLE001 — discovery is best-effort
+        logger.warning("composio: v3 tools list for %s failed: %s", app, exc)
+        return []
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        if it.get("is_deprecated"):
+            continue
+        slug = str(it.get("slug") or "").strip()
+        if not slug:
+            continue
+        out.append(
+            {
+                "name": slug,
+                "description": str(it.get("description", "")),
+                "input_schema": _coerce_schema(it.get("input_parameters")),
+                "no_auth": bool(it.get("no_auth", False)),
+            }
+        )
+        if len(out) >= _MAX_DISCOVERED:
+            break
+    return out
 
 
 async def _actions_for_app(key: str, app: str) -> List[Dict[str, Any]]:
@@ -166,85 +175,118 @@ async def _actions_for_app(key: str, app: str) -> List[Dict[str, Any]]:
     return merged
 
 
-async def _account_for_app(key: str, app: str, conn: Optional[ClawConnection]) -> str:
+async def _account_for_app(key: str, app: str, conn: Optional[ClawConnection]) -> Tuple[str, str]:
     """
-    The Composio connected-account id to scope actions to.
+    Resolve ``(user_id, connected_account_id)`` for an app via v3 connected accounts.
 
-    Prefer the connection's own ``connection_id``; else look one up via list_connections matching
-    the app (preferring an ACTIVE account).  Cached per (key, app).  Empty string when none — the
-    action then executes without a connectedAccountId (Composio errors are surfaced to the model).
+    v3 tools are scoped to a user_id, so we look up the account connected for this toolkit and
+    return the user it belongs to (plus its id).  Prefers an ACTIVE account.  Cached per (key, app).
+    Returns ``("", "")`` when none — execution then reports a clear "connect the app" error.
     """
-    if conn is not None:
-        cid = connections._clean_port(conn.connection_id)
-        if cid:
-            return cid
     ck = (key, app.lower())
     if ck in _ACCOUNT_CACHE:
         return _ACCOUNT_CACHE[ck]
-    acct = ""
-    try:
-        for c in await connections.list_connections(key):
-            if c.get("app", "").lower() != app.lower():
+
+    import httpx
+
+    explicit = connections._clean_port(conn.connection_id) if conn is not None else ""
+    user_id, account_id = "", explicit
+    for params in ({"toolkit_slugs": app, "statuses": "ACTIVE", "limit": 10},
+                   {"toolkit_slugs": app, "limit": 10}):
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(
+                    f"{connections._COMPOSIO_BACKEND}/api/v3/connected_accounts",
+                    headers={"x-api-key": key},
+                    params=params,
+                )
+            if resp.status_code >= 400:
                 continue
-            acct = c.get("connection_id", "") or acct
-            if str(c.get("status", "")).upper() == "ACTIVE":
-                acct = c.get("connection_id", "")
+            items = (resp.json() or {}).get("items", [])
+        except Exception as exc:  # noqa: BLE001 — account lookup is best-effort
+            logger.warning("composio: v3 connected accounts for %s failed: %s", app, exc)
+            continue
+        for it in items:
+            tk = str((it.get("toolkit") or {}).get("slug") or "").lower()
+            if tk and tk != app.lower():
+                continue
+            uid, aid = str(it.get("user_id") or ""), str(it.get("id") or "")
+            if str(it.get("status", "")).upper() == "ACTIVE":
+                user_id, account_id = uid, aid or account_id
                 break
-    except Exception as exc:  # noqa: BLE001 — account lookup is best-effort
-        logger.warning("composio: account lookup for %s failed: %s", app, exc)
-    _ACCOUNT_CACHE[ck] = acct
-    return acct
+            if not user_id:
+                user_id, account_id = uid, aid or account_id
+        if user_id:
+            break
+
+    _ACCOUNT_CACHE[ck] = (user_id, account_id)
+    return user_id, account_id
 
 
-async def _execute(key: str, action: str, args: Dict[str, Any], account_id: str) -> str:
+async def _execute(
+    key: str,
+    tool_slug: str,
+    args: Dict[str, Any],
+    user_id: str,
+    account_id: str,
+    no_auth: bool = False,
+) -> str:
     """
-    Execute a Composio action over REST and return its output as text.
+    Execute a Composio tool via the v3 API and return its output as text.
 
-    Mirrors ``connections.send_channel_reply`` / Grafux-mcp's REST path:
-    ``POST /api/v2/actions/{ACTION}/execute`` with ``x-api-key`` and
-    ``{"input": {…args…, "connectedAccountId": <id>}}``.
+    ``POST /api/v3/tools/execute/{tool_slug}`` with ``x-api-key`` and body
+    ``{"user_id", "connected_account_id"?, "arguments"}``.  v3 tools are scoped to a user_id;
+    the connected account is passed at the top level (not inside arguments).
 
-    Raises RuntimeError with a clear message on any failure (no account, HTTP error, Composio
-    error) so the run surfaces the real cause on the block's ``errors`` port — not just to the model.
+    Raises RuntimeError with a clear message on any failure so the run surfaces the real cause on
+    the block's ``errors`` port — not just to the model.
     """
     import httpx
 
-    payload = dict(args or {})
-    if account_id and "connectedAccountId" not in payload:
-        payload["connectedAccountId"] = account_id
-    logger.info("composio: executing %s (account=%s) args=%s",
-                action, account_id or "(none)", list(payload.keys()))
+    body: Dict[str, Any] = {"user_id": user_id or "default", "arguments": dict(args or {})}
+    if account_id:
+        body["connected_account_id"] = account_id
+    logger.info("composio: v3 execute %s (user=%s account=%s)",
+                tool_slug, body["user_id"], account_id or "(none)")
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
-                f"{connections._COMPOSIO_BACKEND}/api/v2/actions/{action}/execute",
+                f"{connections._COMPOSIO_BACKEND}/api/v3/tools/execute/{tool_slug}",
                 headers={"x-api-key": key, "Content-Type": "application/json"},
-                json={"input": payload},
+                json=body,
             )
     except Exception as exc:  # noqa: BLE001
-        raise RuntimeError(f"Composio '{action}' could not be reached: {exc}") from exc
+        raise RuntimeError(f"Composio '{tool_slug}' could not be reached: {exc}") from exc
     if resp.status_code >= 400:
-        hint = "" if account_id else (
-            f" — no connected '{action.split('_')[0].lower()}' account was found for this Composio "
-            "key. Connect the app in your Composio account, then try again."
+        hint = "" if (account_id or no_auth) else (
+            " — no connected account was found for this toolkit. Connect the app in your Composio "
+            "account, then try again."
         )
         raise RuntimeError(
-            f"Composio '{action}' failed (HTTP {resp.status_code}): {resp.text[:300]}{hint}"
+            f"Composio '{tool_slug}' failed (HTTP {resp.status_code}): {resp.text[:300]}{hint}"
         )
     data = resp.json() if resp.content else {}
-    if isinstance(data, dict) and data.get("error"):
-        raise RuntimeError(f"Composio '{action}' returned an error: {data.get('error')}")
     if isinstance(data, dict):
-        output = data.get("response") or data.get("output") or data.get("data") or data
+        # v3 wraps results as {"data": …, "successful": bool, "error": …}.
+        if data.get("successful") is False or data.get("error"):
+            raise RuntimeError(
+                f"Composio '{tool_slug}' error: "
+                f"{data.get('error') or data.get('message') or 'the action was unsuccessful'}"
+            )
+        output = data.get("data")
+        if output is None:
+            output = data.get("response") or data.get("output") or data
     else:
         output = data
-    logger.info("composio: %s succeeded", action)
+    logger.info("composio: %s succeeded", tool_slug)
     return str(output)
 
 
-def _make_executor(key: str, action: str, account_id: str) -> Callable[[Dict[str, Any]], Awaitable[str]]:
+def _make_executor(
+    key: str, tool_slug: str, user_id: str, account_id: str, no_auth: bool
+) -> Callable[[Dict[str, Any]], Awaitable[str]]:
     async def _run(inp: Dict[str, Any]) -> str:
-        return await _execute(key, action, inp, account_id)
+        return await _execute(key, tool_slug, inp, user_id, account_id, no_auth)
     return _run
 
 
@@ -298,10 +340,10 @@ def unloaded_reason(spec: ClawSpec, tool_defs: List[Dict[str, Any]]) -> str:
             "Add it to the 'api_keys' port as {\"composio\": \"ck_…\"} (a bare ck_… key also works)."
         )
     return (
-        f"Apps [{app_list}] are listed and a Composio key is set, but no tools loaded — most likely "
-        f"no connected account exists in Composio for [{app_list}]. Connect the app in your Composio "
-        "account (for Telegram: add your bot token to the Telegram integration in the Composio "
-        "dashboard), then run again."
+        f"Apps [{app_list}] are listed and a Composio key is set, but Composio returned no tools for "
+        f"them. Check that each name is a valid Composio toolkit slug (e.g. 'googlesheets', "
+        f"'weathermap', 'gmail') and that your Composio key is valid. Connecting the app in Composio "
+        "is only needed to *use* a tool, not to list it — so if this persists the slug or key is wrong."
     )
 
 
@@ -323,7 +365,7 @@ async def build(spec: ClawSpec) -> Tuple[List[Dict[str, Any]], Dict[str, Callabl
         actions = await _actions_for_app(key, app)
         if not actions:
             continue
-        account_id = await _account_for_app(key, app, conn)
+        user_id, account_id = await _account_for_app(key, app, conn)
         for a in actions:
             name = _sanitize_tool_name(a["name"])
             if name in seen:
@@ -336,7 +378,9 @@ async def build(spec: ClawSpec) -> Tuple[List[Dict[str, Any]], Dict[str, Callabl
                     "input_schema": a.get("input_schema") or {"type": "object", "properties": {}},
                 }
             )
-            dispatch[name] = _make_executor(key, a["name"], account_id)
+            dispatch[name] = _make_executor(
+                key, a["name"], user_id, account_id, bool(a.get("no_auth", False))
+            )
     return tool_defs, dispatch
 
 

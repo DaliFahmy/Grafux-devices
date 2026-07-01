@@ -203,11 +203,11 @@ async def test_composio_build_telegram_curated(monkeypatch):
     async def no_discovery(key, app):
         return []
 
-    async def fake_accounts(key):
-        return [{"app": "telegram", "connection_id": "ca_1", "status": "ACTIVE", "account_label": ""}]
+    async def fake_account(key, app, conn):
+        return ("user1", "ca_1")
 
     monkeypatch.setattr(composio_tools, "_list_actions_for_app", no_discovery)
-    monkeypatch.setattr(connections, "list_connections", fake_accounts)
+    monkeypatch.setattr(composio_tools, "_account_for_app", fake_account)
 
     spec = ClawSpec(api_keys='{"composio": "ck_test"}', connections='["telegram"]')
     tool_defs, dispatch = await composio_tools.build(spec)
@@ -218,22 +218,39 @@ async def test_composio_build_telegram_curated(monkeypatch):
 
 async def test_composio_build_merges_discovered(monkeypatch):
     async def discovery(key, app):
-        return [{"name": "TELEGRAM_GET_ME", "description": "who am I", "input_schema": {"type": "object", "properties": {}}}]
+        return [{"name": "GOOGLESHEETS_GET_SPREADSHEET_INFO", "description": "info",
+                 "input_schema": {"type": "object", "properties": {}}, "no_auth": False}]
 
-    async def fake_accounts(key):
-        return []
+    async def fake_account(key, app, conn):
+        return ("", "")   # not connected yet — tools still listed
 
     monkeypatch.setattr(composio_tools, "_list_actions_for_app", discovery)
-    monkeypatch.setattr(connections, "list_connections", fake_accounts)
+    monkeypatch.setattr(composio_tools, "_account_for_app", fake_account)
     tool_defs, _ = await composio_tools.build(
-        ClawSpec(api_keys='{"composio": "ck"}', connections='["telegram"]')
+        ClawSpec(api_keys='{"composio": "ck"}', connections='["googlesheets"]')
     )
     names = {d["name"] for d in tool_defs}
-    assert "TELEGRAM_SEND_MESSAGE" in names   # curated
-    assert "TELEGRAM_GET_ME" in names         # discovered
+    assert "GOOGLESHEETS_GET_SPREADSHEET_INFO" in names   # discovered via v3 listing
 
 
-# --- REST execute shape (fake httpx) ---------------------------------------
+async def test_composio_list_actions_v3(fake_httpx_get):
+    # _list_actions_for_app hits the v3 tools endpoint and parses items[].slug/input_parameters.
+    fake_httpx_get.payload = {"items": [
+        {"slug": "WEATHERMAP_WEATHER", "description": "get weather",
+         "input_parameters": {"type": "object", "properties": {"location": {"type": "string"}}},
+         "no_auth": True},
+        {"slug": "WEATHERMAP_OLD", "description": "x", "input_parameters": {}, "is_deprecated": True},
+    ]}
+    out = await composio_tools._list_actions_for_app("ck_1", "weathermap")
+    assert fake_httpx_get.captured["url"].endswith("/api/v3/tools")
+    assert fake_httpx_get.captured["params"]["toolkit_slug"] == "weathermap"
+    names = {a["name"] for a in out}
+    assert "WEATHERMAP_WEATHER" in names          # kept
+    assert "WEATHERMAP_OLD" not in names          # deprecated dropped
+    assert next(a for a in out if a["name"] == "WEATHERMAP_WEATHER")["no_auth"] is True
+
+
+# --- REST shapes (fake httpx supporting get + post) ------------------------
 
 class _FakeResp:
     def __init__(self, status=200, payload=None):
@@ -245,6 +262,9 @@ class _FakeResp:
 
 
 class _FakeAsyncClient:
+    # Class-level knobs the fixtures set; captured records the last call.
+    payload: dict = {"data": "ok done", "successful": True}
+    status: int = 200
     captured: dict = {}
 
     def __init__(self, *a, **k):
@@ -257,28 +277,52 @@ class _FakeAsyncClient:
         return False
 
     async def post(self, url, headers=None, json=None):
-        _FakeAsyncClient.captured = {"url": url, "headers": headers, "json": json}
-        return _FakeResp(200, {"response": "ok done"})
+        type(self).captured = {"method": "POST", "url": url, "headers": headers, "json": json}
+        return _FakeResp(type(self).status, type(self).payload)
+
+    async def get(self, url, headers=None, params=None):
+        type(self).captured = {"method": "GET", "url": url, "headers": headers, "params": params}
+        return _FakeResp(type(self).status, type(self).payload)
 
 
-@pytest.fixture
-def fake_httpx(monkeypatch):
+def _install_fake_httpx(monkeypatch):
+    _FakeAsyncClient.payload = {"data": "ok done", "successful": True}
+    _FakeAsyncClient.status = 200
+    _FakeAsyncClient.captured = {}
     mod = types.ModuleType("httpx")
     mod.AsyncClient = _FakeAsyncClient
     monkeypatch.setitem(sys.modules, "httpx", mod)
     return _FakeAsyncClient
 
 
-async def test_composio_execute_posts_rest(fake_httpx):
+@pytest.fixture
+def fake_httpx(monkeypatch):
+    return _install_fake_httpx(monkeypatch)
+
+
+@pytest.fixture
+def fake_httpx_get(monkeypatch):
+    return _install_fake_httpx(monkeypatch)
+
+
+async def test_composio_execute_posts_v3(fake_httpx):
     out = await composio_tools._execute(
-        "ck_1", "TELEGRAM_SEND_MESSAGE", {"chat_id": "5", "text": "hi"}, "ca_9"
+        "ck_1", "TELEGRAM_SEND_MESSAGE", {"chat_id": "5", "text": "hi"}, "user1", "ca_9"
     )
     cap = fake_httpx.captured
-    assert cap["url"].endswith("/api/v2/actions/TELEGRAM_SEND_MESSAGE/execute")
+    assert cap["url"].endswith("/api/v3/tools/execute/TELEGRAM_SEND_MESSAGE")
     assert cap["headers"]["x-api-key"] == "ck_1"
-    assert cap["json"]["input"]["connectedAccountId"] == "ca_9"
-    assert cap["json"]["input"]["chat_id"] == "5"
+    assert cap["json"]["user_id"] == "user1"
+    assert cap["json"]["connected_account_id"] == "ca_9"
+    assert cap["json"]["arguments"] == {"chat_id": "5", "text": "hi"}
     assert "ok done" in out
+
+
+async def test_composio_execute_raises_on_error(fake_httpx):
+    fake_httpx.status = 400
+    fake_httpx.payload = {"error": "bad key"}
+    with pytest.raises(RuntimeError):
+        await composio_tools._execute("ck", "X_DO", {}, "u", "")
 
 
 # --- run_claw end-to-end via a fake tool-use client ------------------------
@@ -325,19 +369,19 @@ def tool_anthropic(monkeypatch):
 async def test_run_claw_uses_composio_tool(tool_anthropic, monkeypatch):
     executed = {}
 
-    async def fake_execute(key, action, args, account_id):
-        executed.update(key=key, action=action, args=args, account_id=account_id)
+    async def fake_execute(key, tool_slug, args, user_id, account_id, no_auth=False):
+        executed.update(key=key, action=tool_slug, args=args, user_id=user_id, account_id=account_id)
         return "Message sent."
 
     async def no_discovery(key, app):
         return []
 
-    async def fake_accounts(key):
-        return [{"app": "telegram", "connection_id": "ca_1", "status": "ACTIVE", "account_label": ""}]
+    async def fake_account(key, app, conn):
+        return ("user1", "ca_1")
 
     monkeypatch.setattr(composio_tools, "_execute", fake_execute)
     monkeypatch.setattr(composio_tools, "_list_actions_for_app", no_discovery)
-    monkeypatch.setattr(connections, "list_connections", fake_accounts)
+    monkeypatch.setattr(composio_tools, "_account_for_app", fake_account)
 
     spec = ClawSpec(
         api_keys='{"anthropic": "sk-ant", "composio": "ck_test"}',
@@ -349,25 +393,26 @@ async def test_run_claw_uses_composio_tool(tool_anthropic, monkeypatch):
     assert result["response"] == "Sent it!"
     assert executed["action"] == "TELEGRAM_SEND_MESSAGE"
     assert executed["args"] == {"chat_id": "5", "text": "hi"}
-    assert executed["account_id"] == "ca_1"          # resolved from list_connections
+    assert executed["user_id"] == "user1"            # v3 user scope, resolved from the account
+    assert executed["account_id"] == "ca_1"
     assert any("tools" in c for c in tool_anthropic["calls"])
 
 
 async def test_run_claw_surfaces_composio_tool_error(tool_anthropic, monkeypatch):
     # A failing Composio action must surface its real cause on the errors port (status error),
     # not just be paraphrased by the model.
-    async def failing_execute(key, action, args, account_id):
+    async def failing_execute(key, tool_slug, args, user_id, account_id, no_auth=False):
         raise RuntimeError("Composio 'TELEGRAM_SEND_MESSAGE' failed (HTTP 401): invalid api key")
 
     async def no_discovery(key, app):
         return []
 
-    async def fake_accounts(key):
-        return [{"app": "telegram", "connection_id": "ca_1", "status": "ACTIVE"}]
+    async def fake_account(key, app, conn):
+        return ("user1", "ca_1")
 
     monkeypatch.setattr(composio_tools, "_execute", failing_execute)
     monkeypatch.setattr(composio_tools, "_list_actions_for_app", no_discovery)
-    monkeypatch.setattr(connections, "list_connections", fake_accounts)
+    monkeypatch.setattr(composio_tools, "_account_for_app", fake_account)
 
     spec = ClawSpec(api_keys='{"anthropic": "sk-ant", "composio": "ck_bad"}', connections='["telegram"]')
     result = await claw_runtime.run_claw(spec, task="send hi")
