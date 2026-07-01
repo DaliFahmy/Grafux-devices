@@ -331,6 +331,113 @@ def _make_executor(
 
 
 # ---------------------------------------------------------------------------
+# Connect flow — create an Auth Config + a connect (auth-link) session (v3)
+# ---------------------------------------------------------------------------
+
+async def resolve_or_create_auth_config(key: str, app: str) -> str:
+    """
+    Return an auth-config id (``ac_…``) for ``app``, creating a Composio-managed one if none exists.
+
+    ``GET /api/v3/auth_configs?toolkit_slug=<app>`` → reuse the first item; else
+    ``POST /api/v3/auth_configs`` with ``{"toolkit":{"slug"},"auth_config":{"type":
+    "use_composio_managed_auth"}}``.  Raises RuntimeError with the raw body on failure.
+    """
+    import httpx
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(
+            f"{connections._COMPOSIO_BACKEND}/api/v3/auth_configs",
+            headers={"x-api-key": key},
+            params={"toolkit_slug": app, "limit": 5},
+        )
+        if resp.status_code < 400:
+            items = (resp.json() or {}).get("items", []) or []
+            if items and items[0].get("id"):
+                return str(items[0]["id"])
+
+        create = await client.post(
+            f"{connections._COMPOSIO_BACKEND}/api/v3/auth_configs",
+            headers={"x-api-key": key, "Content-Type": "application/json"},
+            json={"toolkit": {"slug": app}, "auth_config": {"type": "use_composio_managed_auth"}},
+        )
+    if create.status_code >= 400:
+        raise RuntimeError(f"Composio auth_configs create failed (HTTP {create.status_code}): "
+                           f"{create.text[:400]}")
+    data = create.json() if create.content else {}
+    acid = (data.get("id")
+            or (data.get("auth_config") or {}).get("id")
+            or (data.get("data") or {}).get("id"))
+    if not acid:
+        raise RuntimeError(f"Composio auth_configs create returned no id: {str(data)[:400]}")
+    return str(acid)
+
+
+def _redirect_from(data: Any) -> str:
+    """Pull a redirect URL out of the several shapes the connect endpoints return."""
+    if not isinstance(data, dict):
+        return ""
+    if data.get("redirect_url"):
+        return str(data["redirect_url"])
+    if data.get("redirect_uri"):
+        return str(data["redirect_uri"])
+    cd = data.get("connection_data") or data.get("connectionData") or {}
+    val = cd.get("val") if isinstance(cd, dict) else {}
+    if isinstance(val, dict) and val.get("redirect_url"):
+        return str(val["redirect_url"])
+    return ""
+
+
+async def initiate_connect(
+    key: str, auth_config_id: str, user_id: str, callback_url: str, api_key: str = ""
+) -> Dict[str, Any]:
+    """
+    Create a connect (auth-link) session and return ``{redirect_url, connection_id, status, raw}``.
+
+    Tries the current ``POST /api/v3/connected_accounts/link`` first, then falls back to the older
+    ``POST /api/v3/connected_accounts`` initiate shape.  For API-key toolkits, ``api_key`` is passed
+    in the connection ``config`` so the account connects without an OAuth redirect.
+    """
+    import httpx
+
+    link_body: Dict[str, Any] = {"auth_config_id": auth_config_id, "user_id": user_id}
+    if callback_url:
+        link_body["callback_url"] = callback_url
+    if api_key:
+        link_body["config"] = {"api_key": api_key}
+
+    initiate_body: Dict[str, Any] = {
+        "auth_config": {"id": auth_config_id},
+        "connection": {"user_id": user_id, **({"callback_url": callback_url} if callback_url else {}),
+                       **({"config": {"api_key": api_key}} if api_key else {})},
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        attempts = (
+            ("/api/v3/connected_accounts/link", link_body),
+            ("/api/v3/connected_accounts", initiate_body),
+        )
+        last_text, last_code = "", 0
+        for path, body in attempts:
+            resp = await client.post(
+                f"{connections._COMPOSIO_BACKEND}{path}",
+                headers={"x-api-key": key, "Content-Type": "application/json"},
+                json=body,
+            )
+            if resp.status_code < 400:
+                data = resp.json() if resp.content else {}
+                return {
+                    "redirect_url": _redirect_from(data),
+                    "connection_id": str(data.get("connected_account_id") or data.get("id") or ""),
+                    "status": str(data.get("status")
+                                  or ((data.get("connection_data") or {}).get("val") or {}).get("status")
+                                  or ""),
+                    "raw": data,
+                }
+            last_text, last_code = resp.text[:400], resp.status_code
+    raise RuntimeError(f"Composio connect failed (HTTP {last_code}): {last_text}")
+
+
+# ---------------------------------------------------------------------------
 # Public: which connections are handled here, tool building, system-prompt line
 # ---------------------------------------------------------------------------
 

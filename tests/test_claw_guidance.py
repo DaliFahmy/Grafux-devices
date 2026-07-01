@@ -262,10 +262,12 @@ class _FakeResp:
 
 
 class _FakeAsyncClient:
-    # Class-level knobs the fixtures set; captured records the last call.
+    # Class-level knobs the fixtures set; captured records the last call, calls records all.
     payload: dict = {"data": "ok done", "successful": True}
     status: int = 200
+    routes: list = []          # list of (url_substring, status, payload) matched in order
     captured: dict = {}
+    calls: list = []
 
     def __init__(self, *a, **k):
         pass
@@ -276,19 +278,31 @@ class _FakeAsyncClient:
     async def __aexit__(self, *a):
         return False
 
-    async def post(self, url, headers=None, json=None):
-        type(self).captured = {"method": "POST", "url": url, "headers": headers, "json": json}
+    def _resp(self, url):
+        for sub, status, payload in type(self).routes:
+            if sub in url:
+                return _FakeResp(status, payload)
         return _FakeResp(type(self).status, type(self).payload)
 
+    async def post(self, url, headers=None, json=None):
+        rec = {"method": "POST", "url": url, "headers": headers, "json": json}
+        type(self).captured = rec
+        type(self).calls.append(rec)
+        return self._resp(url)
+
     async def get(self, url, headers=None, params=None):
-        type(self).captured = {"method": "GET", "url": url, "headers": headers, "params": params}
-        return _FakeResp(type(self).status, type(self).payload)
+        rec = {"method": "GET", "url": url, "headers": headers, "params": params}
+        type(self).captured = rec
+        type(self).calls.append(rec)
+        return self._resp(url)
 
 
 def _install_fake_httpx(monkeypatch):
     _FakeAsyncClient.payload = {"data": "ok done", "successful": True}
     _FakeAsyncClient.status = 200
+    _FakeAsyncClient.routes = []
     _FakeAsyncClient.captured = {}
+    _FakeAsyncClient.calls = []
     mod = types.ModuleType("httpx")
     mod.AsyncClient = _FakeAsyncClient
     monkeypatch.setitem(sys.modules, "httpx", mod)
@@ -341,6 +355,71 @@ async def test_composio_execute_raises_on_error(fake_httpx):
     fake_httpx.payload = {"error": "bad key"}
     with pytest.raises(RuntimeError):
         await composio_tools._execute("ck", "X_DO", {}, "u", "")
+
+
+# --- connect flow (auth config + link) -------------------------------------
+
+async def test_resolve_auth_config_reuses_existing(fake_httpx):
+    fake_httpx.routes = [("/api/v3/auth_configs", 200, {"items": [{"id": "ac_existing"}]})]
+    acid = await composio_tools.resolve_or_create_auth_config("ck", "googlecalendar")
+    assert acid == "ac_existing"
+
+
+async def test_resolve_auth_config_creates_when_missing(monkeypatch):
+    # GET returns no items → POST /auth_configs creates one (managed auth) and returns its id.
+    seen = {"post_body": None}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None, params=None):
+            return _FakeResp(200, {"items": []})
+
+        async def post(self, url, headers=None, json=None):
+            seen["post_body"] = json
+            return _FakeResp(200, {"auth_config": {"id": "ac_new"}})
+
+    mod = types.ModuleType("httpx")
+    mod.AsyncClient = _Client
+    monkeypatch.setitem(sys.modules, "httpx", mod)
+
+    acid = await composio_tools.resolve_or_create_auth_config("ck", "gmail")
+    assert acid == "ac_new"
+    assert seen["post_body"]["toolkit"]["slug"] == "gmail"
+    assert seen["post_body"]["auth_config"]["type"] == "use_composio_managed_auth"
+
+
+async def test_initiate_connect_returns_redirect(fake_httpx):
+    fake_httpx.routes = [
+        ("/connected_accounts/link", 200,
+         {"redirect_url": "https://accounts.google.com/o/oauth2/auth?x=1",
+          "connected_account_id": "ca_new", "status": "INITIATED"}),
+    ]
+    out = await composio_tools.initiate_connect("ck", "ac_1", "default", "https://cb")
+    assert out["redirect_url"].startswith("https://accounts.google.com")
+    assert out["connection_id"] == "ca_new"
+    cap = fake_httpx.captured
+    assert cap["url"].endswith("/api/v3/connected_accounts/link")
+    assert cap["json"]["auth_config_id"] == "ac_1"
+    assert cap["json"]["user_id"] == "default"
+
+
+async def test_initiate_connect_falls_back_to_initiate(fake_httpx):
+    fake_httpx.routes = [
+        ("/connected_accounts/link", 404, {"error": "gone"}),
+        ("/connected_accounts", 200,
+         {"id": "ca_2", "connection_data": {"val": {"redirect_url": "https://x/auth", "status": "INITIATED"}}}),
+    ]
+    out = await composio_tools.initiate_connect("ck", "ac_1", "default", "https://cb")
+    assert out["redirect_url"] == "https://x/auth"
+    assert out["connection_id"] == "ca_2"
 
 
 # --- run_claw end-to-end via a fake tool-use client ------------------------

@@ -30,6 +30,7 @@ import json
 import logging
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from . import claw_runtime, composio_tools, connections, guidance, qr
 from .models import (
@@ -357,6 +358,59 @@ async def composio_probe(claw_id: str) -> dict:
             entry["account_error"] = str(exc)
         out["apps"].append(entry)
     return out
+
+
+@router.get("/{claw_id}/composio/connect/{app}")
+async def composio_connect(claw_id: str, app: str, request: Request):
+    """
+    Browser-facing: create a Composio Connected Account for ``app`` and redirect to authorize.
+
+    Open this URL in a browser (optionally ``?user_id=default`` and, for API-key toolkits like
+    weathermap, ``?api_key=…``). It ensures an Auth Config exists (Composio-managed OAuth),
+    creates a connect session, and 302-redirects to the OAuth page. When there is no redirect
+    (API-key apps connect synchronously, or an error) it returns JSON with the raw Composio result.
+    """
+    spec = _require_spec(claw_id)
+    key = connections.resolve_composio_key(spec)
+    if not key:
+        return {"error": "No Composio key on this claw. Add {\"composio\": \"ck_…\"} to api_keys "
+                         "and Regenerate, then retry."}
+    user_id = str(request.query_params.get("user_id") or "default")
+    api_key = str(request.query_params.get("api_key") or "")
+    base = str(request.base_url).rstrip("/")
+    callback_url = f"{base}/claw/{claw_id}/composio/connected?app={app}"
+    try:
+        auth_config_id = await composio_tools.resolve_or_create_auth_config(key, app)
+        result = await composio_tools.initiate_connect(key, auth_config_id, user_id, callback_url, api_key)
+    except Exception as exc:  # noqa: BLE001 — show the real Composio error, not a 500 stack
+        return {"error": str(exc), "app": app,
+                "hint": "If auth is API-key based (e.g. weathermap), append ?api_key=YOUR_KEY. "
+                        "If managed OAuth is disabled on your Composio org, create the auth config "
+                        "for this toolkit once in the dashboard, then retry."}
+    composio_tools.clear_cache()  # so the next probe/run re-resolves the (soon ACTIVE) account
+    redirect_url = result.get("redirect_url")
+    if redirect_url:
+        return RedirectResponse(redirect_url, status_code=302)
+    return {"app": app, "status": result.get("status"), "connection_id": result.get("connection_id"),
+            "message": "No OAuth redirect was returned — for an API-key toolkit this usually means "
+                       "the account connected directly (re-open the probe to confirm), or the key "
+                       "was missing (append ?api_key=…).",
+            "raw": result.get("raw")}
+
+
+@router.get("/{claw_id}/composio/connected", response_class=HTMLResponse)
+async def composio_connected(claw_id: str, request: Request) -> str:
+    """OAuth callback landing page after the user authorizes a Composio connection."""
+    app = str(request.query_params.get("app") or "the app")
+    base = str(request.base_url).rstrip("/")
+    return (
+        "<html><body style='font-family:sans-serif;max-width:640px;margin:40px auto'>"
+        f"<h2>✅ Connected {app}</h2>"
+        "<p>You can close this tab. Back in Grafux, the claw will now find this account.</p>"
+        f"<p>Verify: <a href='{base}/claw/{claw_id}/composio/probe'>open the probe</a> — "
+        "the app should show <code>connected: true</code>. Then Run the claw.</p>"
+        "</body></html>"
+    )
 
 
 @router.delete("/{claw_id}/session/{session_id}")
