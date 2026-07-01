@@ -330,6 +330,54 @@ async def _account_for_app(key: str, app: str, conn: Optional[ClawConnection]) -
     return user_id, account_id
 
 
+async def list_connected_accounts(key: str) -> List[Dict[str, Any]]:
+    """
+    List all Composio connected accounts for ``key`` → ``[{id, toolkit, user_id, status}]``.
+
+    Used by the Manage Connections page + the probe.  Best-effort → ``[]`` on any error.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{connections._COMPOSIO_BACKEND}/api/v3/connected_accounts",
+                headers={"x-api-key": key},
+                params={"limit": 100},
+            )
+        if resp.status_code >= 400:
+            return []
+        items = (resp.json() or {}).get("items", []) or []
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("composio: list connected accounts failed: %s", exc)
+        return []
+    return [
+        {
+            "id": str(a.get("id") or ""),
+            "toolkit": str((a.get("toolkit") or {}).get("slug") or "").lower(),
+            "user_id": str(a.get("user_id") or ""),
+            "status": str(a.get("status") or ""),
+        }
+        for a in items
+    ]
+
+
+async def delete_connected_account(key: str, account_id: str) -> bool:
+    """Delete a Composio connected account (``DELETE /api/v3/connected_accounts/{id}``)."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.delete(
+                f"{connections._COMPOSIO_BACKEND}/api/v3/connected_accounts/{account_id}",
+                headers={"x-api-key": key},
+            )
+        return 200 <= resp.status_code < 300
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("composio: delete connected account %s failed: %s", account_id, exc)
+        return False
+
+
 async def _execute(
     key: str,
     tool_slug: str,

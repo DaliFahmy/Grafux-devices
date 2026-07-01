@@ -416,6 +416,8 @@ async def composio_manage(claw_id: str, request: Request) -> str:
             "then reopen this page.</p>"
         )
 
+    all_accounts = await composio_tools.list_connected_accounts(key)
+
     cards = []
     for conn in conns:
         app = connections._clean_port(conn.app)
@@ -424,6 +426,7 @@ async def composio_manage(claw_id: str, request: Request) -> str:
         app_esc = html.escape(app)
         note = ""
         connect_slug = app_esc
+        resolved = app
         try:
             resolved = await composio_tools.resolve_toolkit_slug(key, app)
             if resolved != app:
@@ -432,24 +435,54 @@ async def composio_manage(claw_id: str, request: Request) -> str:
                         f"<b>{connect_slug}</b></span>")
         except Exception:  # noqa: BLE001
             pass
+
+        # Tools for this toolkit (expandable list).
+        tools_html = ""
         try:
             tools = await composio_tools._list_actions_for_app(key, app)
-            _uid, account_id = await composio_tools._account_for_app(key, app, conn)
-            connected = bool(account_id)
-            status = ("<span style='color:#2e7d32'>✅ Connected</span>" if connected
-                      else "<span style='color:#b26a00'>Not connected</span>")
+            if tools:
+                items = "".join(f"<li>{html.escape(t['name'])}</li>" for t in tools)
+                tools_html = (f"<details style='margin:6px 0'><summary style='cursor:pointer'>"
+                              f"{len(tools)} tools</summary>"
+                              f"<ul style='margin:6px 0 0;max-height:220px;overflow:auto'>{items}</ul>"
+                              "</details>")
             meta = f"{len(tools)} tools"
         except Exception as exc:  # noqa: BLE001 — never let one app break the page
-            status = f"<span style='color:#b00'>status error: {html.escape(str(exc)[:120])}</span>"
-            meta = ""
+            meta = f"<span style='color:#b00'>tools error: {html.escape(str(exc)[:100])}</span>"
+
+        # Connected accounts for this toolkit + a Disconnect link each.
+        app_accounts = [a for a in all_accounts if a.get("toolkit") == resolved.lower()]
+        active = any(a.get("status", "").upper() == "ACTIVE" for a in app_accounts)
+        status = ("<span style='color:#2e7d32'>✅ Connected</span>" if active
+                  else "<span style='color:#b26a00'>Not connected</span>")
+        if app_accounts:
+            rows = []
+            for a in app_accounts:
+                aid = html.escape(a["id"])
+                dis = f"{base}/claw/{claw_id}/composio/disconnect/{aid}"
+                rows.append(
+                    "<div style='display:flex;justify-content:space-between;align-items:center;"
+                    "gap:8px;padding:4px 0;font-size:13px'>"
+                    f"<span><code>{aid}</code> · {html.escape(a['user_id'])} · "
+                    f"{html.escape(a['status'])}</span>"
+                    f"<a href='{dis}' style='color:#b00;text-decoration:none;border:1px solid #f0b0b0;"
+                    "border-radius:6px;padding:3px 10px'>Disconnect</a></div>"
+                )
+            accounts_html = ("<div style='margin:6px 0;color:#555;font-size:13px'>"
+                             "<b>Connected accounts</b></div>" + "".join(rows))
+        else:
+            accounts_html = ("<div style='margin:6px 0;color:#999;font-size:13px'>"
+                             "No account connected yet.</div>")
+
         # Connect under the resolved (canonical) slug so a typo still connects the right toolkit.
         action = f"{base}/claw/{claw_id}/composio/connect/{connect_slug}"
         cards.append(
             "<div style='border:1px solid #e0e0e8;border-radius:10px;padding:14px 16px;margin:12px 0'>"
             f"<div style='display:flex;justify-content:space-between;align-items:center'>"
             f"<b style='font-size:16px'>{app_esc}</b><span>{status}</span></div>"
-            f"<div style='color:#888;font-size:13px;margin:2px 0 10px'>{meta}{note}</div>"
-            f"<form method='get' action='{action}' style='display:flex;gap:8px;flex-wrap:wrap'>"
+            f"<div style='color:#888;font-size:13px;margin:2px 0 6px'>{meta}{note}</div>"
+            f"{tools_html}{accounts_html}"
+            f"<form method='get' action='{action}' style='display:flex;gap:8px;flex-wrap:wrap;margin-top:8px'>"
             "<input name='api_key' placeholder='API key / bot token (leave blank for OAuth apps)' "
             "style='flex:1;min-width:220px;padding:8px;border:1px solid #ccc;border-radius:6px'>"
             "<button type='submit' style='padding:8px 18px;border:0;border-radius:6px;"
@@ -514,6 +547,26 @@ async def composio_connected(claw_id: str, request: Request) -> str:
         "the app should show <code>connected: true</code>. Then Run the claw.</p>"
         "</body></html>"
     )
+
+
+@router.get("/{claw_id}/composio/disconnect/{account_id}")
+async def composio_disconnect(claw_id: str, account_id: str, request: Request):
+    """Delete a Composio connected account, then return to the Manage Connections page."""
+    import re
+
+    spec = _require_spec(claw_id)
+    key = connections.resolve_composio_key(spec)
+    base = str(request.base_url).rstrip("/")
+    if not key:
+        return {"error": "No Composio key on this claw."}
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", account_id):
+        return {"error": f"Invalid account id: {account_id}"}
+    ok = await composio_tools.delete_connected_account(key, account_id)
+    composio_tools.clear_cache()  # refresh status on the page we redirect to
+    if not ok:
+        return {"error": f"Could not disconnect account {account_id} (already gone, or Composio "
+                         "rejected the request).", "back": f"{base}/claw/{claw_id}/composio"}
+    return RedirectResponse(f"{base}/claw/{claw_id}/composio", status_code=302)
 
 
 @router.delete("/{claw_id}/session/{session_id}")

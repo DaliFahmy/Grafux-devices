@@ -325,6 +325,12 @@ class _FakeAsyncClient:
         type(self).calls.append(rec)
         return self._resp(url)
 
+    async def delete(self, url, headers=None):
+        rec = {"method": "DELETE", "url": url, "headers": headers}
+        type(self).captured = rec
+        type(self).calls.append(rec)
+        return self._resp(url)
+
 
 def _install_fake_httpx(monkeypatch):
     _FakeAsyncClient.payload = {"data": "ok done", "successful": True}
@@ -440,6 +446,35 @@ async def test_initiate_connect_returns_redirect(fake_httpx):
     assert cap["json"]["user_id"] == "default"
 
 
+# --- connected accounts: list + disconnect ---------------------------------
+
+async def test_list_connected_accounts(fake_httpx):
+    fake_httpx.payload = {"items": [
+        {"id": "ca_1", "toolkit": {"slug": "GoogleSheets"}, "user_id": "default", "status": "ACTIVE"},
+        {"id": "ca_2", "toolkit": {"slug": "gmail"}, "user_id": "u2", "status": "EXPIRED"},
+    ]}
+    out = await composio_tools.list_connected_accounts("ck")
+    assert out == [
+        {"id": "ca_1", "toolkit": "googlesheets", "user_id": "default", "status": "ACTIVE"},
+        {"id": "ca_2", "toolkit": "gmail", "user_id": "u2", "status": "EXPIRED"},
+    ]
+
+
+async def test_delete_connected_account(fake_httpx):
+    fake_httpx.status = 200
+    ok = await composio_tools.delete_connected_account("ck", "ca_9")
+    assert ok is True
+    cap = fake_httpx.captured
+    assert cap["method"] == "DELETE"
+    assert cap["url"].endswith("/api/v3/connected_accounts/ca_9")
+    assert cap["headers"]["x-api-key"] == "ck"
+
+
+async def test_delete_connected_account_failure(fake_httpx):
+    fake_httpx.status = 404
+    assert await composio_tools.delete_connected_account("ck", "ca_x") is False
+
+
 # --- Manage Connections HTML page ------------------------------------------
 
 def _manage_client():
@@ -457,20 +492,26 @@ def test_composio_manage_page_renders(monkeypatch):
     async def fake_tools(key, app):
         return [{"name": "GOOGLECALENDAR_X", "description": "", "input_schema": {}, "no_auth": False}]
 
-    async def fake_account(key, app, conn):
-        return ("", "")  # not connected yet
+    async def fake_resolve(key, app):
+        return app
+
+    async def fake_accounts(key):
+        return [{"id": "ca_1", "toolkit": "googlecalendar", "user_id": "default", "status": "ACTIVE"}]
 
     monkeypatch.setattr(composio_tools, "_list_actions_for_app", fake_tools)
-    monkeypatch.setattr(composio_tools, "_account_for_app", fake_account)
+    monkeypatch.setattr(composio_tools, "resolve_toolkit_slug", fake_resolve)
+    monkeypatch.setattr(composio_tools, "list_connected_accounts", fake_accounts)
 
     cid = registry.create(ClawSpec(api_keys='{"composio":"ck"}', connections='["googlecalendar"]', name="t"))
     try:
         r = _manage_client().get(f"/claw/{cid}/composio")
         assert r.status_code == 200
         assert "googlecalendar" in r.text
-        assert "Connect" in r.text
+        assert "GOOGLECALENDAR_X" in r.text                       # tools listed
         assert f"/claw/{cid}/composio/connect/googlecalendar" in r.text
-        assert "Not connected" in r.text
+        assert f"/claw/{cid}/composio/disconnect/ca_1" in r.text  # disconnect link
+        assert "Disconnect" in r.text
+        assert "✅ Connected" in r.text                            # ACTIVE account
     finally:
         registry.delete(cid)
 
