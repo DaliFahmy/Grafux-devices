@@ -383,11 +383,14 @@ async def run_claw(
     text = "".join(
         block.text for block in message.content if getattr(block, "type", None) == "text"
     )
+    # If apps are wired in 'connections' but no tools loaded (no Composio key / no connected
+    # account), flag it on the errors port instead of silently answering like a plain chatbot.
+    no_tools = composio_tools.unloaded_reason(spec, composio_defs)
     usage = getattr(message, "usage", None)
     return {
-        "status": "ok",
+        "status": "error" if no_tools else "ok",
         "response": text,
-        "errors": "",
+        "errors": no_tools,
         "input_tokens": int(getattr(usage, "input_tokens", 0) or 0)
         + int(getattr(usage, "cache_read_input_tokens", 0) or 0)
         + int(getattr(usage, "cache_creation_input_tokens", 0) or 0),

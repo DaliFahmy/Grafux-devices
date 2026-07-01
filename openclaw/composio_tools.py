@@ -278,6 +278,33 @@ def has_rest_tools(spec: ClawSpec) -> bool:
     return bool(_rest_connections(spec))
 
 
+def unloaded_reason(spec: ClawSpec, tool_defs: List[Dict[str, Any]]) -> str:
+    """
+    Explain why a claw with apps in its ``connections`` port ended up with NO tools.
+
+    Returns "" when tools loaded, or there are no app connections to load.  Otherwise a clear,
+    user-facing reason so the block's errors port flags the misconfiguration instead of the claw
+    silently behaving like a plain chatbot ("I can't send messages").
+    """
+    if tool_defs:
+        return ""
+    apps = list(dict.fromkeys(connections._clean_port(c.app) for c in _rest_connections(spec)))
+    if not apps:
+        return ""
+    app_list = ", ".join(apps)
+    if not connections.resolve_composio_key(spec):
+        return (
+            f"Apps [{app_list}] are listed in the 'connections' port but NO Composio key was found. "
+            "Add it to the 'api_keys' port as {\"composio\": \"ck_…\"} (a bare ck_… key also works)."
+        )
+    return (
+        f"Apps [{app_list}] are listed and a Composio key is set, but no tools loaded — most likely "
+        f"no connected account exists in Composio for [{app_list}]. Connect the app in your Composio "
+        "account (for Telegram: add your bot token to the Telegram integration in the Composio "
+        "dashboard), then run again."
+    )
+
+
 async def build(spec: ClawSpec) -> Tuple[List[Dict[str, Any]], Dict[str, Callable[[Dict[str, Any]], Awaitable[str]]]]:
     """
     Build ``(tool_defs, dispatch)`` for the claw's connected Composio apps.
