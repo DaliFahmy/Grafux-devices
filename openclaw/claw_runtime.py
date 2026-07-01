@@ -539,14 +539,67 @@ def _scaffold_fallback() -> Dict[str, str]:
     return out
 
 
-async def scaffold_claw(description: str, name: str = "") -> Dict[str, str]:
+def _apps_from_connections_value(val: Any) -> List[str]:
+    """Extract bare app names from a ``connections`` port value (string list / dict list / JSON)."""
+    data = _maybe_json(val) if isinstance(val, str) else val
+    apps: List[str] = []
+    if isinstance(data, list):
+        for it in data:
+            if isinstance(it, str) and it.strip():
+                apps.append(it.strip())
+            elif isinstance(it, dict):
+                app = str(it.get("app") or "").strip()
+                if app:
+                    apps.append(app)
+    return apps
+
+
+async def _normalize_connection_apps(apps: List[str]) -> List[str]:
+    """Resolve each app name to its canonical Composio toolkit slug, de-duped (order preserved)."""
+    key = connections.resolve_composio_key(ClawSpec())
+    out: List[str] = []
+    seen: set = set()
+    for app in apps:
+        if key:
+            slug = await composio_tools.resolve_toolkit_slug(key, app)
+        else:
+            slug = app
+        slug = (slug or "").strip().lower()
+        if slug and slug not in seen:
+            seen.add(slug)
+            out.append(slug)
+    return out
+
+
+async def _finalize_connections(out: Dict[str, str], connections_hint: Optional[List[str]]) -> Dict[str, str]:
+    """Merge an explicit connections hint with the AI-drafted apps, normalize to valid slugs."""
+    apps = [str(a).strip() for a in (connections_hint or []) if str(a).strip()]
+    apps += _apps_from_connections_value(out.get("connections", ""))
+    resolved = await _normalize_connection_apps(apps)
+    if resolved:
+        out["connections"] = json.dumps(resolved)
+        out["guidance"] = _scaffold_guidance(out)  # guidance depends on connections
+    return out
+
+
+async def scaffold_claw(
+    description: str, name: str = "", connections_hint: Optional[List[str]] = None
+) -> Dict[str, str]:
     """
     Draft the claw's input-port values from ``description``.
 
     Returns a dict with the six design keys plus ``credentials``/``api_keys``
-    (always placeholder hints).  Never raises — returns a best-effort fallback so
-    the block can still be created when the AI is unavailable.
+    (always placeholder hints).  ``connections_hint`` carries apps the caller named
+    explicitly; they are merged with the AI-inferred apps and normalized to valid
+    Composio toolkit slugs (e.g. ``["googlesheets"]``).  Never raises — returns a
+    best-effort fallback so the block can still be created when the AI is unavailable.
     """
+    out = await _scaffold_draft(description, name)
+    return await _finalize_connections(out, connections_hint)
+
+
+async def _scaffold_draft(description: str, name: str = "") -> Dict[str, str]:
+    """Draft the design ports from ``description`` (no connections normalization — see caller)."""
     description = (description or "").strip()
     if not description:
         return _scaffold_fallback()

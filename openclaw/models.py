@@ -222,32 +222,6 @@ class ClawSummary(BaseModel):
     tool_count: int = 0           # number of tools the claw currently exposes
 
 
-class InitiateConnectionRequest(BaseModel):
-    """Begin a Composio OAuth flow to connect an app to a claw."""
-
-    app: str = Field(..., description="App / toolkit to connect, e.g. 'telegram'.")
-    user_id: str = Field("", description="An opaque user/entity id used to scope the connection.")
-    redirect_uri: str = Field("", description="Where Composio returns the user after authorizing.")
-
-
-class InitiateConnectionResponse(BaseModel):
-    app: str = ""
-    connection_id: str = ""
-    redirect_url: str = ""
-    status: str = "pending"  # "pending" until the user authorizes, then "active"
-
-
-class ConnectionSummary(BaseModel):
-    """A connected app as echoed back to the UI (never carries secret tokens)."""
-
-    app: str = ""
-    connection_id: str = ""
-    account_label: str = ""
-    status: str = ""  # Composio account status, e.g. "ACTIVE" / "INITIATED"
-    enabled: bool = True
-    channel: bool = False
-
-
 class RegisterChannelRequest(BaseModel):
     """Register (or update) the inbound messaging channel for a claw."""
 
@@ -270,6 +244,11 @@ class ScaffoldRequest(BaseModel):
     description: str = Field("", description="What the claw should be / do.")
     name: str = Field("", description="Optional claw name for extra context.")
     category: str = Field("", description="Optional category for extra context.")
+    connections: list[str] = Field(
+        default_factory=list,
+        description="Optional app/toolkit names the caller explicitly wants connected "
+        "(e.g. ['googlesheets']). Merged with AI-inferred apps and normalized to valid slugs.",
+    )
 
 
 class ScaffoldResponse(BaseModel):
@@ -291,6 +270,12 @@ class ScaffoldResponse(BaseModel):
     credentials: str = ""
     api_keys: str = ""
     guidance: str = ""  # drafted "what to fill in next" notes for the create dialog
+
+
+class ToolkitsResponse(BaseModel):
+    """The Composio toolkit slugs a claw can connect to (for grounding block creation)."""
+
+    toolkits: list[str] = []
 
 
 class QrRequest(BaseModel):

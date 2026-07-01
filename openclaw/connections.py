@@ -8,8 +8,8 @@ A claw's ``connections`` port carries a JSON list of connected applications
   * **Outbound tools** — Composio-hosted MCP servers passed straight to Anthropic's
     native remote-MCP connector (``build_mcp_servers``), so the claw can *act* on the
     apps (send a Telegram message, post to Slack) without us hand-rolling a tool loop.
-  * **OAuth wiring** — ``initiate_connection`` / ``list_connections`` / ``delete_connection``
-    drive Composio's "connected accounts" flow so a user can link their own account.
+    (App-name connections instead get REST tools via ``composio_tools``; the connect
+    flow lives in the router's ``/composio`` endpoints.)
   * **Inbound replies** — ``send_channel_reply`` posts the claw's response back to the
     chat a message arrived on (used by the channel webhook).
 
@@ -588,74 +588,6 @@ async def run_local_agent_loop(
         # Ran out of iterations — return whatever text the last turn produced.
         logger.warning("local MCP loop hit the %d-iteration cap", _MAX_TOOL_ITERATIONS)
         return _extract_text(last_message)
-
-
-# ---------------------------------------------------------------------------
-# OAuth / connected-accounts flow (mirrors composio/auth.py)
-# ---------------------------------------------------------------------------
-
-async def initiate_connection(
-    app: str, user_id: str, redirect_uri: str, key: str
-) -> Dict[str, str]:
-    """Start a Composio OAuth connection for ``app`` and return the redirect URL."""
-    import httpx
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
-            f"{_COMPOSIO_BACKEND}/api/v1/connectedAccounts",
-            headers={"x-api-key": key, "Content-Type": "application/json"},
-            json={
-                "appName": app,
-                "userUuid": user_id or f"claw:{app}",
-                "redirectUri": redirect_uri,
-                "authMode": "OAUTH2",
-            },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    return {
-        "app": app,
-        "connection_id": data.get("connectedAccountId", ""),
-        "redirect_url": data.get("redirectUrl", ""),
-        "status": data.get("connectionStatus", "pending"),
-    }
-
-
-async def list_connections(key: str) -> List[Dict[str, Any]]:
-    """List Composio connected accounts (id + app + status; never tokens)."""
-    import httpx
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(
-            f"{_COMPOSIO_BACKEND}/api/v1/connectedAccounts",
-            headers={"x-api-key": key},
-            params={"pageSize": 100},
-        )
-        resp.raise_for_status()
-        items = resp.json().get("items", [])
-    out: List[Dict[str, Any]] = []
-    for it in items:
-        out.append(
-            {
-                "connection_id": it.get("id") or it.get("connectedAccountId", ""),
-                "app": (it.get("appName") or it.get("appUniqueId") or "").lower(),
-                "account_label": it.get("label") or it.get("clientUniqueUserId", ""),
-                "status": it.get("status", ""),
-            }
-        )
-    return out
-
-
-async def delete_connection(connection_id: str, key: str) -> bool:
-    """Delete a Composio connected account.  Returns True on success."""
-    import httpx
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.delete(
-            f"{_COMPOSIO_BACKEND}/api/v1/connectedAccounts/{connection_id}",
-            headers={"x-api-key": key},
-        )
-        return 200 <= resp.status_code < 300
 
 
 # ---------------------------------------------------------------------------

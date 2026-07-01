@@ -12,11 +12,9 @@ are under the ``/claw`` prefix:
     GET    /claw/{id}          -> a claw's non-secret summary
     DELETE /claw/{id}          -> remove a claw
 
-External app connections (Composio) + inbound messaging channels:
+Composio connections (browser-facing) live in ``composio_web``-style handlers here under
+``/claw/{id}/composio/*`` (Manage page, connect, disconnect, probe). Inbound messaging channels:
 
-    POST   /claw/{id}/connections/initiate     -> start a Composio OAuth flow
-    GET    /claw/{id}/connections              -> list the claw's connected apps
-    DELETE /claw/{id}/connections/{app}        -> disconnect an app
     POST   /claw/{id}/channels/{provider}/register -> register an inbound channel
     POST   /claw/{id}/channels/{provider}/webhook  -> inbound message entrypoint
 
@@ -39,11 +37,8 @@ from .models import (
     ClawSpec,
     ClawSummary,
     ConfigPatchRequest,
-    ConnectionSummary,
     CreateClawResponse,
     GuidanceResponse,
-    InitiateConnectionRequest,
-    InitiateConnectionResponse,
     QrRequest,
     QrResponse,
     RegisterChannelRequest,
@@ -52,6 +47,7 @@ from .models import (
     RunResponse,
     ScaffoldRequest,
     ScaffoldResponse,
+    ToolkitsResponse,
 )
 from .registry import registry
 from .sessions import sessions
@@ -76,8 +72,24 @@ async def scaffold_claw(body: ScaffoldRequest) -> ScaffoldResponse:
     Never errors for AI failures — returns a best-effort object (empty design ports
     + placeholder secrets) so the block can still be created.
     """
-    drafted = await claw_runtime.scaffold_claw(body.description, body.name)
+    drafted = await claw_runtime.scaffold_claw(
+        body.description, body.name, connections_hint=body.connections
+    )
     return ScaffoldResponse(**drafted)
+
+
+@router.get("/toolkits", response_model=ToolkitsResponse)
+async def list_toolkits() -> ToolkitsResponse:
+    """
+    List every Composio toolkit slug a claw can connect to (e.g. ``googlesheets``, ``gmail``).
+
+    Used to ground block creation (stream voice/text) so the ``connections`` port gets valid
+    app slugs.  Uses the server's Composio key (``COMPOSIO_API_KEY``); returns ``[]`` when no key
+    is configured or the list can't be fetched.  Declared before ``/{claw_id}`` so "toolkits" is
+    not captured as a claw id.
+    """
+    key = connections.resolve_composio_key(ClawSpec())
+    return ToolkitsResponse(toolkits=await composio_tools.list_toolkit_slugs(key or ""))
 
 
 @router.get("", response_model=list[ClawSummary])
@@ -592,98 +604,6 @@ def _require_spec(claw_id: str) -> ClawSpec:
     if spec is None:
         raise HTTPException(status_code=404, detail=f"No claw with id '{claw_id}'")
     return spec
-
-
-def _require_composio_key(spec: ClawSpec) -> str:
-    key = connections.resolve_composio_key(spec)
-    if not key:
-        raise HTTPException(
-            status_code=400,
-            detail="No Composio API key found. Set the claw's api_keys port "
-                   "({\"composio\": \"...\"}) or the COMPOSIO_API_KEY env var.",
-        )
-    return key
-
-
-# ---------------------------------------------------------------------------
-# External app connections (Composio OAuth connected-accounts)
-# ---------------------------------------------------------------------------
-
-@router.post("/{claw_id}/connections/initiate", response_model=InitiateConnectionResponse)
-async def initiate_connection(claw_id: str, body: InitiateConnectionRequest) -> InitiateConnectionResponse:
-    """Start a Composio OAuth flow so the user can link an app to this claw."""
-    spec = _require_spec(claw_id)
-    key = _require_composio_key(spec)
-    try:
-        result = await connections.initiate_connection(
-            body.app, body.user_id or claw_id, body.redirect_uri, key
-        )
-    except Exception as exc:  # noqa: BLE001 — surface Composio/network errors to the UI
-        logger.warning("connection initiate failed for claw %s: %s", claw_id, exc)
-        raise HTTPException(status_code=502, detail=f"Composio initiate failed: {exc}")
-
-    # Record the connection on the live claw spec so its tools are available on the
-    # next run without waiting for the frontend to re-provision (registry.get returns
-    # the stored ClawSpec by reference, so this mutation sticks for this process).
-    conns = connections.parse_connections(spec)
-    new_id = result.get("connection_id", "")
-    updated = [c for c in conns if c.app.lower() != body.app.lower()]
-    updated.append(
-        connections.ClawConnection(app=body.app, connection_id=new_id, enabled=True)
-    )
-    spec.connections = json.dumps([c.model_dump() for c in updated])
-    registry.save(claw_id)  # flush the mutation so it survives a restart
-    return InitiateConnectionResponse(**result)
-
-
-@router.get("/{claw_id}/connections", response_model=list[ConnectionSummary])
-async def list_claw_connections(claw_id: str) -> list[ConnectionSummary]:
-    """
-    List the claw's connections, enriched with live Composio status.
-
-    The configured connections (from the ``connections`` port) are the source of
-    truth for which apps the claw uses; Composio is queried for their auth status.
-    """
-    spec = _require_spec(claw_id)
-    configured = connections.parse_connections(spec)
-    status_by_id: dict[str, str] = {}
-    key = connections.resolve_composio_key(spec)
-    if key:
-        try:
-            for c in await connections.list_connections(key):
-                status_by_id[c["connection_id"]] = c.get("status", "")
-        except Exception as exc:  # noqa: BLE001 — status is best-effort, never fatal
-            logger.warning("connection list failed for claw %s: %s", claw_id, exc)
-    return [
-        ConnectionSummary(
-            app=c.app,
-            connection_id=c.connection_id,
-            account_label=c.account_label,
-            status=status_by_id.get(c.connection_id, ""),
-            enabled=c.enabled,
-            channel=c.channel,
-        )
-        for c in configured
-    ]
-
-
-@router.delete("/{claw_id}/connections/{app}")
-async def delete_claw_connection(claw_id: str, app: str) -> dict:
-    """Disconnect ``app``: drop it from the claw spec and revoke it on Composio."""
-    spec = _require_spec(claw_id)
-    remaining = [c for c in connections.parse_connections(spec) if c.app.lower() != app.lower()]
-    removed = [c for c in connections.parse_connections(spec) if c.app.lower() == app.lower()]
-    spec.connections = json.dumps([c.model_dump() for c in remaining])
-    registry.save(claw_id)
-    key = connections.resolve_composio_key(spec)
-    if key:
-        for c in removed:
-            if c.connection_id:
-                try:
-                    await connections.delete_connection(c.connection_id, key)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Composio delete failed for %s: %s", c.connection_id, exc)
-    return {"status": "disconnected", "app": app, "claw_id": claw_id}
 
 
 # ---------------------------------------------------------------------------

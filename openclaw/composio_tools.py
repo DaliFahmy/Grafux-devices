@@ -101,6 +101,13 @@ async def _toolkit_slugs(key: str) -> set:
     return slugs
 
 
+async def list_toolkit_slugs(key: str) -> list:
+    """Sorted list of every Composio toolkit slug (for grounding claw connections). ``[]`` on no key/error."""
+    if not key:
+        return []
+    return sorted(await _toolkit_slugs(key))
+
+
 async def resolve_toolkit_slug(key: str, app: str) -> str:
     """
     Resolve a user-typed app name to the canonical Composio toolkit slug.
