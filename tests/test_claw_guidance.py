@@ -12,9 +12,12 @@ import types
 
 import pytest
 
-from openclaw import claw_runtime, connections, guidance, qr
+from openclaw import claw_runtime, connections, guidance, native_tools, qr
 from openclaw.connections import TOOL_ROUTER_URL
 from openclaw.models import ClawSpec
+
+# A syntactically-valid BotFather token (35-char secret) for the native Telegram tests.
+_TG_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678"
 
 
 def _spec(**kw) -> ClawSpec:
@@ -187,3 +190,94 @@ async def test_run_result_always_carries_guidance_fields(stub_anthropic):
     # block's guidance/setup_status/connections_status ports are always populated.
     result = await claw_runtime.run_claw(_spec(), task="hi")
     assert "guidance" in result and "setup_status" in result and "connections_status" in result
+
+
+# ---------------------------------------------------------------------------
+# Native Telegram tool — bot token in credentials/api_keys gives real send tools
+# ---------------------------------------------------------------------------
+
+def test_resolve_telegram_token_bare_credentials():
+    # The common case: the user pastes the BotFather token straight into credentials.
+    assert native_tools.resolve_telegram_token(ClawSpec(credentials=_TG_TOKEN)) == _TG_TOKEN
+
+
+def test_resolve_telegram_token_json_api_keys():
+    spec = ClawSpec(api_keys='{"telegram_bot_token": "%s"}' % _TG_TOKEN)
+    assert native_tools.resolve_telegram_token(spec) == _TG_TOKEN
+
+
+def test_resolve_telegram_token_none():
+    assert native_tools.resolve_telegram_token(ClawSpec(credentials="just some notes")) == ""
+
+
+def test_build_native_tools():
+    defs, dispatch = native_tools.build(ClawSpec(credentials=_TG_TOKEN))
+    assert {d["name"] for d in defs} == {"telegram_send_message", "telegram_list_chats"}
+    assert set(dispatch.keys()) == {"telegram_send_message", "telegram_list_chats"}
+    # No token ⇒ no native tools (byte-identical to before).
+    assert native_tools.build(ClawSpec()) == ([], {})
+
+
+def test_guidance_reports_connected_telegram_bot():
+    g = guidance.analyze(ClawSpec(api_keys="sk-ant", credentials=_TG_TOKEN, soul="hi"))
+    assert "Telegram bot" in g["guidance"]
+
+
+# Fake Anthropic client that drives one tool call then finishes — exercises the native loop.
+class _TU:
+    def __init__(self, id, name, inp):
+        self.type, self.id, self.name, self.input = "tool_use", id, name, inp
+
+
+class _TX:
+    def __init__(self, t):
+        self.type, self.text = "text", t
+
+
+class _M:
+    def __init__(self, content, stop_reason):
+        self.content, self.stop_reason, self.usage = content, stop_reason, None
+
+
+@pytest.fixture
+def tool_anthropic(monkeypatch):
+    mod = types.ModuleType("anthropic")
+    state = {"n": 0, "calls": []}
+
+    class _Messages:
+        async def create(self, **kwargs):
+            state["calls"].append(kwargs)
+            state["n"] += 1
+            if state["n"] == 1:
+                return _M([_TU("t1", "telegram_send_message", {"chat_id": "5", "text": "hi"})], "tool_use")
+            return _M([_TX("Sent it!")], "end_turn")
+
+    class _AsyncAnthropic:
+        def __init__(self, **kw):
+            self.messages = _Messages()
+
+    mod.AsyncAnthropic = _AsyncAnthropic
+    monkeypatch.setitem(sys.modules, "anthropic", mod)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    claw_runtime._ANTHROPIC_CLIENTS.clear()
+    return state
+
+
+async def test_run_claw_uses_native_telegram_tool(tool_anthropic, monkeypatch):
+    sent = {}
+
+    async def fake_send(token, chat_id, text):
+        sent.update(token=token, chat_id=chat_id, text=text)
+        return f"Message sent to chat {chat_id}."
+
+    monkeypatch.setattr(native_tools, "_telegram_send_message", fake_send)
+    spec = ClawSpec(
+        api_keys='{"anthropic": "sk-ant", "telegram": "%s"}' % _TG_TOKEN,
+        soul="You message Telegram.",
+    )
+    result = await claw_runtime.run_claw(spec, task="send hi to my telegram")
+    assert result["status"] == "ok"
+    assert result["response"] == "Sent it!"          # final text after the tool ran
+    assert sent == {"token": _TG_TOKEN, "chat_id": "5", "text": "hi"}
+    # The model was actually offered the native tools.
+    assert any("tools" in c for c in tool_anthropic["calls"])

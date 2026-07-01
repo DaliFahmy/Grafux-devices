@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from . import connections
+from . import connections, native_tools
 from .models import ClawSpec
 
 
@@ -38,6 +38,7 @@ def analyze(spec: ClawSpec) -> Dict[str, Any]:
     model = claw_runtime._resolve_model_params(spec)["model"]
     model_known = model in claw_runtime.MODEL_CATALOG
     statuses = connections.connection_statuses(spec)
+    telegram_token = native_tools.resolve_telegram_token(spec)
 
     pending = [s for s in statuses if s["needs_auth"]]
     ready = bool(api_key)  # only the Anthropic key blocks a run; the rest are warnings
@@ -109,6 +110,17 @@ def analyze(spec: ClawSpec) -> Dict[str, Any]:
             "`[\"whatsapp\", \"telegram\"]` — or open **Manage Connections…** on the block to "
             "pick apps and scan a QR to authorize them. "
             f"Available: {', '.join(connections.APP_CATALOG.keys())}."
+        )
+
+    # Native tools from the claw's own credentials (no Composio needed).
+    if telegram_token:
+        parts.append(
+            "### 📨 Telegram bot — connected\n"
+            "A bot token is set, so the claw can send Telegram messages directly (no Composio "
+            "needed). Ask it to *\"send a Telegram message\"* — it will call **telegram_list_chats** "
+            "to find a chat_id (a bot can only message people who have messaged it first), then "
+            "**telegram_send_message**. Tip: open your bot in Telegram and send it any message so "
+            "it has a chat to reply to."
         )
 
     if ready and not pending:

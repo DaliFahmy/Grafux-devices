@@ -413,6 +413,8 @@ async def run_local_agent_loop(
     base_kwargs: Dict[str, Any],
     spec: ClawSpec,
     connector_servers: Optional[List[Dict[str, Any]]] = None,
+    native_tool_defs: Optional[List[Dict[str, Any]]] = None,
+    native_dispatch: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Run a tool-use loop against the claw's header-authenticated MCP servers and return
@@ -422,10 +424,13 @@ async def run_local_agent_loop(
     max_tokens, temperature, system, messages).  ``connector_servers`` (the bearer/self-auth
     servers from ``build_mcp_servers``) are passed through on the same call so a claw that
     mixes both connection styles still works; those tools resolve server-side and never
-    surface as local ``tool_use`` blocks.
+    surface as local ``tool_use`` blocks.  ``native_tool_defs`` / ``native_dispatch`` add
+    built-in python-executed tools (e.g. Telegram) alongside the MCP tools.
 
     Raises RuntimeError with a friendly message when the ``mcp`` SDK is not installed.
     """
+    native_tool_defs = native_tool_defs or []
+    native_dispatch = native_dispatch or {}
     try:
         from contextlib import AsyncExitStack
 
@@ -511,6 +516,9 @@ async def run_local_agent_loop(
                     }
                 )
 
+        # Native tools (Telegram, …) are executed in-process — expose them alongside MCP tools.
+        tool_defs.extend(native_tool_defs)
+
         if not tool_defs:
             # Connected and authenticated, but the server(s) advertised no tools — the
             # model would then claim it "has no integration". Surface the real cause.
@@ -552,6 +560,18 @@ async def run_local_agent_loop(
             messages.append({"role": "assistant", "content": last_message.content})
             tool_results: List[Dict[str, Any]] = []
             for tu in tool_uses:
+                # Native (in-process) tools take priority over MCP dispatch.
+                native_fn = native_dispatch.get(tu.name)
+                if native_fn is not None:
+                    try:
+                        out = await native_fn(tu.input or {})
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "content": out or "(no output)"})
+                    except Exception as exc:  # noqa: BLE001 — report the failure to the model
+                        logger.warning("native tool %s failed: %s", tu.name, exc)
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                             "is_error": True, "content": f"{tu.name} failed: {exc}"})
+                    continue
                 session_real = dispatch.get(tu.name)
                 if session_real is None:
                     tool_results.append(

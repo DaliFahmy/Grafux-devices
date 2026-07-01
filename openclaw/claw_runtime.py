@@ -26,7 +26,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from . import connections
+from . import connections, native_tools
 from .models import ClawSpec
 
 logger = logging.getLogger("openclaw.runtime")
@@ -200,6 +200,10 @@ def _build_system_prompt(spec: ClawSpec, from_channel: bool = False) -> str:
             "Use the available tools to take real actions (send messages, post, read) "
             "when the task requires it."
         )
+    native_desc = native_tools.describe(spec)
+    if native_desc:
+        # Built-in tools from the claw's own credentials (e.g. a Telegram bot token).
+        parts.append(native_desc)
     if from_channel:
         parts.append(
             "You are replying inside a live chat. Your text response is delivered to the "
@@ -311,6 +315,7 @@ async def run_claw(
     user_turn = _build_user_turn(task, memory, text_message)
     mcp_servers = connections.build_mcp_servers(spec)
     local_conns = connections.local_loop_connections(spec)
+    native_defs, native_dispatch = native_tools.build(spec)
 
     client = _client_for(api_key, AsyncAnthropic)
     request_kwargs: Dict[str, Any] = dict(
@@ -338,9 +343,18 @@ async def run_claw(
             # Header-authenticated servers (e.g. Composio's Connect/Tool-Router URL) can't
             # use Anthropic's connector — we run them via a local MCP client loop that sends
             # the x-consumer-api-key header. Any bearer/self-auth connector servers ride
-            # along on the same calls so a mixed claw still works.
+            # along on the same calls, and native tools (e.g. Telegram) are merged in, so a
+            # mixed claw still works.
             text = await connections.run_local_agent_loop(
-                client, request_kwargs, spec, connector_servers=mcp_servers
+                client, request_kwargs, spec, connector_servers=mcp_servers,
+                native_tool_defs=native_defs, native_dispatch=native_dispatch,
+            )
+            return {"status": "ok", "response": text, "errors": "", **guide}
+        if native_defs:
+            # Built-in tools from the claw's own credentials (Telegram bot token, …). Run a
+            # local tool loop so the claw takes the real action; any connector servers ride along.
+            text = await native_tools.run_native_tool_loop(
+                client, request_kwargs, native_defs, native_dispatch, connector_servers=mcp_servers
             )
             return {"status": "ok", "response": text, "errors": "", **guide}
         if mcp_servers:
@@ -413,9 +427,10 @@ async def stream_claw(
     params = _resolve_model_params(spec)
     mcp_servers = connections.build_mcp_servers(spec)
     local_conns = connections.local_loop_connections(spec)
+    native_defs, _ = native_tools.build(spec)
 
-    # Connection paths aren't token-streamed — run them normally and emit once.
-    if local_conns or mcp_servers:
+    # Connection / native-tool paths aren't token-streamed — run them normally and emit once.
+    if local_conns or mcp_servers or native_defs:
         result = await run_claw(spec, task, memory, text_message, from_channel)
         if result.get("status") == "ok":
             if result.get("response"):
