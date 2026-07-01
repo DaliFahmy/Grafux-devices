@@ -151,7 +151,7 @@ async def get_claw(claw_id: str) -> ClawSummary:
 
 
 @router.post("/{claw_id}/run", response_model=RunResponse)
-async def run_claw(claw_id: str, body: RunRequest) -> RunResponse:
+async def run_claw(claw_id: str, body: RunRequest, request: Request = None) -> RunResponse:
     """
     Run an existing claw against a task.
 
@@ -171,6 +171,12 @@ async def run_claw(claw_id: str, body: RunRequest) -> RunResponse:
             memory = f"{history}\n\n---\n\n{memory}" if memory else history
 
     result = await claw_runtime.run_claw(spec, body.task, memory, body.text_message)
+
+    # Surface the Manage-Connections page URL on the block (via the guidance port) so the user can
+    # open it without hand-building the URL — only when the claw has apps to connect.
+    if request is not None and result.get("guidance") and composio_tools._rest_connections(spec):
+        base = str(request.base_url).rstrip("/")
+        result["guidance"] += f"\n\n🔌 Connect apps for this claw: {base}/claw/{claw_id}/composio"
 
     if sid and body.remember and result.get("status") == "ok":
         user_turn = (body.text_message or body.task or "").strip()
@@ -358,6 +364,86 @@ async def composio_probe(claw_id: str) -> dict:
             entry["account_error"] = str(exc)
         out["apps"].append(entry)
     return out
+
+
+@router.get("/{claw_id}/composio", response_class=HTMLResponse)
+async def composio_manage(claw_id: str, request: Request) -> str:
+    """
+    Friendly, browser-facing "Manage Connections" page for a claw.
+
+    Lists each app in the claw's ``connections`` port with its live status and a **Connect** button
+    (OAuth apps redirect to sign-in; API-key apps get an input). Backend-only so it reaches the
+    deployed web app without a rebuild — the user just opens this URL.
+    """
+    import html
+    import re
+
+    spec = _require_spec(claw_id)
+    base = str(request.base_url).rstrip("/")
+    key = connections.resolve_composio_key(spec)
+
+    def page(body: str) -> str:
+        return (
+            "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Claw connections</title></head>"
+            "<body style='font-family:system-ui,sans-serif;max-width:680px;margin:32px auto;"
+            "padding:0 16px;color:#1a1a2e'>"
+            f"<h2>🔌 Connect apps — <span style='color:#666'>{html.escape(spec.name or claw_id)}</span></h2>"
+            f"{body}"
+            f"<p style='margin-top:28px;color:#888;font-size:13px'>"
+            f"<a href='{base}/claw/{claw_id}/composio'>Refresh</a> · "
+            f"<a href='{base}/claw/{claw_id}/composio/probe'>raw status (JSON)</a></p>"
+            "</body></html>"
+        )
+
+    if not key:
+        return page(
+            "<p>No Composio key on this claw. Add it to the <b>api_keys</b> port as "
+            "<code>{&quot;composio&quot;: &quot;ck_…&quot;}</code>, click <b>Regenerate</b>, then reopen this page.</p>"
+        )
+
+    conns = composio_tools._rest_connections(spec)
+    if not conns:
+        return page(
+            "<p>No apps in the <b>connections</b> port yet. Set it on the block to e.g. "
+            "<code>[&quot;googlecalendar&quot;, &quot;telegram&quot;]</code>, click <b>Regenerate</b>, "
+            "then reopen this page.</p>"
+        )
+
+    cards = []
+    for conn in conns:
+        app = connections._clean_port(conn.app)
+        if not app or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", app):
+            continue
+        app_esc = html.escape(app)
+        try:
+            tools = await composio_tools._list_actions_for_app(key, app)
+            _uid, account_id = await composio_tools._account_for_app(key, app, conn)
+            connected = bool(account_id)
+            status = ("<span style='color:#2e7d32'>✅ Connected</span>" if connected
+                      else "<span style='color:#b26a00'>Not connected</span>")
+            meta = f"{len(tools)} tools"
+        except Exception as exc:  # noqa: BLE001 — never let one app break the page
+            status = f"<span style='color:#b00'>status error: {html.escape(str(exc)[:120])}</span>"
+            meta = ""
+        action = f"{base}/claw/{claw_id}/composio/connect/{app_esc}"
+        cards.append(
+            "<div style='border:1px solid #e0e0e8;border-radius:10px;padding:14px 16px;margin:12px 0'>"
+            f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+            f"<b style='font-size:16px'>{app_esc}</b><span>{status}</span></div>"
+            f"<div style='color:#888;font-size:13px;margin:2px 0 10px'>{meta}</div>"
+            f"<form method='get' action='{action}' style='display:flex;gap:8px;flex-wrap:wrap'>"
+            "<input name='api_key' placeholder='API key / bot token (leave blank for OAuth apps)' "
+            "style='flex:1;min-width:220px;padding:8px;border:1px solid #ccc;border-radius:6px'>"
+            "<button type='submit' style='padding:8px 18px;border:0;border-radius:6px;"
+            "background:#4340c0;color:#fff;font-weight:600;cursor:pointer'>Connect</button>"
+            "</form></div>"
+        )
+
+    intro = ("<p style='color:#555'>Click <b>Connect</b> next to an app. OAuth apps (Google Calendar, "
+             "Gmail…) send you to a sign-in page; API-key apps (OpenWeatherMap, Telegram…) — paste the "
+             "key/token first. When it shows ✅ Connected, the claw can use that app.</p>")
+    return page(intro + "".join(cards))
 
 
 @router.get("/{claw_id}/composio/connect/{app}")

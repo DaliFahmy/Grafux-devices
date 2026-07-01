@@ -411,6 +411,52 @@ async def test_initiate_connect_returns_redirect(fake_httpx):
     assert cap["json"]["user_id"] == "default"
 
 
+# --- Manage Connections HTML page ------------------------------------------
+
+def _manage_client():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from openclaw import router as claw_router
+    app = FastAPI()
+    app.include_router(claw_router.router)
+    return TestClient(app)
+
+
+def test_composio_manage_page_renders(monkeypatch):
+    from openclaw.registry import registry
+
+    async def fake_tools(key, app):
+        return [{"name": "GOOGLECALENDAR_X", "description": "", "input_schema": {}, "no_auth": False}]
+
+    async def fake_account(key, app, conn):
+        return ("", "")  # not connected yet
+
+    monkeypatch.setattr(composio_tools, "_list_actions_for_app", fake_tools)
+    monkeypatch.setattr(composio_tools, "_account_for_app", fake_account)
+
+    cid = registry.create(ClawSpec(api_keys='{"composio":"ck"}', connections='["googlecalendar"]', name="t"))
+    try:
+        r = _manage_client().get(f"/claw/{cid}/composio")
+        assert r.status_code == 200
+        assert "googlecalendar" in r.text
+        assert "Connect" in r.text
+        assert f"/claw/{cid}/composio/connect/googlecalendar" in r.text
+        assert "Not connected" in r.text
+    finally:
+        registry.delete(cid)
+
+
+def test_composio_manage_page_no_key():
+    from openclaw.registry import registry
+    cid = registry.create(ClawSpec(connections='["googlecalendar"]', name="t"))
+    try:
+        r = _manage_client().get(f"/claw/{cid}/composio")
+        assert r.status_code == 200
+        assert "api_keys" in r.text  # tells the user to add a Composio key
+    finally:
+        registry.delete(cid)
+
+
 async def test_initiate_connect_falls_back_to_initiate(fake_httpx):
     fake_httpx.routes = [
         ("/connected_accounts/link", 404, {"error": "gone"}),
