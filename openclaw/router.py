@@ -312,6 +312,33 @@ async def composio_probe(claw_id: str) -> dict:
         out["hint"] = ("No Composio key found in api_keys/credentials. Add {\"composio\": \"ck_…\"} "
                        "to the api_keys port and Regenerate the block.")
         return out
+
+    # Raw dump of EVERY connected account for this key — reveals why an app is 'connected: false'
+    # (e.g. no accounts at all → wrong key/project, or accounts under an unexpected toolkit/user).
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=20.0) as _c:
+            _r = await _c.get(
+                f"{connections._COMPOSIO_BACKEND}/api/v3/connected_accounts",
+                headers={"x-api-key": key},
+                params={"limit": 50},
+            )
+        out["connected_accounts_http"] = _r.status_code
+        if _r.status_code < 400:
+            out["all_connected_accounts"] = [
+                {
+                    "toolkit": (a.get("toolkit") or {}).get("slug"),
+                    "user_id": a.get("user_id"),
+                    "status": a.get("status"),
+                    "id": a.get("id"),
+                }
+                for a in (_r.json() or {}).get("items", [])
+            ]
+        else:
+            out["connected_accounts_body"] = _r.text[:300]
+    except Exception as exc:  # noqa: BLE001
+        out["connected_accounts_error"] = str(exc)
+
     for conn in composio_tools._rest_connections(spec):
         app = connections._clean_port(conn.app)
         entry: dict = {"app": app}
