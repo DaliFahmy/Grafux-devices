@@ -256,15 +256,15 @@ async def run_claw_stream(claw_id: str, websocket: WebSocket) -> None:
 @router.post("/{claw_id}/config", response_model=ClawSummary)
 async def patch_claw_config(claw_id: str, body: ConfigPatchRequest) -> ClawSummary:
     """
-    Patch the mutable, non-secret config of an existing claw in place.
+    Patch the mutable config of an existing claw in place.
 
-    The block calls this on Run when its config ports changed, so connection /
-    soul / skills / tools_config / agent edits take effect WITHOUT a full
-    Regenerate (which would re-provision and lose the cached claw_id + session).
-    Secret ports (credentials, api_keys) are intentionally not patchable here.
+    The block calls this on Run so edits to its config ports take effect WITHOUT a full
+    Regenerate (which would re-provision and lose the cached claw_id + session).  This now
+    includes the key ports (api_keys, credentials) too — otherwise adding e.g. a Composio key
+    on an already-provisioned claw would have no effect until the user Regenerated (a footgun).
     """
     spec = _require_spec(claw_id)
-    for field in ("soul", "skills", "agent", "tools_config", "connections"):
+    for field in ("soul", "skills", "agent", "tools_config", "connections", "api_keys", "credentials"):
         val = getattr(body, field)
         if val is not None:
             setattr(spec, field, val)

@@ -144,13 +144,12 @@ class RunRequest(BaseModel):
 
 class ConfigPatchRequest(BaseModel):
     """
-    Patch the mutable, NON-secret config of an existing claw in place.
+    Patch the mutable config of an existing claw in place.
 
-    Sent by the block on Run when its config ports changed, so connection / soul /
-    skills / tools_config / agent edits take effect WITHOUT a full Regenerate.
-    Every field is optional; only provided (non-None) fields are applied.  Secret
-    ports (credentials, api_keys) are intentionally absent — those still require
-    Regenerate so they are never silently patched.
+    Sent by the block on Run when its config ports changed, so edits take effect WITHOUT a
+    full Regenerate.  Every field is optional; only provided (non-None) fields are applied.
+    Includes the key ports (api_keys, credentials) so adding e.g. a Composio key to an
+    already-provisioned claw takes effect on the next Run (not only after a Regenerate).
     """
 
     soul: Optional[str] = None
@@ -158,6 +157,8 @@ class ConfigPatchRequest(BaseModel):
     agent: Optional[str] = None
     tools_config: Optional[str] = None
     connections: Optional[str] = None
+    api_keys: Optional[str] = None
+    credentials: Optional[str] = None
 
 
 class ConnectionStatus(BaseModel):
