@@ -288,7 +288,26 @@ async def composio_probe(claw_id: str) -> dict:
     spec = _require_spec(claw_id)
     composio_tools.clear_cache()  # always probe fresh
     key = connections.resolve_composio_key(spec)
-    out: dict = {"composio_key_present": bool(key), "apps": []}
+    raw_conn = connections._clean_port(spec.connections)
+    parsed_apps = [connections._clean_port(c.app) for c in connections.parse_connections(spec)]
+    out: dict = {
+        "claw_id": claw_id,
+        "claw_name": spec.name,
+        "composio_key_present": bool(key),
+        "connections_raw": raw_conn[:500],
+        "parsed_apps": parsed_apps,
+        "apps": [],
+    }
+    if not raw_conn:
+        out["hint"] = ("This claw's 'connections' port is EMPTY on the server. Set it to e.g. "
+                       "[\"weathermap\", \"googlecalendar\", \"telegram\"] and click Regenerate "
+                       "(then re-open this probe with the NEW claw_id from the block).")
+        return out
+    if not parsed_apps:
+        out["hint"] = ("The 'connections' value could not be parsed as JSON. It must be a JSON list "
+                       "of app names, e.g. [\"weathermap\", \"googlecalendar\"] — check for smart "
+                       "quotes or typos.")
+        return out
     if not key:
         out["hint"] = ("No Composio key found in api_keys/credentials. Add {\"composio\": \"ck_…\"} "
                        "to the api_keys port and Regenerate the block.")
