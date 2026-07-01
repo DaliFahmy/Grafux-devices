@@ -318,6 +318,24 @@ async def test_composio_execute_posts_v3(fake_httpx):
     assert "ok done" in out
 
 
+def test_coerce_schema_drops_anthropic_invalid_property_keys():
+    # Composio schemas sometimes carry property keys Anthropic rejects (spaces, >64 chars, etc.).
+    bad = {
+        "type": "object",
+        "properties": {
+            "good_key": {"type": "string"},
+            "bad key with spaces": {"type": "string"},
+            "x" * 80: {"type": "string"},
+            "nested": {"type": "object", "properties": {"also bad!": {"type": "string"}}},
+        },
+        "required": ["good_key", "bad key with spaces"],
+    }
+    out = composio_tools._coerce_schema(bad)
+    assert set(out["properties"].keys()) == {"good_key", "nested"}
+    assert out["required"] == ["good_key"]                       # pruned to surviving keys
+    assert out["properties"]["nested"]["properties"] == {}       # nested bad key dropped
+
+
 async def test_composio_execute_raises_on_error(fake_httpx):
     fake_httpx.status = 400
     fake_httpx.payload = {"error": "bad key"}

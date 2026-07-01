@@ -21,6 +21,7 @@ it is absent.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from . import connections
@@ -69,9 +70,9 @@ def clear_cache() -> None:
 # ---------------------------------------------------------------------------
 
 def _sanitize_tool_name(name: str) -> str:
-    """Coerce a Composio action name into Anthropic's ``^[a-zA-Z0-9_-]{1,128}$`` constraint."""
+    """Coerce a Composio action name into Anthropic's ``^[a-zA-Z0-9_-]{1,64}$`` constraint."""
     cleaned = "".join(ch if (ch.isalnum() or ch in "_-") else "_" for ch in (name or ""))
-    return (cleaned.strip("_") or "action")[:128]
+    return (cleaned.strip("_") or "action")[:64]
 
 
 def _strip_account(schema: Any) -> Dict[str, Any]:
@@ -107,9 +108,38 @@ def _curated_actions(app: str) -> List[Dict[str, Any]]:
     ]
 
 
+# Anthropic requires every JSON-schema property KEY to match this pattern; Composio schemas
+# sometimes carry keys that violate it, which 400s the whole Messages call. We drop such keys.
+_PROP_KEY_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,64}$")
+
+
+def _sanitize_schema(node: Any) -> Any:
+    """Recursively drop object-property keys Anthropic rejects (and prune them from ``required``)."""
+    if isinstance(node, dict):
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            if k == "properties" and isinstance(v, dict):
+                out[k] = {
+                    str(pk): _sanitize_schema(pv)
+                    for pk, pv in v.items()
+                    if _PROP_KEY_RE.match(str(pk))
+                }
+            else:
+                out[k] = _sanitize_schema(v)
+        req, props = out.get("required"), out.get("properties")
+        if isinstance(req, list) and isinstance(props, dict):
+            out["required"] = [r for r in req if r in props]
+        return out
+    if isinstance(node, list):
+        return [_sanitize_schema(i) for i in node]
+    return node
+
+
 def _coerce_schema(schema: Any) -> Dict[str, Any]:
-    """Ensure an action's input schema is a valid Anthropic object schema."""
-    s = _strip_account(schema)
+    """Ensure an action's input schema is a valid Anthropic object schema (keys sanitized)."""
+    s = _sanitize_schema(_strip_account(schema))
+    if not isinstance(s, dict):
+        return {"type": "object", "properties": {}}
     if not s.get("type"):
         s = dict(s, type="object")
     if "properties" not in s:
@@ -150,6 +180,11 @@ async def _list_actions_for_app(key: str, app: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for it in items:
         if it.get("is_deprecated"):
+            continue
+        # Keep only tools that actually belong to the requested toolkit — a wrong/misspelled slug
+        # can make Composio return unrelated tools (e.g. 1Password for "googlecalender").
+        tk = str((it.get("toolkit") or {}).get("slug") or "").lower()
+        if tk and tk != app.lower():
             continue
         slug = str(it.get("slug") or "").strip()
         if not slug:
