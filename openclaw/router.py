@@ -276,6 +276,43 @@ async def patch_claw_config(claw_id: str, body: ConfigPatchRequest) -> ClawSumma
     return _summarize(claw_id, spec)
 
 
+@router.get("/{claw_id}/composio/probe")
+async def composio_probe(claw_id: str) -> dict:
+    """
+    Diagnostic (LLM-free): report exactly what Composio returns for this claw's apps.
+
+    For each app in the claw's connections it runs the real v3 tools-list + connected-account
+    lookup with the claw's Composio key and returns counts / sample tool names / connection status /
+    any error.  Open ``/claw/<id>/composio/probe`` in a browser to see why tools do or don't load.
+    """
+    spec = _require_spec(claw_id)
+    composio_tools.clear_cache()  # always probe fresh
+    key = connections.resolve_composio_key(spec)
+    out: dict = {"composio_key_present": bool(key), "apps": []}
+    if not key:
+        out["hint"] = ("No Composio key found in api_keys/credentials. Add {\"composio\": \"ck_…\"} "
+                       "to the api_keys port and Regenerate the block.")
+        return out
+    for conn in composio_tools._rest_connections(spec):
+        app = connections._clean_port(conn.app)
+        entry: dict = {"app": app}
+        try:
+            actions = await composio_tools._list_actions_for_app(key, app)
+            entry["tool_count"] = len(actions)
+            entry["sample_tools"] = [a["name"] for a in actions[:5]]
+        except Exception as exc:  # noqa: BLE001
+            entry["list_error"] = str(exc)
+        try:
+            user_id, account_id = await composio_tools._account_for_app(key, app, conn)
+            entry["connected"] = bool(account_id)
+            entry["connected_user_id"] = user_id
+            entry["connected_account_id"] = account_id
+        except Exception as exc:  # noqa: BLE001
+            entry["account_error"] = str(exc)
+        out["apps"].append(entry)
+    return out
+
+
 @router.delete("/{claw_id}/session/{session_id}")
 async def clear_claw_session(claw_id: str, session_id: str) -> dict:
     """Drop a block conversation's transcript (the "reset chat" action)."""

@@ -127,21 +127,26 @@ async def _list_actions_for_app(key: str, app: str) -> List[Dict[str, Any]]:
     """
     import httpx
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.get(
-                f"{connections._COMPOSIO_BACKEND}/api/v3/tools",
-                headers={"x-api-key": key},
-                params={"toolkit_slug": app, "limit": _MAX_DISCOVERED},
-            )
-        if resp.status_code >= 400:
-            logger.warning("composio: v3 tools list for %s → HTTP %s: %s",
-                           app, resp.status_code, resp.text[:200])
-            return []
-        items = (resp.json() or {}).get("items", [])
-    except Exception as exc:  # noqa: BLE001 — discovery is best-effort
-        logger.warning("composio: v3 tools list for %s failed: %s", app, exc)
-        return []
+    # Composio's filter param name varies (toolkit_slug vs toolkit_slugs) — try both.
+    items: List[Dict[str, Any]] = []
+    for pkey in ("toolkit_slug", "toolkit_slugs"):
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(
+                    f"{connections._COMPOSIO_BACKEND}/api/v3/tools",
+                    headers={"x-api-key": key},
+                    params={pkey: app, "limit": _MAX_DISCOVERED},
+                )
+            if resp.status_code >= 400:
+                logger.warning("composio: v3 tools list for %s (%s) → HTTP %s: %s",
+                               app, pkey, resp.status_code, resp.text[:200])
+                continue
+            items = (resp.json() or {}).get("items", []) or []
+        except Exception as exc:  # noqa: BLE001 — discovery is best-effort
+            logger.warning("composio: v3 tools list for %s (%s) failed: %s", app, pkey, exc)
+            continue
+        if items:
+            break
     out: List[Dict[str, Any]] = []
     for it in items:
         if it.get("is_deprecated"):
