@@ -281,25 +281,27 @@ async def _actions_for_app(key: str, app: str) -> List[Dict[str, Any]]:
     return merged
 
 
-async def _account_for_app(key: str, app: str, conn: Optional[ClawConnection]) -> Tuple[str, str]:
+async def _account_for_app(
+    key: str, app: str, conn: Optional[ClawConnection], identity: str = "default"
+) -> Tuple[str, str]:
     """
-    Resolve ``(user_id, connected_account_id)`` for an app via v3 connected accounts.
+    Resolve ``(user_id, connected_account_id)`` for an app via v3 connected accounts, **scoped to
+    the given ``identity``** (the claw's owner / Composio user_id) so one Grafux user cannot see
+    another's accounts under the shared Composio key.
 
-    v3 tools are scoped to a user_id, so we look up the account connected for this toolkit and
-    return the user it belongs to (plus its id).  Prefers an ACTIVE account.  Cached per (key, app).
-    Returns ``("", "")`` when none — execution then reports a clear "connect the app" error.
+    Prefers an ACTIVE account.  Cached per ``(key, identity, app)``.  Returns ``(identity, "")`` when
+    none for this identity — execution then reports a clear "connect the app" error.
     """
     app = await resolve_toolkit_slug(key, app)  # forgive typos (googlesheet → googlesheets)
-    ck = (key, app.lower())
+    ck = (key, identity, app.lower())
     if ck in _ACCOUNT_CACHE:
         return _ACCOUNT_CACHE[ck]
 
     import httpx
 
-    explicit = connections._clean_port(conn.connection_id) if conn is not None else ""
-    user_id, account_id = "", explicit
-    for params in ({"toolkit_slugs": app, "statuses": "ACTIVE", "limit": 10},
-                   {"toolkit_slugs": app, "limit": 10}):
+    account_id = ""
+    for params in ({"toolkit_slugs": app, "user_ids": identity, "statuses": "ACTIVE", "limit": 10},
+                   {"toolkit_slugs": app, "user_ids": identity, "limit": 10}):
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 resp = await client.get(
@@ -315,35 +317,47 @@ async def _account_for_app(key: str, app: str, conn: Optional[ClawConnection]) -
             continue
         for it in items:
             tk = str((it.get("toolkit") or {}).get("slug") or "").lower()
-            if tk and tk != app.lower():
-                continue
             uid, aid = str(it.get("user_id") or ""), str(it.get("id") or "")
+            # Belt-and-braces: only accept an account that matches BOTH this toolkit AND this identity
+            # (in case the API ignores a filter param).
+            if (tk and tk != app.lower()) or (uid and uid != identity):
+                continue
             if str(it.get("status", "")).upper() == "ACTIVE":
-                user_id, account_id = uid, aid or account_id
+                account_id = aid or account_id
                 break
-            if not user_id:
-                user_id, account_id = uid, aid or account_id
-        if user_id:
+            if not account_id:
+                account_id = aid
+        if account_id:
             break
 
-    _ACCOUNT_CACHE[ck] = (user_id, account_id)
-    return user_id, account_id
+    result = (identity, account_id)
+    _ACCOUNT_CACHE[ck] = result
+    return result
 
 
-async def list_connected_accounts(key: str) -> List[Dict[str, Any]]:
+def _owner(spec: ClawSpec) -> str:
+    """The claw's Composio user_id scope (its Grafux owner), or ``"default"`` (single-tenant)."""
+    return connections._clean_port(spec.owner) or "default"
+
+
+async def list_connected_accounts(key: str, user_id: str = "") -> List[Dict[str, Any]]:
     """
-    List all Composio connected accounts for ``key`` → ``[{id, toolkit, user_id, status}]``.
+    List Composio connected accounts for ``key`` → ``[{id, toolkit, user_id, status}]``.
 
-    Used by the Manage Connections page + the probe.  Best-effort → ``[]`` on any error.
+    When ``user_id`` is given, only that user's (owner's) accounts are returned — so the Manage
+    Connections page/probe show a Grafux user only their own connections.  Best-effort → ``[]``.
     """
     import httpx
 
+    params: Dict[str, Any] = {"limit": 100}
+    if user_id:
+        params["user_ids"] = user_id
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.get(
                 f"{connections._COMPOSIO_BACKEND}/api/v3/connected_accounts",
                 headers={"x-api-key": key},
-                params={"limit": 100},
+                params=params,
             )
         if resp.status_code >= 400:
             return []
@@ -351,7 +365,7 @@ async def list_connected_accounts(key: str) -> List[Dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("composio: list connected accounts failed: %s", exc)
         return []
-    return [
+    out = [
         {
             "id": str(a.get("id") or ""),
             "toolkit": str((a.get("toolkit") or {}).get("slug") or "").lower(),
@@ -360,6 +374,10 @@ async def list_connected_accounts(key: str) -> List[Dict[str, Any]]:
         }
         for a in items
     ]
+    # Belt-and-braces client-side filter in case the API ignores user_ids.
+    if user_id:
+        out = [a for a in out if a["user_id"] == user_id]
+    return out
 
 
 async def delete_connected_account(key: str, account_id: str) -> bool:
@@ -621,6 +639,7 @@ async def build(spec: ClawSpec) -> Tuple[List[Dict[str, Any]], Dict[str, Callabl
     key = connections.resolve_composio_key(spec)
     if not key:
         return [], {}
+    identity = _owner(spec)  # scope every account lookup + execution to this claw's Grafux owner
     tool_defs: List[Dict[str, Any]] = []
     dispatch: Dict[str, Callable[[Dict[str, Any]], Awaitable[str]]] = {}
     seen: set = set()
@@ -629,7 +648,7 @@ async def build(spec: ClawSpec) -> Tuple[List[Dict[str, Any]], Dict[str, Callabl
         actions = await _actions_for_app(key, app)
         if not actions:
             continue
-        user_id, account_id = await _account_for_app(key, app, conn)
+        user_id, account_id = await _account_for_app(key, app, conn, identity)
         for a in actions:
             name = _sanitize_tool_name(a["name"])
             if name in seen:

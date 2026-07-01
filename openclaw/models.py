@@ -53,6 +53,14 @@ class ClawSpec(BaseModel):
         ),
     )
     name: str = Field("", description="Optional human-friendly name for the claw.")
+    owner: str = Field(
+        "",
+        description=(
+            "Opaque Grafux user/tenant id (the Composio user_id scope). Set by the frontend so each "
+            "Grafux user's Composio connected accounts are isolated within the shared Composio key. "
+            "Empty ⇒ 'default' (single-tenant fallback)."
+        ),
+    )
 
 
 class ClawConnection(BaseModel):
@@ -159,6 +167,7 @@ class ConfigPatchRequest(BaseModel):
     connections: Optional[str] = None
     api_keys: Optional[str] = None
     credentials: Optional[str] = None
+    owner: Optional[str] = None
 
 
 class ConnectionStatus(BaseModel):

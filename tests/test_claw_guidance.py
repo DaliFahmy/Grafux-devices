@@ -203,7 +203,7 @@ async def test_composio_build_telegram_curated(monkeypatch):
     async def no_discovery(key, app):
         return []
 
-    async def fake_account(key, app, conn):
+    async def fake_account(key, app, conn, identity="default"):
         return ("user1", "ca_1")
 
     monkeypatch.setattr(composio_tools, "_list_actions_for_app", no_discovery)
@@ -221,7 +221,7 @@ async def test_composio_build_merges_discovered(monkeypatch):
         return [{"name": "GOOGLESHEETS_GET_SPREADSHEET_INFO", "description": "info",
                  "input_schema": {"type": "object", "properties": {}}, "no_auth": False}]
 
-    async def fake_account(key, app, conn):
+    async def fake_account(key, app, conn, identity="default"):
         return ("", "")   # not connected yet — tools still listed
 
     monkeypatch.setattr(composio_tools, "_list_actions_for_app", discovery)
@@ -495,7 +495,7 @@ def test_composio_manage_page_renders(monkeypatch):
     async def fake_resolve(key, app):
         return app
 
-    async def fake_accounts(key):
+    async def fake_accounts(key, user_id=""):
         return [{"id": "ca_1", "toolkit": "googlecalendar", "user_id": "default", "status": "ACTIVE"}]
 
     monkeypatch.setattr(composio_tools, "_list_actions_for_app", fake_tools)
@@ -525,7 +525,7 @@ def test_composio_manage_page_shows_orphan_and_empty_port_accounts(monkeypatch):
     async def fake_resolve(key, app):
         return app
 
-    async def fake_accounts(key):
+    async def fake_accounts(key, user_id=""):
         return [
             {"id": "ca_sheets", "toolkit": "googlesheets", "user_id": "default", "status": "ACTIVE"},
             {"id": "ca_cal", "toolkit": "googlecalendar", "user_id": "default", "status": "ACTIVE"},
@@ -628,7 +628,7 @@ async def test_run_claw_uses_composio_tool(tool_anthropic, monkeypatch):
     async def no_discovery(key, app):
         return []
 
-    async def fake_account(key, app, conn):
+    async def fake_account(key, app, conn, identity="default"):
         return ("user1", "ca_1")
 
     monkeypatch.setattr(composio_tools, "_execute", fake_execute)
@@ -659,7 +659,7 @@ async def test_run_claw_surfaces_composio_tool_error(tool_anthropic, monkeypatch
     async def no_discovery(key, app):
         return []
 
-    async def fake_account(key, app, conn):
+    async def fake_account(key, app, conn, identity="default"):
         return ("user1", "ca_1")
 
     monkeypatch.setattr(composio_tools, "_execute", failing_execute)
@@ -670,3 +670,103 @@ async def test_run_claw_surfaces_composio_tool_error(tool_anthropic, monkeypatch
     result = await claw_runtime.run_claw(spec, task="send hi")
     assert result["status"] == "error"
     assert "HTTP 401" in result["errors"]
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenancy: connections scoped per Grafux owner (Composio user_id)
+# ---------------------------------------------------------------------------
+
+def test_owner_default_and_value():
+    assert composio_tools._owner(ClawSpec()) == "default"
+    assert composio_tools._owner(ClawSpec(owner="1634473414")) == "1634473414"
+    assert composio_tools._owner(ClawSpec(owner="empty")) == "default"  # placeholder sentinel
+
+
+async def test_account_for_app_scoped_by_identity(fake_httpx, monkeypatch):
+    async def _identity_slug(key, app):
+        return app
+    monkeypatch.setattr(composio_tools, "resolve_toolkit_slug", _identity_slug)
+    fake_httpx.payload = {"items": [
+        {"id": "ca_u1", "toolkit": {"slug": "googlesheets"}, "user_id": "u1", "status": "ACTIVE"},
+        {"id": "ca_u2", "toolkit": {"slug": "googlesheets"}, "user_id": "u2", "status": "ACTIVE"},
+    ]}
+    uid, aid = await composio_tools._account_for_app("ck", "googlesheets", None, "u1")
+    assert (uid, aid) == ("u1", "ca_u1")   # only u1's account, NEVER u2's
+    # the lookup was scoped by user_ids
+    assert any((c.get("params") or {}).get("user_ids") == "u1" for c in fake_httpx.calls)
+
+
+async def test_build_scopes_executor_to_owner(fake_httpx, monkeypatch):
+    captured = {}
+
+    async def fake_account(key, app, conn, identity="default"):
+        captured["identity"] = identity
+        return (identity, "ca_x")
+
+    async def fake_actions(key, app):
+        return [{"name": "GOOGLESHEETS_X", "description": "", "input_schema": {}}]
+
+    async def fake_execute(key, slug, args, user_id, account_id, no_auth=False):
+        captured["exec_user"] = user_id
+        return "ok"
+
+    monkeypatch.setattr(composio_tools, "_account_for_app", fake_account)
+    monkeypatch.setattr(composio_tools, "_actions_for_app", fake_actions)
+    monkeypatch.setattr(composio_tools, "_execute", fake_execute)
+
+    spec = ClawSpec(api_keys='{"composio":"ck"}', connections='["googlesheets"]', owner="u1")
+    _defs, dispatch = await composio_tools.build(spec)
+    assert captured["identity"] == "u1"
+    await dispatch["GOOGLESHEETS_X"]({})
+    assert captured["exec_user"] == "u1"
+
+
+def test_connect_endpoint_uses_owner(monkeypatch):
+    from openclaw.registry import registry
+    captured = {}
+
+    async def fake_auth(key, app):
+        return "ac_1"
+
+    async def fake_initiate(key, auth_config_id, user_id, callback_url, api_key=""):
+        captured["user_id"] = user_id
+        return {"redirect_url": "", "connection_id": "", "status": "", "raw": {}}
+
+    monkeypatch.setattr(composio_tools, "resolve_or_create_auth_config", fake_auth)
+    monkeypatch.setattr(composio_tools, "initiate_connect", fake_initiate)
+
+    cid = registry.create(ClawSpec(api_keys='{"composio":"ck"}', owner="u1", name="t"))
+    try:
+        _manage_client().get(f"/claw/{cid}/composio/connect/googlesheets")
+        assert captured["user_id"] == "u1"   # account created under the claw's owner, not "default"
+    finally:
+        registry.delete(cid)
+
+
+def test_manage_page_scopes_accounts_to_owner(monkeypatch):
+    from openclaw.registry import registry
+    captured = {}
+
+    async def fake_tools(key, app):
+        return [{"name": f"{app.upper()}_X", "input_schema": {}}]
+
+    async def fake_resolve(key, app):
+        return app
+
+    async def fake_accounts(key, user_id=""):
+        captured["user_id"] = user_id
+        # Only this owner's account (the backend filters by user_ids; simulate that).
+        return [{"id": "ca_u1", "toolkit": "googlesheets", "user_id": "u1", "status": "ACTIVE"}]
+
+    monkeypatch.setattr(composio_tools, "_list_actions_for_app", fake_tools)
+    monkeypatch.setattr(composio_tools, "resolve_toolkit_slug", fake_resolve)
+    monkeypatch.setattr(composio_tools, "list_connected_accounts", fake_accounts)
+
+    cid = registry.create(ClawSpec(api_keys='{"composio":"ck"}', connections='["googlesheets"]',
+                                   owner="u1", name="t"))
+    try:
+        r = _manage_client().get(f"/claw/{cid}/composio")
+        assert captured["user_id"] == "u1"   # accounts fetched scoped to the owner
+        assert "ca_u1" in r.text
+    finally:
+        registry.delete(cid)

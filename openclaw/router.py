@@ -271,7 +271,8 @@ async def patch_claw_config(claw_id: str, body: ConfigPatchRequest) -> ClawSumma
     on an already-provisioned claw would have no effect until the user Regenerated (a footgun).
     """
     spec = _require_spec(claw_id)
-    for field in ("soul", "skills", "agent", "tools_config", "connections", "api_keys", "credentials"):
+    for field in ("soul", "skills", "agent", "tools_config", "connections", "api_keys",
+                  "credentials", "owner"):
         val = getattr(body, field)
         if val is not None:
             setattr(spec, field, val)
@@ -320,29 +321,12 @@ async def composio_probe(claw_id: str) -> dict:
                        "to the api_keys port and Regenerate the block.")
         return out
 
-    # Raw dump of EVERY connected account for this key — reveals why an app is 'connected: false'
-    # (e.g. no accounts at all → wrong key/project, or accounts under an unexpected toolkit/user).
+    identity = composio_tools._owner(spec)
+    out["owner"] = identity
+    # Connected accounts scoped to THIS claw's owner (Grafux user) — reveals why an app is
+    # 'connected: false' for this user (e.g. connected under a different user, or none at all).
     try:
-        import httpx
-        async with httpx.AsyncClient(timeout=20.0) as _c:
-            _r = await _c.get(
-                f"{connections._COMPOSIO_BACKEND}/api/v3/connected_accounts",
-                headers={"x-api-key": key},
-                params={"limit": 50},
-            )
-        out["connected_accounts_http"] = _r.status_code
-        if _r.status_code < 400:
-            out["all_connected_accounts"] = [
-                {
-                    "toolkit": (a.get("toolkit") or {}).get("slug"),
-                    "user_id": a.get("user_id"),
-                    "status": a.get("status"),
-                    "id": a.get("id"),
-                }
-                for a in (_r.json() or {}).get("items", [])
-            ]
-        else:
-            out["connected_accounts_body"] = _r.text[:300]
+        out["all_connected_accounts"] = await composio_tools.list_connected_accounts(key, identity)
     except Exception as exc:  # noqa: BLE001
         out["connected_accounts_error"] = str(exc)
 
@@ -362,7 +346,7 @@ async def composio_probe(claw_id: str) -> dict:
         except Exception as exc:  # noqa: BLE001
             entry["list_error"] = str(exc)
         try:
-            user_id, account_id = await composio_tools._account_for_app(key, app, conn)
+            user_id, account_id = await composio_tools._account_for_app(key, app, conn, identity)
             entry["connected"] = bool(account_id)
             entry["connected_user_id"] = user_id
             entry["connected_account_id"] = account_id
@@ -408,7 +392,8 @@ async def composio_manage(claw_id: str, request: Request) -> str:
             "<code>{&quot;composio&quot;: &quot;ck_…&quot;}</code>, click <b>Regenerate</b>, then reopen this page.</p>"
         )
 
-    all_accounts = await composio_tools.list_connected_accounts(key)
+    identity = composio_tools._owner(spec)  # this Grafux user's scope — show only their accounts
+    all_accounts = await composio_tools.list_connected_accounts(key, identity)
 
     async def _card(app_display: str, resolved_slug: str, from_port: bool) -> str:
         """Render one app card: tools list + connected accounts (with Disconnect) + Connect form."""
@@ -522,7 +507,8 @@ async def composio_connect(claw_id: str, app: str, request: Request):
     if not key:
         return {"error": "No Composio key on this claw. Add {\"composio\": \"ck_…\"} to api_keys "
                          "and Regenerate, then retry."}
-    user_id = str(request.query_params.get("user_id") or "default")
+    # Scope the connected account to this claw's Grafux owner so other users can't use it.
+    user_id = composio_tools._owner(spec)
     api_key = str(request.query_params.get("api_key") or "")
     base = str(request.base_url).rstrip("/")
     callback_url = f"{base}/claw/{claw_id}/composio/connected?app={app}"
@@ -760,7 +746,8 @@ async def _process_inbound(claw_id: str, provider: str, payload: dict) -> None:
     connection_id = channel.get("connection_id", "") if isinstance(channel, dict) else ""
     if key:
         try:
-            await connections.send_channel_reply(provider, connection_id, chat_id, reply, key)
+            await connections.send_channel_reply(
+                provider, connection_id, chat_id, reply, key, user_id=composio_tools._owner(spec))
         except Exception as exc:  # noqa: BLE001 — log, never crash the worker
             logger.warning("send reply failed for claw %s: %s", claw_id, exc)
 
