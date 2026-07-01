@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
-from . import connections, native_tools
+from . import connections
 from .models import ClawSpec
 
 
@@ -38,7 +38,6 @@ def analyze(spec: ClawSpec) -> Dict[str, Any]:
     model = claw_runtime._resolve_model_params(spec)["model"]
     model_known = model in claw_runtime.MODEL_CATALOG
     statuses = connections.connection_statuses(spec)
-    telegram_token = native_tools.resolve_telegram_token(spec)
 
     pending = [s for s in statuses if s["needs_auth"]]
     ready = bool(api_key)  # only the Anthropic key blocks a run; the rest are warnings
@@ -48,7 +47,7 @@ def analyze(spec: ClawSpec) -> Dict[str, Any]:
         setup_status = "Needs Anthropic API key"
     elif pending:
         first = pending[0]["app"]
-        setup_status = f"{first}: not connected — open Manage Connections to scan a QR"
+        setup_status = f"{first}: add a Composio key + connect it in Composio"
     elif not soul:
         setup_status = "Ready (tip: give it a persona in 'soul')"
     else:
@@ -83,44 +82,36 @@ def analyze(spec: ClawSpec) -> Dict[str, Any]:
             "`{\"model\": \"claude-opus-4-8\", \"max_tokens\": 4096}`."
         )
 
-    # Connections section
+    # Connections section — apps get real tools via Composio (REST actions).
     if statuses:
-        lines = ["### 🔌 Connected apps"]
+        lines = ["### 🔌 Connected apps (via Composio)"]
         for s in statuses:
             app = s["app"]
             tag = " (inbound channel)" if s["channel"] else ""
             if s["configured"]:
-                lines.append(f"- ✅ **{app}**{tag} — tools ready.")
-            else:
-                hint = "" if composio_key else (
-                    " First add a Composio key to **api_keys** "
-                    "(`{\"composio\": \"ck_…\"}`)."
-                )
                 lines.append(
-                    f"- ⚠️ **{app}**{tag} — not connected yet. Open **Manage Connections…** on "
-                    f"the block, click **Connect**, and scan the QR with your phone to "
-                    f"authorize it.{hint}"
+                    f"- ✅ **{app}**{tag} — Composio tools available. Make sure **{app}** is "
+                    f"connected in your Composio account (dashboard, or **Manage Connections… → "
+                    f"Connect**), then just ask the claw to act on it."
                 )
+            else:
+                lines.append(
+                    f"- ⚠️ **{app}**{tag} — add a Composio key to **api_keys** "
+                    f"(`{{\"composio\": \"ck_…\"}}`), then connect **{app}** in Composio."
+                )
+        lines.append(
+            "\nGet a Composio key at https://app.composio.dev/ . Composio hosts the app "
+            "integrations; the claw calls their actions for you."
+        )
         parts.append("\n".join(lines))
     else:
         parts.append(
             "### 🔌 Connect apps (optional)\n"
-            "Give the claw real tools (send a Telegram message, read Gmail, post to Slack…). "
-            "Either type app names into the **connections** port — e.g. "
-            "`[\"whatsapp\", \"telegram\"]` — or open **Manage Connections…** on the block to "
-            "pick apps and scan a QR to authorize them. "
-            f"Available: {', '.join(connections.APP_CATALOG.keys())}."
-        )
-
-    # Native tools from the claw's own credentials (no Composio needed).
-    if telegram_token:
-        parts.append(
-            "### 📨 Telegram bot — connected\n"
-            "A bot token is set, so the claw can send Telegram messages directly (no Composio "
-            "needed). Ask it to *\"send a Telegram message\"* — it will call **telegram_list_chats** "
-            "to find a chat_id (a bot can only message people who have messaged it first), then "
-            "**telegram_send_message**. Tip: open your bot in Telegram and send it any message so "
-            "it has a chat to reply to."
+            "Give the claw real tools (send a Telegram message, read Gmail, post to Slack…) via "
+            "**Composio**. 1) Add a Composio key to **api_keys** (`{\"composio\": \"ck_…\"}`). "
+            "2) Connect the app in your Composio account. 3) Type app names into the "
+            "**connections** port — e.g. `[\"telegram\", \"slack\"]` — or use **Manage "
+            f"Connections…**. Available: {', '.join(connections.APP_CATALOG.keys())}."
         )
 
     if ready and not pending:

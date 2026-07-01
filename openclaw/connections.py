@@ -34,11 +34,6 @@ logger = logging.getLogger("openclaw.connections")
 # Composio endpoints (kept identical to the Grafux-mcp integration).
 _COMPOSIO_BACKEND = "https://backend.composio.dev"
 
-# Composio's Tool-Router MCP URL — a single header-authenticated endpoint that exposes the
-# user's enabled toolkits.  Used by the one-click ``tool_router`` connection so a user can get
-# an app's tools without pasting an MCP server URL (driven by the local loop, x-consumer-api-key).
-TOOL_ROUTER_URL = "https://connect.composio.dev/mcp"
-
 # Anthropic beta flag that enables the remote-MCP connector on the Messages API.
 # (mcp-client-2025-04-04 is deprecated; 2025-11-20 requires a matching mcp_toolset
 # entry in the tools array for every server — see claw_runtime.run_claw.)
@@ -154,32 +149,10 @@ def parse_connections(spec: ClawSpec) -> List[ClawConnection]:
             out.append(ClawConnection(**item))
         except Exception as exc:  # noqa: BLE001 — skip malformed entries, keep the rest
             logger.warning("connections: skipping malformed entry %r (%s)", item, exc)
-    _apply_tool_router(out, spec)
+    # Note: app-name connections are given real tools via Composio REST (see composio_tools.py),
+    # NOT by synthesising a Tool-Router MCP URL here (that URL returns no tools unless the toolkit
+    # is enabled server-side). Only connections with an explicit mcp_url/headers use the MCP path.
     return out
-
-
-def _apply_tool_router(conns: List[ClawConnection], spec: ClawSpec) -> None:
-    """
-    Resolve ``tool_router`` connections to Composio's Tool-Router MCP URL in place.
-
-    A connection with ``tool_router: true`` and no explicit ``mcp_url`` is pointed at
-    ``TOOL_ROUTER_URL`` with header auth (``x-consumer-api-key`` from the claw's resolved
-    Composio key), so the local MCP loop exposes the app's tools without the user pasting a
-    server URL.  No-op when the connection already has a url, or when no Composio key is
-    resolvable (guidance then tells the user to add one).
-    """
-    key = None
-    for conn in conns:
-        if not conn.tool_router or _clean_port(conn.mcp_url):
-            continue
-        if key is None:
-            key = resolve_composio_key(spec) or ""
-        if not key:
-            continue
-        conn.mcp_url = TOOL_ROUTER_URL
-        conn.header_auth = True
-        if not _clean_port(conn.api_key):
-            conn.api_key = key
 
 
 def _connections_from_mcp_servers(servers: Dict[str, Any]) -> List[ClawConnection]:
@@ -296,12 +269,15 @@ def connection_statuses(spec: ClawSpec) -> List[Dict[str, Any]]:
     tool_router with a resolvable Composio key).  ``needs_auth`` = the user still has to
     connect/authorize the account (no mcp_url and no usable tool-router fallback).
     """
+    has_key = bool(resolve_composio_key(spec))
     out: List[Dict[str, Any]] = []
     for conn in parse_connections(spec):
         app = _clean_port(conn.app)
         if not app:
             continue
-        configured = bool(_mcp_url_for(conn))  # tool_router was already resolved to a url
+        # An app has tools when it carries an explicit MCP url, OR (the common case) a Composio
+        # key is set — then its actions are available via Composio REST (composio_tools.py).
+        configured = bool(_mcp_url_for(conn)) or has_key
         out.append(
             {
                 "app": app,
@@ -413,8 +389,8 @@ async def run_local_agent_loop(
     base_kwargs: Dict[str, Any],
     spec: ClawSpec,
     connector_servers: Optional[List[Dict[str, Any]]] = None,
-    native_tool_defs: Optional[List[Dict[str, Any]]] = None,
-    native_dispatch: Optional[Dict[str, Any]] = None,
+    extra_tool_defs: Optional[List[Dict[str, Any]]] = None,
+    extra_dispatch: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Run a tool-use loop against the claw's header-authenticated MCP servers and return
@@ -424,13 +400,13 @@ async def run_local_agent_loop(
     max_tokens, temperature, system, messages).  ``connector_servers`` (the bearer/self-auth
     servers from ``build_mcp_servers``) are passed through on the same call so a claw that
     mixes both connection styles still works; those tools resolve server-side and never
-    surface as local ``tool_use`` blocks.  ``native_tool_defs`` / ``native_dispatch`` add
-    built-in python-executed tools (e.g. Telegram) alongside the MCP tools.
+    surface as local ``tool_use`` blocks.  ``extra_tool_defs`` / ``extra_dispatch`` add
+    python-executed tools (e.g. Composio REST actions) alongside the MCP tools.
 
     Raises RuntimeError with a friendly message when the ``mcp`` SDK is not installed.
     """
-    native_tool_defs = native_tool_defs or []
-    native_dispatch = native_dispatch or {}
+    extra_tool_defs = extra_tool_defs or []
+    extra_dispatch = extra_dispatch or {}
     try:
         from contextlib import AsyncExitStack
 
@@ -516,8 +492,8 @@ async def run_local_agent_loop(
                     }
                 )
 
-        # Native tools (Telegram, …) are executed in-process — expose them alongside MCP tools.
-        tool_defs.extend(native_tool_defs)
+        # Extra python-executed tools (Composio REST actions, …) — expose them alongside MCP tools.
+        tool_defs.extend(extra_tool_defs)
 
         if not tool_defs:
             # Connected and authenticated, but the server(s) advertised no tools — the
@@ -560,15 +536,15 @@ async def run_local_agent_loop(
             messages.append({"role": "assistant", "content": last_message.content})
             tool_results: List[Dict[str, Any]] = []
             for tu in tool_uses:
-                # Native (in-process) tools take priority over MCP dispatch.
-                native_fn = native_dispatch.get(tu.name)
-                if native_fn is not None:
+                # Extra (in-process) tools take priority over MCP dispatch.
+                extra_fn = extra_dispatch.get(tu.name)
+                if extra_fn is not None:
                     try:
-                        out = await native_fn(tu.input or {})
+                        out = await extra_fn(tu.input or {})
                         tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
                                              "content": out or "(no output)"})
                     except Exception as exc:  # noqa: BLE001 — report the failure to the model
-                        logger.warning("native tool %s failed: %s", tu.name, exc)
+                        logger.warning("extra tool %s failed: %s", tu.name, exc)
                         tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
                                              "is_error": True, "content": f"{tu.name} failed: {exc}"})
                     continue

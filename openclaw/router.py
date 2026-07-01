@@ -31,7 +31,7 @@ import logging
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, WebSocket, WebSocketDisconnect
 
-from . import claw_runtime, connections, guidance, qr
+from . import claw_runtime, composio_tools, connections, guidance, qr
 from .models import (
     ClawModel,
     ClawModelsResponse,
@@ -268,9 +268,10 @@ async def patch_claw_config(claw_id: str, body: ConfigPatchRequest) -> ClawSumma
         val = getattr(body, field)
         if val is not None:
             setattr(spec, field, val)
-    # A connections change can alter the MCP tool set — drop the cached schemas so the next
-    # run re-discovers them (cheap; the cache also keys on url+headers, this is belt-and-braces).
+    # A connections change can alter the tool set — drop the cached MCP schemas and Composio
+    # action/account lookups so the next run re-discovers them.
     connections.clear_tool_cache()
+    composio_tools.clear_cache()
     registry.save(claw_id)  # flush to disk when persistence is enabled
     return _summarize(claw_id, spec)
 

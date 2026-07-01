@@ -110,11 +110,9 @@ class ClawConnection(BaseModel):
     tool_router: bool = Field(
         False,
         description=(
-            "One-click 'use Composio's Tool-Router for this app's tools'. When True and no "
-            "explicit mcp_url is set, the claw resolves the connection to Composio's Tool-Router "
-            "MCP URL (https://connect.composio.dev/mcp) with header auth (x-consumer-api-key from "
-            "the resolved Composio key) so the local MCP loop exposes the app's tools — no need to "
-            "paste an MCP server URL. The toolkit must be enabled for the user_id on Composio."
+            "Deprecated / back-compat hint. The claw now gives every enabled app-name connection "
+            "real tools via Composio REST actions (see composio_tools.py) whenever a Composio key "
+            "is set, so this flag is no longer required and is treated as a no-op."
         ),
     )
 

@@ -12,12 +12,8 @@ import types
 
 import pytest
 
-from openclaw import claw_runtime, connections, guidance, native_tools, qr
-from openclaw.connections import TOOL_ROUTER_URL
+from openclaw import claw_runtime, connections, guidance, qr
 from openclaw.models import ClawSpec
-
-# A syntactically-valid BotFather token (35-char secret) for the native Telegram tests.
-_TG_TOKEN = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZ012345678"
 
 
 def _spec(**kw) -> ClawSpec:
@@ -60,7 +56,7 @@ def test_guidance_app_without_composio_key_needs_auth():
     assert statuses[0]["configured"] is False
     # setup_status flags the pending connection
     assert "whatsapp" in report["setup_status"].lower()
-    assert "Manage Connections" in report["guidance"]
+    assert "Composio" in report["guidance"]
 
 
 def test_guidance_no_connections_offers_apps():
@@ -86,26 +82,17 @@ def test_parse_app_only_dict():
     assert len(conns) == 1 and conns[0].app == "slack" and conns[0].enabled is True
 
 
-def test_tool_router_resolves_with_composio_key():
+def test_app_name_connection_is_not_synthesised_to_mcp_url():
+    # App-name connections now get tools via Composio REST, NOT a synthesised Tool-Router MCP URL.
     spec = _spec(
         api_keys='{"composio": "ck_test"}',
         connections='[{"app": "telegram", "tool_router": true}]',
     )
     conns = connections.parse_connections(spec)
-    assert conns[0].mcp_url == TOOL_ROUTER_URL
-    assert conns[0].header_auth is True
-    assert conns[0].api_key == "ck_test"
-    # Header-auth ⇒ driven by the local loop, excluded from the bearer connector.
-    assert connections.build_mcp_servers(spec) == []
-    assert connections.local_loop_connections(spec)  # non-empty
-
-
-def test_tool_router_noop_without_composio_key():
-    spec = _spec(connections='[{"app": "telegram", "tool_router": true}]')
-    conns = connections.parse_connections(spec)
-    # No key to authenticate with ⇒ left unresolved (guidance tells the user to add one).
-    assert conns[0].mcp_url == ""
+    assert conns[0].mcp_url == ""          # no MCP-URL synthesis anymore
     assert conns[0].header_auth is False
+    assert connections.build_mcp_servers(spec) == []
+    assert connections.local_loop_connections(spec) == []  # not an MCP-path connection
 
 
 def test_legacy_mcpservers_shape_still_parses():
@@ -193,37 +180,109 @@ async def test_run_result_always_carries_guidance_fields(stub_anthropic):
 
 
 # ---------------------------------------------------------------------------
-# Native Telegram tool — bot token in credentials/api_keys gives real send tools
+# Composio REST tools — a connected app gives the claw real tools (no MCP URL)
 # ---------------------------------------------------------------------------
 
-def test_resolve_telegram_token_bare_credentials():
-    # The common case: the user pastes the BotFather token straight into credentials.
-    assert native_tools.resolve_telegram_token(ClawSpec(credentials=_TG_TOKEN)) == _TG_TOKEN
+from openclaw import composio_tools  # noqa: E402
 
 
-def test_resolve_telegram_token_json_api_keys():
-    spec = ClawSpec(api_keys='{"telegram_bot_token": "%s"}' % _TG_TOKEN)
-    assert native_tools.resolve_telegram_token(spec) == _TG_TOKEN
+@pytest.fixture(autouse=True)
+def _clear_composio_cache():
+    composio_tools.clear_cache()
+    yield
+    composio_tools.clear_cache()
 
 
-def test_resolve_telegram_token_none():
-    assert native_tools.resolve_telegram_token(ClawSpec(credentials="just some notes")) == ""
+async def test_composio_build_empty_without_key():
+    # No Composio key ⇒ no REST tools (byte-identical to before).
+    assert await composio_tools.build(ClawSpec(connections='["telegram"]')) == ([], {})
 
 
-def test_build_native_tools():
-    defs, dispatch = native_tools.build(ClawSpec(credentials=_TG_TOKEN))
-    assert {d["name"] for d in defs} == {"telegram_send_message", "telegram_list_chats"}
-    assert set(dispatch.keys()) == {"telegram_send_message", "telegram_list_chats"}
-    # No token ⇒ no native tools (byte-identical to before).
-    assert native_tools.build(ClawSpec()) == ([], {})
+async def test_composio_build_telegram_curated(monkeypatch):
+    # Auto-discovery returns nothing → the curated TELEGRAM_SEND_MESSAGE is still present.
+    async def no_discovery(key, app):
+        return []
+
+    async def fake_accounts(key):
+        return [{"app": "telegram", "connection_id": "ca_1", "status": "ACTIVE", "account_label": ""}]
+
+    monkeypatch.setattr(composio_tools, "_list_actions_for_app", no_discovery)
+    monkeypatch.setattr(connections, "list_connections", fake_accounts)
+
+    spec = ClawSpec(api_keys='{"composio": "ck_test"}', connections='["telegram"]')
+    tool_defs, dispatch = await composio_tools.build(spec)
+    assert any(d["name"] == "TELEGRAM_SEND_MESSAGE" for d in tool_defs)
+    assert "TELEGRAM_SEND_MESSAGE" in dispatch
+    assert composio_tools.has_rest_tools(spec) is True
 
 
-def test_guidance_reports_connected_telegram_bot():
-    g = guidance.analyze(ClawSpec(api_keys="sk-ant", credentials=_TG_TOKEN, soul="hi"))
-    assert "Telegram bot" in g["guidance"]
+async def test_composio_build_merges_discovered(monkeypatch):
+    async def discovery(key, app):
+        return [{"name": "TELEGRAM_GET_ME", "description": "who am I", "input_schema": {"type": "object", "properties": {}}}]
+
+    async def fake_accounts(key):
+        return []
+
+    monkeypatch.setattr(composio_tools, "_list_actions_for_app", discovery)
+    monkeypatch.setattr(connections, "list_connections", fake_accounts)
+    tool_defs, _ = await composio_tools.build(
+        ClawSpec(api_keys='{"composio": "ck"}', connections='["telegram"]')
+    )
+    names = {d["name"] for d in tool_defs}
+    assert "TELEGRAM_SEND_MESSAGE" in names   # curated
+    assert "TELEGRAM_GET_ME" in names         # discovered
 
 
-# Fake Anthropic client that drives one tool call then finishes — exercises the native loop.
+# --- REST execute shape (fake httpx) ---------------------------------------
+
+class _FakeResp:
+    def __init__(self, status=200, payload=None):
+        self.status_code, self._payload, self.content = status, payload or {}, b"x"
+        self.text = str(payload)
+
+    def json(self):
+        return self._payload
+
+
+class _FakeAsyncClient:
+    captured: dict = {}
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        _FakeAsyncClient.captured = {"url": url, "headers": headers, "json": json}
+        return _FakeResp(200, {"response": "ok done"})
+
+
+@pytest.fixture
+def fake_httpx(monkeypatch):
+    mod = types.ModuleType("httpx")
+    mod.AsyncClient = _FakeAsyncClient
+    monkeypatch.setitem(sys.modules, "httpx", mod)
+    return _FakeAsyncClient
+
+
+async def test_composio_execute_posts_rest(fake_httpx):
+    out = await composio_tools._execute(
+        "ck_1", "TELEGRAM_SEND_MESSAGE", {"chat_id": "5", "text": "hi"}, "ca_9"
+    )
+    cap = fake_httpx.captured
+    assert cap["url"].endswith("/api/v2/actions/TELEGRAM_SEND_MESSAGE/execute")
+    assert cap["headers"]["x-api-key"] == "ck_1"
+    assert cap["json"]["input"]["connectedAccountId"] == "ca_9"
+    assert cap["json"]["input"]["chat_id"] == "5"
+    assert "ok done" in out
+
+
+# --- run_claw end-to-end via a fake tool-use client ------------------------
+
 class _TU:
     def __init__(self, id, name, inp):
         self.type, self.id, self.name, self.input = "tool_use", id, name, inp
@@ -249,7 +308,7 @@ def tool_anthropic(monkeypatch):
             state["calls"].append(kwargs)
             state["n"] += 1
             if state["n"] == 1:
-                return _M([_TU("t1", "telegram_send_message", {"chat_id": "5", "text": "hi"})], "tool_use")
+                return _M([_TU("t1", "TELEGRAM_SEND_MESSAGE", {"chat_id": "5", "text": "hi"})], "tool_use")
             return _M([_TX("Sent it!")], "end_turn")
 
     class _AsyncAnthropic:
@@ -263,21 +322,32 @@ def tool_anthropic(monkeypatch):
     return state
 
 
-async def test_run_claw_uses_native_telegram_tool(tool_anthropic, monkeypatch):
-    sent = {}
+async def test_run_claw_uses_composio_tool(tool_anthropic, monkeypatch):
+    executed = {}
 
-    async def fake_send(token, chat_id, text):
-        sent.update(token=token, chat_id=chat_id, text=text)
-        return f"Message sent to chat {chat_id}."
+    async def fake_execute(key, action, args, account_id):
+        executed.update(key=key, action=action, args=args, account_id=account_id)
+        return "Message sent."
 
-    monkeypatch.setattr(native_tools, "_telegram_send_message", fake_send)
+    async def no_discovery(key, app):
+        return []
+
+    async def fake_accounts(key):
+        return [{"app": "telegram", "connection_id": "ca_1", "status": "ACTIVE", "account_label": ""}]
+
+    monkeypatch.setattr(composio_tools, "_execute", fake_execute)
+    monkeypatch.setattr(composio_tools, "_list_actions_for_app", no_discovery)
+    monkeypatch.setattr(connections, "list_connections", fake_accounts)
+
     spec = ClawSpec(
-        api_keys='{"anthropic": "sk-ant", "telegram": "%s"}' % _TG_TOKEN,
+        api_keys='{"anthropic": "sk-ant", "composio": "ck_test"}',
+        connections='["telegram"]',
         soul="You message Telegram.",
     )
     result = await claw_runtime.run_claw(spec, task="send hi to my telegram")
     assert result["status"] == "ok"
-    assert result["response"] == "Sent it!"          # final text after the tool ran
-    assert sent == {"token": _TG_TOKEN, "chat_id": "5", "text": "hi"}
-    # The model was actually offered the native tools.
+    assert result["response"] == "Sent it!"
+    assert executed["action"] == "TELEGRAM_SEND_MESSAGE"
+    assert executed["args"] == {"chat_id": "5", "text": "hi"}
+    assert executed["account_id"] == "ca_1"          # resolved from list_connections
     assert any("tools" in c for c in tool_anthropic["calls"])
