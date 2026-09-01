@@ -358,19 +358,29 @@ def get_pod(api_key: str, pod_id: str) -> Dict[str, Any]:
     return resp.json()
 
 
-def terminate_pod(api_key: str, pod_id: str) -> None:
-    """Terminate (delete) a pod, stopping all billing.  Best-effort, never raises."""
+def terminate_pod(api_key: str, pod_id: str) -> bool:
+    """
+    Terminate (delete) a pod, stopping all billing.  Never raises.
+
+    Returns True when the pod is known to be gone (deleted, or already absent).
+    Callers MUST NOT discard their handle on a False return: that is the only
+    record of a pod that is still billing, so dropping it strands the pod until
+    someone notices it in the RunPod console.
+    """
     httpx = _httpx()
     try:
         with httpx.Client(timeout=30.0) as client:
             resp = client.delete(f"{REST_BASE}/pods/{pod_id}", headers=_headers(api_key))
-        if resp.status_code not in (200, 204):
-            logger.warning(
-                "RunPod terminate_pod %s returned %s: %s",
-                pod_id, resp.status_code, resp.text[:200],
-            )
+        if resp.status_code in (200, 204, 404):
+            return True   # 404 = already gone, which is the outcome we wanted
+        logger.warning(
+            "RunPod terminate_pod %s returned %s: %s",
+            pod_id, resp.status_code, resp.text[:200],
+        )
+        return False
     except Exception as exc:  # noqa: BLE001 — teardown must never raise
         logger.warning("RunPod terminate_pod %s error: %s", pod_id, exc)
+        return False
 
 
 def _ssh_endpoint(pod: Dict[str, Any]) -> Optional[Tuple[str, int]]:

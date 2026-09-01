@@ -248,6 +248,31 @@ class EdaRegistry:
             rec.cancel.set()
             return True
 
+    def mark_for_reaping(self, eda_id: str) -> None:
+        """
+        Make a record immediately eligible for the reaper.
+
+        Used when terminating a pod failed: the record is the only handle to
+        something that is still billing, so it must not be dropped — but it also
+        must not sit in the registry untouched. Clearing the job state matters
+        because ``_select_stale`` deliberately skips records with a job in flight;
+        without this a cancelled-but-not-terminated pod would be permanently
+        un-reapable, which is exactly the leak the caller is trying to avoid.
+        """
+        with self._lock:
+            rec = self._records.get(eda_id)
+            if rec is None:
+                return
+            rec.job_started_at = 0.0
+            rec.done = True
+            rec.keep_warm_deadline = 0.0
+            rec.warm_until = 0.0
+            rec.phase = "error"
+            rec.phase_detail = "termination failed; awaiting reaper retry"
+            # Backdate so the next reaper tick picks it up regardless of the
+            # configured idle timeout.
+            rec.last_used = time.monotonic() - 86400
+
     def set_connection(
         self,
         eda_id: str,
@@ -334,15 +359,28 @@ class EdaRegistry:
         since anything touched it — that is the whole point of the check.  An
         OpenROAD route occupies a single SSH call for the better part of an hour;
         reaping on idle time alone would terminate the pod out from under it.
+
+        Eligibility keys off ``pod_id``, not ``is_running``: billing starts when
+        the pod is CREATED, not when its SSH endpoint appears, so a pod that came
+        up without usable networking still costs money and still needs reaping.
+        (``is_running`` additionally requires public_ip/ssh_port, which would make
+        exactly those records — and any record ``mark_for_reaping`` has flagged
+        after a failed termination — permanently un-reapable.)
+
+        Records still being provisioned are skipped: their ``last_used`` is the
+        creation time and a cold image pull can approach the idle timeout, so
+        judging them on idle alone would terminate a pod mid-provision.
         """
         timeout_s = _IDLE_TIMEOUT_MIN * 60
         stale: List[tuple] = []
         with self._lock:
             for eid, rec in list(self._records.items()):
-                if not rec.is_running:
-                    continue
+                if not rec.pod_id:
+                    continue          # nothing provisioned yet, nothing billing
                 if rec.job_in_flight:
                     continue
+                if rec.phase in ("creating", "pulling_image"):
+                    continue          # provisioning in progress
                 if rec.keep_warm_deadline > 0:
                     expired = now > rec.keep_warm_deadline
                 elif timeout_s > 0:

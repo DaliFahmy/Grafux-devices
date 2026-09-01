@@ -132,6 +132,37 @@ def _resolve_runpod_key(spec: EdaSpec) -> Optional[str]:
     return os.environ.get("RUNPOD_API_KEY") or None
 
 
+def _abandoned(eda_id: Optional[str], api_key: str, pod_id: str) -> bool:
+    """
+    True if this provisioning job has been cancelled out from under us.
+
+    ``cancel_eda`` deletes the registry record, which is the only signal a
+    background provisioner gets. Without this check the sequence is:
+
+        registry.create(stub)            # pod_id is still ""
+        ...user presses Stop...
+        cancel_eda -> no pod_id to kill, record deleted
+        create_pod(...)                  # a pod now EXISTS on RunPod
+        set_connection(...)              # silently no-ops on the deleted id
+
+    leaving a pod running that nothing anywhere knows about, billing until
+    someone spots it in the console. Checking after every step that can create or
+    reveal a pod closes that window, and terminating here is the last chance to
+    do so while we still hold the id.
+    """
+    if not eda_id or registry.get(eda_id) is not None:
+        return False
+    if pod_id and api_key:
+        logger.info("eda provisioning cancelled; terminating orphan pod %s", pod_id)
+        if not pod_client.terminate_pod(api_key, pod_id):
+            logger.error(
+                "ORPHANED POD %s — cancelled during provisioning and termination "
+                "failed. It is still billing and is no longer tracked; terminate it "
+                "in the RunPod console.", pod_id,
+            )
+    return True
+
+
 def _describe_exception(exc: BaseException) -> str:
     """Render an exception for the ``errors`` port, unwrapping ExceptionGroups."""
     leaves: List[str] = []
@@ -204,6 +235,11 @@ def provision_eda(spec: EdaSpec, *, eda_id: Optional[str] = None) -> Dict[str, A
                 registry.set_phase(eda_id, "creating", f"placing pod (attempt {attempt})")
             private_pem, public_key = pod_client.generate_keypair()
             pod_id = pod_client.create_pod(api_key, spec, public_key)
+            # A pod now exists. From here every step must re-check that the block
+            # still wants it, or a Stop pressed during the (multi-minute) wait
+            # strands it -- see _abandoned.
+            if _abandoned(eda_id, api_key, pod_id):
+                return _error_create(spec, "Cancelled during provisioning.", eda_id or "", rate)
             if eda_id:
                 registry.set_connection(
                     eda_id, pod_id=pod_id, private_key_pem=private_pem,
@@ -211,6 +247,8 @@ def provision_eda(spec: EdaSpec, *, eda_id: Optional[str] = None) -> Dict[str, A
                 )
                 registry.set_phase(eda_id, "pulling_image", "starting container")
             public_ip, ssh_port = pod_client.wait_until_ready(api_key, pod_id)
+            if _abandoned(eda_id, api_key, pod_id):
+                return _error_create(spec, "Cancelled during provisioning.", eda_id or "", rate)
 
             if eda_id:
                 registry.set_connection(eda_id, public_ip=public_ip, ssh_port=ssh_port)
@@ -513,6 +551,13 @@ def _run_job(eda_id: str, req, kind: str) -> None:
     )
     if _LOCAL_SSH:
         return
+    # Precedence, which is easy to misread: keep-warm WINS over _EPHEMERAL, and
+    # _keep_warm_minutes falls back to EDA_DEFAULT_KEEP_WARM_MIN when neither the
+    # run nor the block asked for a window. So with the shipped config
+    # (EDA_DEFAULT_KEEP_WARM_MIN=15) warm_min is never 0 and EDA_EPHEMERAL has no
+    # effect at all — the pod is held for 15 minutes and then freed by the reaper,
+    # not torn down here. EDA_EPHEMERAL only takes effect when the effective
+    # keep-warm window is 0, i.e. when EDA_DEFAULT_KEEP_WARM_MIN is set to 0.
     if warm_min > 0:
         registry.set_keep_warm(eda_id, warm_min)
     elif _EPHEMERAL:
@@ -639,8 +684,20 @@ def cancel_eda(eda_id: str) -> bool:
     if record is None:
         return False
     registry.request_cancel(eda_id)
+
     if record.pod_id and record.api_key:
-        pod_client.terminate_pod(record.api_key, record.pod_id)
+        if not pod_client.terminate_pod(record.api_key, record.pod_id):
+            # Termination failed and this record is the ONLY handle to a pod that
+            # is still billing. Deleting it here would strand the pod. Instead mark
+            # the record collectable and idle so the reaper retries the kill on its
+            # next tick, and keep it visible in GET /{kind} meanwhile.
+            logger.warning(
+                "eda %s: pod %s did not terminate; keeping the record so the "
+                "reaper retries rather than stranding it", eda_id, record.pod_id,
+            )
+            registry.mark_for_reaping(eda_id)
+            return True
+
     registry.delete(eda_id)
     return True
 

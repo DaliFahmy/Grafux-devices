@@ -106,12 +106,22 @@ services:
       # count in a separate vcpuCount field; pod_client splits this id.
       - key: EDA_DEFAULT_INSTANCE
         value: "cpu3c-8"
-      # Release the pod as soon as a run finishes, so idle cost is $0.
+      # Tear the pod down the instant a run finishes. NOTE this only takes effect
+      # when the effective keep-warm window is 0 — keep-warm wins over it — so with
+      # EDA_DEFAULT_KEEP_WARM_MIN=15 below this flag currently does nothing. Set
+      # that to 0 to get true per-run teardown.
       - key: EDA_EPHEMERAL
         value: "1"
       # Keep-warm is longer than the gpu block's 0: iterating on a floorplan or
-      # re-running a testbench is unusable if every attempt re-pulls a multi-GB
-      # image, and 15 min of a ~$0.12/hr CPU instance is about three cents.
+      # re-running a testbench is unusable if every attempt re-pulls the 5 GB
+      # image, and 15 min of a ~$0.24/hr CPU instance is about six cents.
+      #
+      # COST TRADE-OFF, worth a deliberate decision: this applies to EVERY run,
+      # including a 5-second verilator lint, and each block gets its own pod. A
+      # canvas with 10 EDA blocks run once each leaves 10 pods idling for 15
+      # minutes — about $0.60 of pure idle. Lower it (or set 0 to make
+      # EDA_EPHEMERAL above effective) if runs are mostly one-shot rather than
+      # iterative; raise it if users sit and tune floorplans.
       - key: EDA_DEFAULT_KEEP_WARM_MIN
         value: "15"
       # Backstop for pods provisioned but never run. Longer than the gpu block's

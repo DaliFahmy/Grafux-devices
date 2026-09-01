@@ -76,6 +76,9 @@ def fake_pod(monkeypatch):
 
     def fake_terminate(api_key, pod_id):
         calls["terminate"].append(pod_id)
+        # Mirrors the real signature: callers branch on this to decide whether it
+        # is safe to drop their only handle to the pod.
+        return True
 
     def fake_connect(host, port, key, **kwargs):
         calls["connect"].append((host, port))
@@ -731,6 +734,114 @@ def test_reaper_never_reaps_a_pod_with_a_job_in_flight():
     record.last_used = time.monotonic() - 86400
     assert registry._select_stale(time.monotonic()) == []
     assert registry.get(eda_id) is not None
+
+
+def test_cancel_during_provisioning_does_not_orphan_the_pod(monkeypatch, fake_pod):
+    """
+    The window that strands a pod with no record anywhere.
+
+    provision_eda_async registers a stub whose pod_id is still empty. If Stop
+    lands before create_pod returns, cancel_eda finds nothing to terminate and
+    deletes the record; the provisioner then creates a real pod and its
+    set_connection silently no-ops on the dead id. The pod bills forever, unknown
+    to the registry. The provisioner must notice its record vanished and kill it.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    eda_id = registry.create(EdaRecord(spec=EdaSpec(kind="yosys"), phase="creating"))
+
+    def cancelling_create(api_key, spec, public_key):
+        registry.delete(eda_id)          # the Stop lands here
+        return "pod-orphan"
+
+    monkeypatch.setattr(pod_client, "create_pod", cancelling_create)
+    result = runtime.provision_eda(EdaSpec(kind="yosys"), eda_id=eda_id)
+
+    assert result["status"] == "error"
+    assert "pod-orphan" in fake_pod["terminate"], (
+        "the pod created after cancellation was never terminated")
+
+
+def test_cancel_between_create_and_ready_also_terminates(monkeypatch, fake_pod):
+    """The same window, one step later: cancelled while waiting for the endpoint."""
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    eda_id = registry.create(EdaRecord(spec=EdaSpec(kind="openroad"), phase="creating"))
+
+    def cancelling_wait(api_key, pod_id, **kwargs):
+        registry.delete(eda_id)
+        return ("1.2.3.4", 40022)
+
+    monkeypatch.setattr(pod_client, "wait_until_ready", cancelling_wait)
+    result = runtime.provision_eda(EdaSpec(kind="openroad"), eda_id=eda_id)
+    assert result["status"] == "error"
+    assert fake_pod["terminate"], "pod not terminated after cancellation"
+
+
+def test_cancel_keeps_the_record_when_termination_fails(monkeypatch, fake_pod):
+    """
+    Deleting the record after a FAILED termination strands the pod: that record
+    is the only handle to something still billing.
+    """
+    monkeypatch.setattr(pod_client, "terminate_pod", lambda k, p: False)
+    eda_id = _provisioned("yosys")
+    assert runtime.cancel_eda(eda_id) is True
+    rec = registry.get(eda_id)
+    assert rec is not None, "record dropped despite the pod still running"
+    # ...and it must now be reapable, so the reaper retries the kill.
+    assert not rec.job_in_flight
+    assert [eid for eid, _r in registry._select_stale(time.monotonic())] == [eda_id]
+
+
+def test_terminate_pod_reports_success_and_failure(monkeypatch):
+    """Callers branch on this, so it must not always claim success."""
+    class _Resp:
+        def __init__(self, code): self.status_code, self.text = code, ""
+
+    def module(code):
+        class _C:
+            def __init__(self, **kw): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def delete(self, *a, **kw): return _Resp(code)
+        class _M:
+            Client = staticmethod(lambda **kw: _C())
+        return _M
+
+    monkeypatch.setattr(pod_client, "_httpx", lambda: module(200))
+    assert pod_client.terminate_pod("k", "p") is True
+    monkeypatch.setattr(pod_client, "_httpx", lambda: module(404))
+    assert pod_client.terminate_pod("k", "p") is True   # already gone is success
+    monkeypatch.setattr(pod_client, "_httpx", lambda: module(500))
+    assert pod_client.terminate_pod("k", "p") is False
+
+
+def test_reaper_reaps_a_pod_that_never_got_an_ssh_endpoint(monkeypatch):
+    """
+    Billing starts at pod creation, not at SSH readiness.
+
+    A pod that came up without public-IP networking has a pod_id but no
+    public_ip, so an is_running-gated reaper would never touch it — while RunPod
+    bills for it all the same.
+    """
+    import EDA.registry as registry_mod
+    monkeypatch.setattr(registry_mod, "_IDLE_TIMEOUT_MIN", 10)
+    eda_id = registry.create(EdaRecord(
+        spec=EdaSpec(kind="yosys"), pod_id="pod-no-ip", api_key="k", phase="error"))
+    registry.get(eda_id).last_used = time.monotonic() - 86400
+    assert [eid for eid, _r in registry._select_stale(time.monotonic())] == [eda_id]
+
+
+def test_reaper_never_reaps_a_pod_mid_provision():
+    """
+    A cold image pull can approach the idle timeout, and a provisioning record's
+    last_used is its creation time — so judging it on idle alone would terminate
+    a pod while it is still coming up.
+    """
+    for phase in ("creating", "pulling_image"):
+        eda_id = registry.create(EdaRecord(
+            spec=EdaSpec(kind="openroad"), pod_id="p", api_key="k", phase=phase))
+        registry.get(eda_id).last_used = time.monotonic() - 86400
+        assert registry._select_stale(time.monotonic()) == [], f"reaped during {phase}"
+        registry.delete(eda_id)
 
 
 def test_reaper_does_reap_an_idle_pod(monkeypatch):
