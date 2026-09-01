@@ -92,7 +92,7 @@ services:
       # listening on port 22 and provisioning fails with a misleading
       # "no public-IP networking" error). PIN THE TAG; never track :latest here.
       - key: EDA_DEFAULT_IMAGE
-        value: "ghcr.io/grafux/grafux-eda:sky130-latest"
+        value: "ghcr.io/dalifahmy/grafux-eda:sky130-20260901"
       # Default process design kit / OpenROAD platform. sky130hd is the standard
       # open-source target and what every public ORFS example uses.
       - key: EDA_DEFAULT_PDK
@@ -102,8 +102,10 @@ services:
       # "NVIDIA RTX A4000") only as a fallback if RunPod CPU pods misbehave.
       - key: EDA_COMPUTE_TYPE
         value: "CPU"
+      # <family>-<vcpus>. RunPod takes the family in cpuFlavorIds and the vCPU
+      # count in a separate vcpuCount field; pod_client splits this id.
       - key: EDA_DEFAULT_INSTANCE
-        value: "cpu3c-4-8"
+        value: "cpu3c-8"
       # Release the pod as soon as a run finishes, so idle cost is $0.
       - key: EDA_EPHEMERAL
         value: "1"

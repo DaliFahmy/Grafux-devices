@@ -11,8 +11,13 @@
 # a missing daemon.  These few lines are what prevent that.
 #
 # Build and push (pin the tag; see EDA/models.py DEFAULT_IMAGE):
-#   docker build -t ghcr.io/<org>/grafux-eda:sky130-$(date +%Y%m%d) EDA/docker
-#   docker push  ghcr.io/<org>/grafux-eda:sky130-$(date +%Y%m%d)
+#   docker build -t ghcr.io/dalifahmy/grafux-eda:sky130-20260901 --build-arg ORFS_TAG=26Q3-422-ga7de7c42f EDA/docker
+#   docker push  ghcr.io/dalifahmy/grafux-eda:sky130-20260901
+#
+# The pushed GHCR package must be PUBLIC: RunPod pulls anonymously, and a
+# private package fails the pull silently -- the pod comes up with no image and
+# times out with the same misleading 'no public-IP networking' error as a
+# missing sshd.
 #
 # Verify before shipping a new tag:
 #   docker run --rm <img> bash -lc 'which yosys openroad klayout verilator; ls $FLOW_HOME/platforms'
@@ -25,7 +30,7 @@
 
 # PIN THIS.  An unpinned base changes under you and breaks provisioning silently --
 # the gpu block learned that lesson with CUDA host-driver mismatches.
-ARG ORFS_TAG=latest
+ARG ORFS_TAG=26Q3-422-ga7de7c42f
 FROM openroad/orfs:${ORFS_TAG}
 
 # openssh-server: the transport.  rsync: faster artifact staging than raw SFTP.

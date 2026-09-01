@@ -45,7 +45,7 @@ from pydantic import BaseModel, Field
 # mismatches (see GPU_DEFAULT_IMAGE in ../GPU/models.py).
 DEFAULT_IMAGE = os.environ.get(
     "EDA_DEFAULT_IMAGE",
-    "ghcr.io/grafux/grafux-eda:sky130-latest",
+    "ghcr.io/dalifahmy/grafux-eda:sky130-20260901",
 )
 
 # sky130hd ("high density") is the standard OpenROAD-flow-scripts sky130 variant
@@ -61,7 +61,7 @@ PDK_CHOICES = ["sky130hd", "sky130hs", "asap7", "nangate45", "ihp-sg13g2"]
 # idle GPU.  ``EDA_COMPUTE_TYPE=GPU`` falls back to the gpu block's proven code
 # path (pick a cheap type such as "NVIDIA RTX A4000") if CPU pods prove awkward.
 DEFAULT_COMPUTE_TYPE = os.environ.get("EDA_COMPUTE_TYPE", "CPU").upper()
-DEFAULT_INSTANCE = os.environ.get("EDA_DEFAULT_INSTANCE", "cpu3c-4-8")
+DEFAULT_INSTANCE = os.environ.get("EDA_DEFAULT_INSTANCE", "cpu3c-8")
 
 # The ORFS flow stages, in order.  These are literal ``make`` targets, which is
 # why stage progress here is exact rather than scraped out of a log.

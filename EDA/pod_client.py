@@ -108,27 +108,71 @@ def _is_capacity_error(text: str) -> bool:
     return any(marker in low for marker in _CAPACITY_MARKERS)
 
 
-# Curated RunPod CPU flavors for the creation-dialog dropdown.  ``id`` is what
-# RunPod expects as the CPU instance selector (and what the block stores in its
-# instance_type port).  ``usd_per_hr`` is an *advisory* reference price, not
-# billing-authoritative — the real rate is the live pod costPerHr.
+# RunPod's CPU flavour families, from the REST v1 schema's ``cpuFlavorIds`` enum.
+# The suffix is the family's RAM-per-vCPU ratio: c = compute (2 GB), g = general
+# (4 GB), m = memory (8 GB); the digit is the hardware generation.
+CPU_FLAVOR_FAMILIES = ("cpu3c", "cpu3g", "cpu3m", "cpu5c", "cpu5g", "cpu5m")
+
+# Curated machine list for the creation-dialog dropdown.  ``id`` is
+# ``<family>-<vcpus>`` — a Grafux-side convention, NOT something RunPod accepts:
+# ``create_pod`` splits it into the ``cpuFlavorIds`` family and the separate
+# ``vcpuCount`` field.  Keeping it as one string means the block needs only one
+# port and the dialog only one combo box.
 #
-# VERIFY THESE IDS IN M0 against https://rest.runpod.io/v1/openapi.json before
-# trusting them: RunPod's CPU catalogue is smaller and changes more often than the
-# GPU one, and a wrong id fails the create with a plain 400 rather than a capacity
-# error (so it will NOT be retried).
+# Compute-optimised is the default because synthesis and place-and-route are
+# CPU-bound and not especially memory-hungry at these design sizes.
+# ``usd_per_hr`` is an *advisory* reference price, not billing-authoritative — the
+# real rate is the live pod costPerHr.
 EDA_INSTANCES: List[Dict[str, Any]] = [
-    {"id": "cpu3c-2-4", "label": "Compute 2 vCPU / 4 GB", "usd_per_hr": 0.06},
-    {"id": "cpu3c-4-8", "label": "Compute 4 vCPU / 8 GB", "usd_per_hr": 0.12},
-    {"id": "cpu3c-8-16", "label": "Compute 8 vCPU / 16 GB", "usd_per_hr": 0.24},
-    {"id": "cpu3g-8-32", "label": "General 8 vCPU / 32 GB", "usd_per_hr": 0.33},
-    {"id": "cpu3c-16-32", "label": "Compute 16 vCPU / 32 GB", "usd_per_hr": 0.48},
-    {"id": "cpu3g-16-64", "label": "General 16 vCPU / 64 GB", "usd_per_hr": 0.66},
+    {"id": "cpu3c-4", "label": "Compute 4 vCPU / 8 GB", "usd_per_hr": 0.12},
+    {"id": "cpu3c-8", "label": "Compute 8 vCPU / 16 GB", "usd_per_hr": 0.24},
+    {"id": "cpu3c-16", "label": "Compute 16 vCPU / 32 GB", "usd_per_hr": 0.48},
+    {"id": "cpu3g-8", "label": "General 8 vCPU / 32 GB", "usd_per_hr": 0.33},
+    {"id": "cpu5c-8", "label": "Compute (gen 5) 8 vCPU / 16 GB", "usd_per_hr": 0.28},
+    {"id": "cpu5c-16", "label": "Compute (gen 5) 16 vCPU / 32 GB", "usd_per_hr": 0.56},
 ]
 
 _PRICE_BY_INSTANCE: Dict[str, float] = {
     i["id"]: float(i.get("usd_per_hr", 0.0)) for i in EDA_INSTANCES
 }
+
+# Fallback when the instance id carries no usable vCPU count.  4 is RunPod's
+# smallest useful compute size; their own default of 2 is slow enough for a route
+# to feel broken.
+_DEFAULT_VCPUS = 4
+
+
+def split_instance_type(instance_type: str) -> Tuple[str, int]:
+    """
+    Split a ``<family>-<vcpus>`` dropdown id into RunPod's two separate fields.
+
+    Returns ``(cpuFlavorId, vcpuCount)``.  Tolerant on purpose — the value comes
+    from a user-editable port, and a malformed one should degrade to a working
+    default rather than fail the create:
+
+        "cpu3c-8"  -> ("cpu3c", 8)
+        "cpu3c"    -> ("cpu3c", 4)      # bare family, default size
+        "cpu3c-4-8"-> ("cpu3c", 4)      # the old three-part form still parses
+        ""         -> ("cpu3c", 4)
+    """
+    raw = (instance_type or "").strip().lower()
+    if not raw:
+        return CPU_FLAVOR_FAMILIES[0], _DEFAULT_VCPUS
+    parts = raw.split("-")
+    family = parts[0]
+    if family not in CPU_FLAVOR_FAMILIES:
+        logger.warning(
+            "unknown CPU flavour %r; falling back to %s. Valid families: %s",
+            family, CPU_FLAVOR_FAMILIES[0], ", ".join(CPU_FLAVOR_FAMILIES),
+        )
+        family = CPU_FLAVOR_FAMILIES[0]
+    vcpus = _DEFAULT_VCPUS
+    if len(parts) > 1:
+        try:
+            vcpus = int(parts[1])
+        except ValueError:
+            pass
+    return family, max(1, vcpus)
 
 # Advisory prices for the GPU fallback path (compute_type=GPU), so a cost estimate
 # still appears if a deployment runs EDA on GPU pods.  Only the cheap end is listed
@@ -270,11 +314,14 @@ def create_pod(api_key: str, spec, public_key: str) -> str:
         body["gpuTypeIds"] = [spec.instance_type]
         body["gpuCount"] = 1
     else:
-        # RunPod's CPU pods select a flavor rather than a GPU type.  Both spellings
-        # are sent because the REST v1 schema has used each: an unknown extra field
-        # is ignored, whereas a missing selector fails the create outright.
-        body["instanceIds"] = [spec.instance_type]
-        body["cpuFlavorIds"] = [spec.instance_type]
+        # A CPU pod is selected by FLAVOUR FAMILY plus a separate vCPU count — not
+        # by a compound instance id, and there is no ``instanceIds`` property in
+        # REST v1 at all.  Sending one is not harmlessly ignored: the create fails
+        # with a plain 400, which is not a capacity error, so provision_eda treats
+        # it as fatal and does not even hop machines.
+        flavor, vcpus = split_instance_type(spec.instance_type)
+        body["cpuFlavorIds"] = [flavor]
+        body["vcpuCount"] = vcpus
 
     with httpx.Client(timeout=60.0) as client:
         resp = client.post(f"{REST_BASE}/pods", headers=_headers(api_key), json=body)

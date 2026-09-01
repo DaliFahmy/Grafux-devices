@@ -163,6 +163,173 @@ def fake_flow(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The RunPod create-pod request body
+#
+# These call the REAL ``create_pod`` with only the HTTP layer faked, so the body
+# it builds is actually asserted. The ``fake_pod`` fixture above replaces
+# ``create_pod`` wholesale, which is right for testing orchestration but means it
+# can never catch a malformed request -- and it did not: the first CPU
+# implementation sent a non-existent ``instanceIds`` field and a compound
+# ``cpuFlavorIds`` value, which RunPod rejects with a plain 400.
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    status_code = 201
+    text = ""
+
+    @staticmethod
+    def json():
+        return {"id": "pod-created"}
+
+
+class _FakeHttpxClient:
+    """Captures the POST body instead of sending it."""
+
+    def __init__(self, sink, **kwargs):
+        self._sink = sink
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        self._sink["url"] = url
+        self._sink["headers"] = headers
+        self._sink["body"] = json
+        return _FakeResponse()
+
+
+@pytest.fixture
+def captured_body(monkeypatch):
+    """Run the real create_pod and hand back the JSON body it built."""
+    sink = {}
+
+    class _FakeHttpxModule:
+        @staticmethod
+        def Client(**kwargs):
+            return _FakeHttpxClient(sink, **kwargs)
+
+    monkeypatch.setattr(pod_client, "_httpx", lambda: _FakeHttpxModule)
+    return sink
+
+
+def test_cpu_pod_body_uses_flavor_family_and_vcpu_count(captured_body):
+    """
+    RunPod selects a CPU pod by flavour FAMILY plus a separate vCPU count.
+
+    The dropdown id "cpu3c-8" is a Grafux convention; it must be split, never
+    sent verbatim.
+    """
+    spec = EdaSpec(kind="yosys", compute_type="CPU", instance_type="cpu3c-8")
+    assert pod_client.create_pod("rp_k", spec, "ssh-rsa AAA") == "pod-created"
+    body = captured_body["body"]
+    assert body["computeType"] == "CPU"
+    assert body["cpuFlavorIds"] == ["cpu3c"]
+    assert body["vcpuCount"] == 8
+
+
+def test_cpu_pod_body_never_sends_instance_ids(captured_body):
+    """
+    ``instanceIds`` does not exist in REST v1.
+
+    Sending it is not harmlessly ignored -- the create fails with a 400, which is
+    not a capacity error, so provision_eda treats it as fatal and does not retry.
+    """
+    spec = EdaSpec(compute_type="CPU", instance_type="cpu3c-8")
+    pod_client.create_pod("rp_k", spec, "pk")
+    assert "instanceIds" not in captured_body["body"]
+
+
+def test_cpu_pod_body_carries_the_ssh_contract(captured_body):
+    """Port 22 mapped, a public IP requested, and the key injected for start.sh."""
+    spec = EdaSpec(compute_type="CPU", instance_type="cpu3c-8")
+    pod_client.create_pod("rp_k", spec, "ssh-rsa THEKEY")
+    body = captured_body["body"]
+    assert body["ports"] == ["22/tcp"]
+    assert body["supportPublicIp"] is True
+    assert body["env"]["PUBLIC_KEY"] == "ssh-rsa THEKEY"
+
+
+def test_gpu_fallback_body_is_unchanged(captured_body):
+    """The GPU branch must stay byte-compatible with the gpu block's request."""
+    spec = EdaSpec(compute_type="GPU", instance_type="NVIDIA RTX A4000")
+    pod_client.create_pod("rp_k", spec, "pk")
+    body = captured_body["body"]
+    assert body["computeType"] == "GPU"
+    assert body["gpuTypeIds"] == ["NVIDIA RTX A4000"]
+    assert body["gpuCount"] == 1
+    # The CPU-only fields must not leak into a GPU request.
+    assert "cpuFlavorIds" not in body and "vcpuCount" not in body
+
+
+def test_capacity_errors_are_retryable_but_other_4xx_are_not(monkeypatch):
+    """A bad-request 400 must NOT be mistaken for transient scarcity."""
+    class _Resp:
+        def __init__(self, code, text):
+            self.status_code, self.text = code, text
+
+        def json(self):
+            return {}
+
+    def make_module(code, text):
+        class _C:
+            def __init__(self, **kw): pass
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def post(self, *a, **kw): return _Resp(code, text)
+
+        class _M:
+            Client = staticmethod(lambda **kw: _C())
+        return _M
+
+    spec = EdaSpec(compute_type="CPU", instance_type="cpu3c-8")
+
+    monkeypatch.setattr(pod_client, "_httpx",
+                        lambda: make_module(500, "There are no instances currently available"))
+    with pytest.raises(pod_client.CapacityError):
+        pod_client.create_pod("rp_k", spec, "pk")
+
+    monkeypatch.setattr(pod_client, "_httpx",
+                        lambda: make_module(400, "cpuFlavorIds: invalid value"))
+    with pytest.raises(RuntimeError) as exc:
+        pod_client.create_pod("rp_k", spec, "pk")
+    assert not isinstance(exc.value, pod_client.ProvisionError)
+
+
+# ---------------------------------------------------------------------------
+# split_instance_type
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw, expected", [
+    ("cpu3c-8", ("cpu3c", 8)),
+    ("cpu5g-16", ("cpu5g", 16)),
+    ("CPU3C-4", ("cpu3c", 4)),          # case-insensitive
+    ("cpu3c", ("cpu3c", 4)),            # bare family -> default size
+    ("cpu3c-4-8", ("cpu3c", 4)),        # the old three-part form still parses
+    ("", ("cpu3c", 4)),                 # unset port
+    ("nonsense-8", ("cpu3c", 8)),       # unknown family falls back, size kept
+    ("cpu3c-notanumber", ("cpu3c", 4)),
+])
+def test_split_instance_type(raw, expected):
+    """
+    Tolerant on purpose: the value comes from a user-editable port, so a
+    malformed one should degrade to something that works rather than fail the
+    create with a RunPod 400 the user cannot interpret.
+    """
+    assert pod_client.split_instance_type(raw) == expected
+
+
+def test_every_curated_instance_id_splits_to_a_valid_flavor():
+    """The dropdown must never offer an id RunPod would reject."""
+    for entry in pod_client.list_instances():
+        family, vcpus = pod_client.split_instance_type(entry["id"])
+        assert family in pod_client.CPU_FLAVOR_FAMILIES, entry["id"]
+        assert vcpus >= 1
+
+
+# ---------------------------------------------------------------------------
 # Key resolution
 # ---------------------------------------------------------------------------
 
