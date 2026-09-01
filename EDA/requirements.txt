@@ -1,0 +1,5 @@
+# Extra dependencies for the EDA (chip-design) runtime.  Both are already pulled
+# in by the GPU runtime, so on the standard devices-server deployment this file
+# adds nothing new — it exists so the package can be installed on its own.
+httpx>=0.23        # RunPod REST API
+paramiko>=3.0      # SSH/SFTP to the pod (exec, staging, artifact download)

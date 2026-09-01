@@ -82,3 +82,80 @@ services:
         value: "2097152"
       - key: GPU_ARTIFACT_MAX_TOTAL_BYTES
         value: "8388608"
+      # ---------------------------------------------------------------------
+      # EDA runtime — the verilator / yosys / openroad chip-design blocks.
+      # Shares RUNPOD_API_KEY (declared above) with the gpu block.
+      # ---------------------------------------------------------------------
+      # The EDA container image: OpenROAD-flow-scripts + Verilator + sky130,
+      # plus the openssh-server and PUBLIC_KEY handling that stock openroad/orfs
+      # lacks (see EDA/docker/Dockerfile — without it a pod comes up with nothing
+      # listening on port 22 and provisioning fails with a misleading
+      # "no public-IP networking" error). PIN THE TAG; never track :latest here.
+      - key: EDA_DEFAULT_IMAGE
+        value: "ghcr.io/grafux/grafux-eda:sky130-latest"
+      # Default process design kit / OpenROAD platform. sky130hd is the standard
+      # open-source target and what every public ORFS example uses.
+      - key: EDA_DEFAULT_PDK
+        value: "sky130hd"
+      # EDA tools are CPU-bound — synthesis and place-and-route never touch a GPU —
+      # so rent a CPU instance. Set to GPU (and point EDA_DEFAULT_INSTANCE at e.g.
+      # "NVIDIA RTX A4000") only as a fallback if RunPod CPU pods misbehave.
+      - key: EDA_COMPUTE_TYPE
+        value: "CPU"
+      - key: EDA_DEFAULT_INSTANCE
+        value: "cpu3c-4-8"
+      # Release the pod as soon as a run finishes, so idle cost is $0.
+      - key: EDA_EPHEMERAL
+        value: "1"
+      # Keep-warm is longer than the gpu block's 0: iterating on a floorplan or
+      # re-running a testbench is unusable if every attempt re-pulls a multi-GB
+      # image, and 15 min of a ~$0.12/hr CPU instance is about three cents.
+      - key: EDA_DEFAULT_KEEP_WARM_MIN
+        value: "15"
+      # Backstop for pods provisioned but never run. Longer than the gpu block's
+      # so it never races the keep-warm window above.
+      - key: EDA_IDLE_TIMEOUT_MIN
+        value: "20"
+      # Per-attempt wait for a pod to come up with a public SSH endpoint. Much
+      # larger than the gpu block's 300s: the EDA image carries a full PDK and
+      # toolchain, so a cold-machine pull takes many minutes.
+      - key: EDA_PROVISION_TIMEOUT
+        value: "900"
+      # Terminate and recreate on a no-public-IP placement or transient capacity
+      # shortage, hopping to a different machine.
+      - key: EDA_PROVISION_ATTEMPTS
+        value: "3"
+      # If the port-22 mapping has not appeared this long after placement, the
+      # machine has no public-IP networking — fail fast and hop instead of waiting
+      # out the full provision timeout.
+      - key: EDA_PUBLIC_IP_GRACE
+        value: "180"
+      # Total wall-clock ceiling for one run across all stages. Cost control, not
+      # UX: a stage timeout bounds one stage, this bounds the bill. A pod left
+      # routing over a weekend is real money.
+      - key: EDA_MAX_RUN_MINUTES
+        value: "180"
+      # Per-stage ceilings (seconds). Routing dominates everything else by an
+      # order of magnitude, hence its own budget. Raise for large designs.
+      - key: EDA_STAGE_TIMEOUT_SYNTH
+        value: "900"
+      - key: EDA_STAGE_TIMEOUT_FLOORPLAN
+        value: "600"
+      - key: EDA_STAGE_TIMEOUT_PLACE
+        value: "1800"
+      - key: EDA_STAGE_TIMEOUT_CTS
+        value: "900"
+      - key: EDA_STAGE_TIMEOUT_ROUTE
+        value: "7200"
+      - key: EDA_STAGE_TIMEOUT_FINAL
+        value: "1800"
+      # Artifact caps. Far larger than the gpu block's because a sky130 GDS for
+      # even a small design is several MB. Bytes.
+      - key: EDA_ARTIFACT_MAX_FILE_BYTES
+        value: "33554432"
+      - key: EDA_ARTIFACT_MAX_TOTAL_BYTES
+        value: "67108864"
+      # Above this, a gate-level netlist is not echoed into a port .txt file; it
+      # travels as an artifact instead and the openroad block accepts either form.
+      - key: EDA_NETLIST_INLINE_MAX
+        value: "1048576"
