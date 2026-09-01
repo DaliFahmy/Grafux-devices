@@ -56,7 +56,8 @@ def _clean_registry(monkeypatch):
 @pytest.fixture
 def fake_pod(monkeypatch):
     """Replace the RunPod REST + SSH calls with in-memory fakes."""
-    calls = {"create": [], "terminate": [], "connect": [], "artifacts": []}
+    calls = {"create": [], "terminate": [], "connect": [], "artifacts": [],
+             "clients": []}
 
     def fake_keypair():
         return ("PRIVATE_PEM", "ssh-rsa AAAAFAKE grafux-eda")
@@ -78,7 +79,9 @@ def fake_pod(monkeypatch):
 
     def fake_connect(host, port, key, **kwargs):
         calls["connect"].append((host, port))
-        return _FakeSSH()
+        client = _FakeSSH()
+        calls["clients"].append(client)
+        return client
 
     def fake_download(client, globs):
         calls["artifacts"].append(list(globs))
@@ -94,8 +97,35 @@ def fake_pod(monkeypatch):
     return calls
 
 
+class _FakeChannel:
+    @staticmethod
+    def recv_exit_status():
+        return 0
+
+
+class _FakeStream:
+    channel = _FakeChannel()
+
+    @staticmethod
+    def read():
+        return b""
+
+
 class _FakeSSH:
-    """A paramiko-client stand-in; the flow layer is faked out separately."""
+    """
+    A paramiko-client stand-in; the flow layer is faked out separately.
+
+    ``exec_command`` is here because the runtime clears the working directory
+    before every run (see _run_job) via pod_client.exec_simple, which goes
+    straight to the client rather than through the faked flow layer.
+    """
+
+    def __init__(self):
+        self.commands = []
+
+    def exec_command(self, command, timeout=None):
+        self.commands.append(command)
+        return None, _FakeStream(), _FakeStream()
 
     def open_sftp(self):
         return _FakeSFTP()
@@ -581,6 +611,23 @@ def test_a_crashing_tool_still_finishes_the_job(fake_pod, monkeypatch):
     result = runtime.eda_result(eda_id)
     assert result["status"] == "error"
     assert "ssh died mid-run" in result["errors"]
+
+
+def test_working_directory_is_cleared_before_each_run(fake_pod, fake_flow, monkeypatch):
+    """
+    A warm pod is reused across runs, so last run's outputs would otherwise be
+    picked up by this run's artifact globs -- a lint run reporting the previous
+    run's waveform. $FLOW_HOME/results is deliberately NOT cleared, because ORFS
+    stages are incremental and from_stage exists to resume them.
+    """
+    monkeypatch.setattr(runtime, "_EPHEMERAL", False)
+    eda_id = _provisioned("yosys")
+    runtime.start_yosys_job(eda_id, YosysRunRequest())
+    assert _wait_until(lambda: registry.get(eda_id).done)
+
+    ssh = fake_pod["clients"][-1]
+    assert any("rm -rf" in c and pod_client.WORK_DIR in c for c in ssh.commands),         ssh.commands
+    assert not any("FLOW_HOME/results" in c for c in ssh.commands)
 
 
 def test_artifacts_are_collected_even_when_the_run_failed(fake_pod, monkeypatch):

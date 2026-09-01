@@ -19,8 +19,12 @@
 # times out with the same misleading 'no public-IP networking' error as a
 # missing sshd.
 #
-# Verify before shipping a new tag:
-#   docker run --rm <img> bash -lc 'which yosys openroad klayout verilator; ls $FLOW_HOME/platforms'
+# Verify before shipping a new tag (note FLOW_HOME is NOT exported by the base
+# image -- _EDA_ENV in pod_client.py supplies it, so set it here too):
+#   docker run --rm <img> bash -lc 'export FLOW_HOME=/OpenROAD-flow-scripts/flow; \
+#     command -v yosys openroad klayout verilator sshd; verilator --version; \
+#     ls $FLOW_HOME/platforms'
+# Expect: verilator 5.x, and sky130hd among the platforms.
 #
 # Local development (no RunPod account, no spend) -- this is what EDA_LOCAL_SSH=1
 # in runtime.py talks to:
@@ -34,17 +38,40 @@ ARG ORFS_TAG=26Q3-422-ga7de7c42f
 FROM openroad/orfs:${ORFS_TAG}
 
 # openssh-server: the transport.  rsync: faster artifact staging than raw SFTP.
-# verilator: ORFS does not bundle a simulator, and the verilator block needs one.
-# If the distro package is too old for the SystemVerilog the AI writes (check with
-# `verilator --version`; the block wants 5.x), build it from source here instead.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        openssh-server rsync verilator \
+        openssh-server rsync \
  && mkdir -p /var/run/sshd /root/.ssh \
  && chmod 700 /root/.ssh \
  && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
  && sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
  && rm -rf /var/lib/apt/lists/*
+
+# Verilator, built from source rather than installed from apt.
+#
+# ORFS does not bundle a simulator, and Ubuntu 22.04's package is Verilator
+# *4.038* — released in 2020, with SystemVerilog support far behind what an LLM
+# writing RTL will happily emit. A design that simulates fine everywhere else
+# would fail here, and the error would look like the user's fault rather than the
+# toolchain's. 5.x is the line worth holding.
+#
+# The base image already carries every build dependency (git, make, g++,
+# autoconf, flex, bison, perl, help2man, FlexLexer.h, zlib) because it builds
+# OpenROAD itself, so this needs no extra apt packages — just the compile, which
+# is the bulk of this image's build time.
+#
+# `make install` lands it in /usr/local/bin, already on PATH, so _EDA_ENV in
+# pod_client.py needs no change.
+ARG VERILATOR_TAG=v5.050
+RUN git clone --depth 1 --branch "${VERILATOR_TAG}" \
+        https://github.com/verilator/verilator.git /tmp/verilator \
+ && cd /tmp/verilator \
+ && autoconf \
+ && ./configure \
+ && make -j"$(nproc)" \
+ && make install \
+ && cd / \
+ && rm -rf /tmp/verilator
 
 COPY start.sh /start.sh
 RUN chmod +x /start.sh

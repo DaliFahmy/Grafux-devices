@@ -30,6 +30,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import shlex
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -664,8 +665,14 @@ def download_artifacts(client, output_globs: List[str]) -> List[Dict[str, Any]]:
     globs = [g for g in (output_globs or []) if isinstance(g, str) and g.strip()]
     if not globs:
         return []
+    # The EDA environment must be exported here too: the openroad globs are written
+    # in terms of $FLOW_HOME, which a bare non-login shell does not have. Without
+    # it every glob expands against an empty prefix, matches nothing, and a
+    # successful run silently returns no GDS at all.
     listing_cmd = (
-        "bash -lc 'for f in " + " ".join(globs) + '; do [ -f "$f" ] && echo "$f"; done\''
+        "bash -lc " + shlex.quote(
+            _EDA_ENV + "for f in " + " ".join(globs) + '; do [ -f "$f" ] && echo "$f"; done'
+        )
     )
     _code, out, _err = exec_simple(client, listing_cmd, timeout=60)
     paths: List[str] = []

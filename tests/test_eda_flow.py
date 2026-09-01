@@ -172,32 +172,111 @@ def test_build_yosys_script_passes_defines_and_includes():
 
 
 # ---------------------------------------------------------------------------
+# Liberty selection
+# ---------------------------------------------------------------------------
+
+# `ls -S` order (largest first) for a real sky130hd platform directory.
+_SKY130_LIBS = [
+    "/flow/platforms/sky130hd/lib/sky130_fd_sc_hd__tt_025C_1v80.lib",
+    "/flow/platforms/sky130hd/lib/sky130_dummy_io.lib",
+]
+
+
+def test_pick_liberty_skips_the_io_stub():
+    """
+    The bug this exists to prevent.
+
+    sky130hd's lib/ sorts sky130_dummy_io.lib ahead of the standard cells
+    alphabetically. Mapping onto it makes dfflibmap fail with "dffs with async set
+    or reset are not supported" -- an error that reads like the user's RTL is at
+    fault when really we handed yosys a library with no flip-flops in it.
+    """
+    assert flow.pick_liberty(_SKY130_LIBS).endswith("sky130_fd_sc_hd__tt_025C_1v80.lib")
+
+
+def test_pick_liberty_skips_macro_and_fill_libraries():
+    libs = [
+        "/p/lib/sky130_sram_1kbyte.lib",
+        "/p/lib/foo_fill.lib",
+        "/p/lib/foo_antenna.lib",
+        "/p/lib/NangateOpenCellLibrary_typical.lib",
+    ]
+    assert flow.pick_liberty(libs).endswith("NangateOpenCellLibrary_typical.lib")
+
+
+def test_pick_liberty_prefers_the_largest_remaining_file():
+    """Callers pass `ls -S` output, so position encodes size."""
+    libs = ["/p/lib/big_sc.lib", "/p/lib/small_sc.lib"]
+    assert flow.pick_liberty(libs) == "/p/lib/big_sc.lib"
+
+
+def test_pick_liberty_falls_back_rather_than_giving_up():
+    """
+    An unfamiliar platform whose every file looks like a support library should
+    still synthesize onto something, not silently drop to generic cells.
+    """
+    libs = ["/p/lib/only_io.lib", "/p/lib/other_ram.lib"]
+    assert flow.pick_liberty(libs) == "/p/lib/only_io.lib"
+
+
+def test_pick_liberty_on_empty_listing():
+    assert flow.pick_liberty([]) == ""
+    assert flow.pick_liberty(["", "  "]) == ""
+
+
+# ---------------------------------------------------------------------------
+# Source filename
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("top, expected", [
+    ("counter", "counter"),
+    ("my_module", "my_module"),
+    ("gen$block", "gen_block"),     # $ is legal in Verilog, awkward in a path
+    ("a-b c", "a_b_c"),
+    ("", "top"),
+])
+def test_safe_filename(top, expected):
+    """
+    Verilator's -Wall makes DECLFILENAME fatal, so the source file must be named
+    after the top module -- writing every design to a fixed design.v made lint
+    fail on every single input.
+    """
+    assert flow._safe_filename(top) == expected
+
+
+# ---------------------------------------------------------------------------
 # ORFS config construction
 # ---------------------------------------------------------------------------
 
-def test_build_orfs_config_from_netlist():
+def test_build_orfs_config_has_no_bypass_synthesis_option():
+    """
+    ORFS always runs its own yosys.
+
+    ``1_synth.odb`` depends on the yosys chain unconditionally and there is no
+    variable to skip it, so emitting something like SYNTH_NETLIST would be
+    silently ignored -- the flow would synthesize anyway and the config would be
+    lying about what it does. The source is always VERILOG_FILES.
+    """
     cfg = flow.build_orfs_config(
-        design="counter", platform="sky130hd", verilog_files=[],
-        netlist_file="./designs/sky130hd/counter/netlist.v",
+        design="counter", platform="sky130hd",
+        verilog_files=["./designs/src/counter/counter.v"],
         sdc_file="./designs/sky130hd/counter/constraint.sdc",
         clock_period="10", core_utilization="45", aspect_ratio="1",
     )
     assert "export DESIGN_NAME     = counter" in cfg
     assert "export PLATFORM        = sky130hd" in cfg
-    assert "SYNTH_NETLIST" in cfg
-    # With a netlist wired in, ORFS must not be told to synthesize from RTL.
-    assert "VERILOG_FILES" not in cfg
+    assert "SYNTH_NETLIST" not in cfg
+    assert "VERILOG_FILES" in cfg
     assert "export CORE_UTILIZATION = 45" in cfg
 
 
 def test_build_orfs_config_from_rtl():
     cfg = flow.build_orfs_config(
         design="gcd", platform="sky130hd",
-        verilog_files=["./designs/src/gcd/design.v"], sdc_file="c.sdc",
+        verilog_files=["./designs/src/gcd/gcd.v"], sdc_file="c.sdc",
         core_utilization="45",
     )
     assert "VERILOG_FILES" in cfg
-    assert "SYNTH_NETLIST" not in cfg
 
 
 def test_build_orfs_config_explicit_die_area_overrides_utilization():
@@ -262,6 +341,61 @@ _YOSYS_STAT = r"""
 """
 
 
+# Real `stat` output from yosys 0.68 (the version openroad/orfs ships), captured
+# from an actual sky130hd synthesis of a 4-bit counter. The modern format is a
+# right-aligned table, NOT the legacy "Number of cells: N" list -- parsing only
+# the legacy shape made a successful synthesis report zero cells.
+_YOSYS_068_STAT = r"""
+=== counter ===
+
+   Number of modules:            1
+
+       10        - wires
+       16        - wire bits
+        3        - public wires
+        6        - public wire bits
+        3        - ports
+        6        - port bits
+       14  152.646 cells
+        1    5.005   sky130_fd_sc_hd__a21oi_1
+        5   18.768   sky130_fd_sc_hd__clkinv_1
+        4  100.096   sky130_fd_sc_hd__dfrtp_1
+        1    6.256   sky130_fd_sc_hd__lpflow_isobufsrc_1
+        1    5.005   sky130_fd_sc_hd__nand3_1
+        1    8.758   sky130_fd_sc_hd__xnor2_1
+        1    8.758   sky130_fd_sc_hd__xor2_1
+
+   Chip area for module '\counter': 152.646400
+     of which used for sequential elements: 100.096000 (65.57%)
+"""
+
+
+def test_parse_yosys_068_table_format():
+    """The format the shipping yosys actually emits."""
+    stats = flow.parse_yosys_stats(_YOSYS_068_STAT)
+    assert stats["cell_count"] == 14
+    assert stats["wire_count"] == 10
+    assert stats["area_um2"] == pytest.approx(152.6464)
+    assert stats["sequential_area_um2"] == pytest.approx(100.096)
+
+
+def test_parse_yosys_068_counts_flip_flops():
+    """sky130 spells its flip-flop __dfrtp_, not __dff."""
+    stats = flow.parse_yosys_stats(_YOSYS_068_STAT)
+    assert stats["sequential_cells"] == 4
+
+
+def test_parse_yosys_068_cell_breakdown():
+    stats = flow.parse_yosys_stats(_YOSYS_068_STAT)
+    by_type = stats["by_cell_type"]
+    assert by_type["sky130_fd_sc_hd__clkinv_1"] == 5
+    assert by_type["sky130_fd_sc_hd__dfrtp_1"] == 4
+    assert sum(by_type.values()) == 14
+    # Summary rows must not be mistaken for cell types.
+    for word in ("cells", "wires", "ports", "bits"):
+        assert word not in by_type
+
+
 def test_parse_yosys_stats_extracts_counts_and_area():
     stats = flow.parse_yosys_stats(_YOSYS_STAT)
     assert stats["cell_count"] == 24
@@ -303,6 +437,62 @@ def test_parse_orfs_metrics_maps_known_keys():
     assert metrics["num_instances"] == 240
     assert metrics["drc_violations"] == 0
     assert metrics["power_mw"] == 0.0021
+
+
+def test_parse_orfs_metrics_from_a_real_6_report_json():
+    """
+    Keys captured from a real sky130hd run of a 4-bit counter.
+
+    ORFS writes these to logs/<platform>/<design>/base/6_report.json -- NOT to
+    reports/.../metadata.json, which is where run_orfs first looked, so a
+    perfectly good layout reported no metrics at all.
+    """
+    metrics = flow.parse_orfs_metrics({
+        "finish__timing__setup__ws": 9.07498,
+        "finish__timing__setup__tns": 0,
+        "finish__timing__hold__ws": 0.373081,
+        "finish__timing__hold__tns": 0,
+        "finish__design__instance__count": 480,
+        "finish__design__instance__area": 282.771,
+        "finish__design__instance__count__class:sequential_cell": 4,
+        "finish__design__instance__utilization": 0.0827839,
+        "finish__power__total": 3.69695e-05,
+    })
+    assert metrics["wns_ns"] == pytest.approx(9.07498)
+    assert metrics["hold_wns_ns"] == pytest.approx(0.373081)
+    assert metrics["num_instances"] == 480
+    assert metrics["area_um2"] == pytest.approx(282.771)
+    assert metrics["sequential_cells"] == 4
+    assert metrics["utilization"] == pytest.approx(0.0827839)
+
+
+def test_explain_orfs_failure_translates_a_too_small_die():
+    """
+    The failure a first-time user hits: a tiny design gives a core narrower than
+    sky130's power straps need. The raw error names a metal layer and two widths
+    and says nothing about which port to change.
+    """
+    log = (
+        "[INFO ORD-0030] Using 8 thread(s).\n"
+        "[ERROR PDN-0185] Insufficient width (18.86 um) to add straps on layer "
+        "met4 in grid 'grid' with total strap width 15.2 um and offset 13.6 um.\n"
+        "Error: pdn.tcl, 6 PDN-0185\n"
+    )
+    out = flow.explain_orfs_failure(log)
+    assert "PDN-0185" in out                 # the tool's own words are kept
+    assert "core_utilization" in out         # and the lever is named
+    assert "die_area" in out
+
+
+def test_explain_orfs_failure_surfaces_unknown_errors_verbatim():
+    """An unrecognised failure must still beat make's bare exit code."""
+    out = flow.explain_orfs_failure("[ERROR XYZ-9] something new went wrong")
+    assert "XYZ-9" in out
+
+
+def test_explain_orfs_failure_on_a_clean_log():
+    assert flow.explain_orfs_failure("") == ""
+    assert flow.explain_orfs_failure("[INFO] all good") == ""
 
 
 def test_parse_orfs_metrics_collects_per_stage_runtimes():

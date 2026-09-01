@@ -423,6 +423,22 @@ def _run_job(eda_id: str, req, kind: str) -> None:
         client = pod_client.connect_ssh(
             record.public_ip, record.ssh_port, record.private_key_pem
         )
+
+        # Start from a clean working directory. A warm pod (keep_warm, or the
+        # local-SSH dev container) is reused across runs, so last run's outputs
+        # would otherwise be picked up by this run's artifact globs -- a lint run
+        # reporting the previous run's waveform, or a failed synthesis appearing
+        # to have produced the netlist from the attempt before it.
+        #
+        # Only WORK_DIR is cleared, never $FLOW_HOME/results: ORFS stages are
+        # deliberately incremental, and wiping them would break the from_stage
+        # port whose whole purpose is resuming a partly-completed flow.
+        pod_client.exec_simple(
+            client,
+            f"rm -rf {pod_client.WORK_DIR} && mkdir -p {pod_client.WORK_DIR}",
+            timeout=60,
+        )
+
         if req.input_files:
             sftp = client.open_sftp()
             try:
