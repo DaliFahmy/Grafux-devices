@@ -55,6 +55,20 @@ NETLIST_INLINE_MAX = int(os.environ.get("EDA_NETLIST_INLINE_MAX", str(1024 * 102
 _DEFAULT_TOP = "top"
 
 
+def _allow_empty_netlist() -> bool:
+    """
+    True when the post-synthesis empty-netlist gate in ``run_orfs`` is disabled.
+
+    Read per call rather than at import so a test (or an operator) can flip it
+    without reloading the module. The gate is on by default because a netlist
+    with no cells is never routable — but the escape hatch exists for anyone
+    deliberately exercising the later stages on an empty design.
+    """
+    return (os.environ.get("EDA_ALLOW_EMPTY_NETLIST", "") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -94,6 +108,164 @@ def infer_top_module(rtl: str, fallback: str = _DEFAULT_TOP) -> str:
     """
     names = _MODULE_RE.findall(rtl or "")
     return names[-1] if names else fallback
+
+
+# Verilog port lists come in two flavours and BOTH must be handled, because the
+# RTL arrives from whoever — or whatever — filled the block's `rtl` port:
+#
+#   ANSI:      module calc #(parameter W=8) (input wire clk, output reg [W-1:0] q);
+#   non-ANSI:  module calc(a, b, y);  input a, b;  output y;
+#
+# Keeping the LAST identifier of each comma-separated item covers both: it drops
+# the direction/type/range prefix of the ANSI form and is a no-op on the bare
+# names of the non-ANSI form.
+_COMMENT_RE = re.compile(r"//[^\n]*|/\*.*?\*/", re.DOTALL)
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+
+# Words that can be the last identifier of a port item without being its name.
+_PORT_NOISE = frozenset({
+    "input", "output", "inout", "wire", "reg", "logic", "signed", "unsigned",
+    "bit", "byte", "int", "integer", "real", "time", "tri", "wand", "wor",
+    "supply0", "supply1", "parameter", "localparam", "var",
+})
+
+
+def _strip_comments(text: str) -> str:
+    """Drop // and /* */ comments so they cannot hide or fake a port name."""
+    return _COMMENT_RE.sub(" ", text or "")
+
+
+def _balanced(text: str, start: int) -> str:
+    """
+    Contents of the parenthesised group opening at ``text[start]``.
+
+    Returns "" when the parentheses never close, which is how a truncated or
+    malformed source gets rejected rather than half-parsed.
+    """
+    depth = 0
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1:index]
+    return ""
+
+
+def _split_top_level(text: str) -> List[str]:
+    """Split on commas that are not nested inside (), [] or {}."""
+    items: List[str] = []
+    current: List[str] = []
+    depth = 0
+    for char in text:
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        if char == "," and depth == 0:
+            items.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+    items.append("".join(current))
+    return [item for item in items if item.strip()]
+
+
+def module_ports(rtl: str, top: str) -> List[str]:
+    """
+    The ports declared in module ``top``'s header, in declaration order.
+
+    An empty list means "could not tell", NOT "this module has no ports" —
+    callers must never act on it as though the design were portless.  Rewriting a
+    user's clock constraint on the strength of a failed parse would be worse than
+    leaving it alone.
+    """
+    source = _strip_comments(rtl)
+    name = (top or "").strip()
+    if not name:
+        return []
+    match = re.search(r"\bmodule\s+" + re.escape(name) + r"\b", source)
+    if not match:
+        return []
+
+    pos = match.end()
+
+    def skip_space(index: int) -> int:
+        while index < len(source) and source[index].isspace():
+            index += 1
+        return index
+
+    pos = skip_space(pos)
+    # An optional #( ... ) parameter list sits between the name and the ports.
+    if pos < len(source) and source[pos] == "#":
+        pos = skip_space(pos + 1)
+        if pos >= len(source) or source[pos] != "(":
+            return []
+        params = _balanced(source, pos)
+        if not params:
+            return []
+        pos = skip_space(pos + len(params) + 2)
+    if pos >= len(source) or source[pos] != "(":
+        return []
+
+    ports: List[str] = []
+    for item in _split_top_level(_balanced(source, pos)):
+        names = [n for n in _IDENT_RE.findall(item) if n not in _PORT_NOISE]
+        if names:
+            ports.append(names[-1])
+    return ports
+
+
+# Port names that mean "clock" in practice, most canonical first.  An exact match
+# here beats the substring sweep below, so `clk` wins over `clk_div_out`.
+_CLOCK_NAMES = (
+    "clk", "clock", "clk_i", "i_clk", "clk_in", "sys_clk", "sysclk",
+    "clock_i", "i_clock", "core_clk", "clk_core", "aclk", "hclk",
+)
+
+
+def resolve_clock_port(rtl: str, top: str, requested: str) -> Tuple[str, str]:
+    """
+    Reconcile the block's ``clock_port`` with the ports the RTL actually declares.
+
+    Returns ``(port, warning)``.  An empty ``port`` means the design has no clock
+    and the caller should reach for ``virtual_clock_sdc`` instead.
+
+    Why this is worth doing: ``default_sdc`` writes ``create_clock ...
+    [get_ports {clk}]`` with no idea whether ``clk`` exists.  When it does not,
+    OpenSTA does not fail — it quietly substitutes a VIRTUAL clock ([WARNING
+    STA-0366] followed later by [WARNING STA-0450]), CTS then finds no clock nets,
+    and the design sails through four more stages with no clock tree.
+    """
+    wanted = (requested or "").strip() or "clk"
+    ports = module_ports(rtl, top)
+    if not ports:
+        # Header unparseable: trust the user's setting rather than guess.
+        return wanted, ""
+    if wanted in ports:
+        return wanted, ""
+
+    swap = (
+        "clock_port '{wanted}' is not a port of module '{top}'; using '{found}' "
+        "instead. Set the block's clock_port to silence this."
+    )
+    lowered = {port.lower(): port for port in ports}
+    for candidate in _CLOCK_NAMES:
+        if candidate in lowered:
+            found = lowered[candidate]
+            return found, swap.format(wanted=wanted, top=top, found=found)
+    for port in ports:
+        if "clk" in port.lower() or "clock" in port.lower():
+            return port, swap.format(wanted=wanted, top=top, found=port)
+
+    return "", (
+        f"Module '{top}' declares no clock port (ports: {', '.join(ports)}). "
+        "Constraining with a virtual clock so timing analysis stays valid. If "
+        "this design is meant to be sequential, its clock is missing from the "
+        "module header."
+    )
 
 
 def _safe_filename(name: str) -> str:
@@ -176,6 +348,30 @@ def default_sdc(clock_port: str, clock_period: str) -> str:
     return (
         f"create_clock -name core_clock -period {period} [get_ports {{{port}}}]\n"
         f"set_clock_uncertainty 0.1 [get_clocks core_clock]\n"
+    )
+
+
+def virtual_clock_sdc(clock_period: str) -> str:
+    """
+    An SDC for a design that has no clock port at all.
+
+    ``create_clock`` with no ``[get_ports]`` declares a VIRTUAL clock, which is
+    the correct constraint for purely combinational logic.  It is also, notably,
+    what OpenSTA falls back to on its own when ``create_clock`` names a port that
+    does not exist — except that it then also warns the clock cannot be
+    propagated, and the user is left reading STA-0366/STA-0450 rather than being
+    told their design has no clock.  Saying it deliberately is quieter and honest.
+
+    The I/O delays give the combinational paths something to be timed against.
+    Zero rather than an invented budget: any real number here would be a guess
+    about a surrounding system we know nothing about.
+    """
+    period = (clock_period or "10").strip() or "10"
+    return (
+        f"create_clock -name core_clock -period {period}\n"
+        f"set_clock_uncertainty 0.1 [get_clocks core_clock]\n"
+        f"set_input_delay 0 -clock core_clock [all_inputs]\n"
+        f"set_output_delay 0 -clock core_clock [all_outputs]\n"
     )
 
 
@@ -560,6 +756,20 @@ _ORFS_HINTS = (
      "is tiny, so a handful of cells gives a core narrower than the power straps "
      "need. Lower 'core_utilization' (which makes the die BIGGER), or set an "
      "explicit 'die_area'/'core_area' such as '0 0 60 60'."),
+    # An empty netlist is silent everywhere until routing, where the first tool
+    # to actually object names a command that DID run. These three cover a run
+    # started past the synth stage, where the gate below cannot help.
+    ("EST-0005",
+     "Global routing produced no result because the design has no nets — "
+     "synthesis mapped it to an empty netlist. Check that every output of the "
+     "top module is driven, and that 'top' names the module you meant to build."),
+    ("GRT-0094",
+     "There were no nets to route: synthesis produced an empty netlist. Check "
+     "that every output of the top module is driven, and that 'top' names the "
+     "module you meant to build."),
+    ("CTS-0083",
+     "No clock net was found: 'clock_port' matches no port of the design, or the "
+     "design has no registers for a clock to reach."),
     ("no space to place",
      "Placement ran out of room. Lower 'core_utilization' to enlarge the die."),
     ("Unable to find a site",
@@ -580,12 +790,91 @@ def explain_orfs_failure(log_text: str) -> str:
     parts: List[str] = []
     if errors:
         parts.append("\n".join(e.strip() for e in errors[-6:]))
-    haystack = (" ".join(errors) or (log_text or "")).lower()
-    for marker, hint in _ORFS_HINTS:
-        if marker.lower() in haystack:
+    # The tool's own ERROR lines are searched first, so the hint describes what
+    # actually failed rather than something incidental further up. Only when none
+    # of them is recognised does the whole log get a look: some causes are only
+    # ever reported as a WARNING, by a stage that shrugged and carried on several
+    # stages before the crash.
+    for haystack in (" ".join(errors).lower(), (log_text or "").lower()):
+        if not haystack:
+            continue
+        hint = next((text for marker, text in _ORFS_HINTS
+                     if marker.lower() in haystack), "")
+        if hint:
             parts.append(hint)
             break
     return "\n".join(parts).strip()
+
+
+# ORFS reports the synthesized size twice in the `synth` stage's output. Either
+# one reading zero means yosys mapped the design to nothing at all.
+_EMPTY_AREA_RE = re.compile(r"Design area\s+0(?:\.0+)?\s*um\^2")
+_EMPTY_INSTANCES_RE = re.compile(r"number instances in verilog is 0\b")
+
+# The lines that usually explain WHY it came out empty. Quoted back verbatim so
+# the user reads the tool's own words rather than our paraphrase of them.
+#
+# Deliberately absent: "Ignoring module ... because it contains processes (run
+# 'proc' command first)". Yosys prints that during the normal
+# 1_1_yosys_canonicalize step of every healthy run, and repeating it here as
+# though it were a diagnosis would send people chasing a non-problem.
+_EMPTY_EVIDENCE_RES = (
+    re.compile(r"^.*\bis used but has no driver\b.*$", re.MULTILINE),
+    re.compile(r"^.*\[WARNING STA-0366\].*$", re.MULTILINE),
+    re.compile(r"^.*\bWire .* is unused\b.*$", re.MULTILINE),
+)
+
+
+def synth_produced_nothing(stage_log: str, top: str = "") -> str:
+    """
+    Explain an empty post-synthesis netlist; "" when synthesis produced cells.
+
+    An empty netlist is a FAILED synthesis even though yosys and ``make synth``
+    both exit 0. Every later stage then quietly no-ops on it — the floorplan
+    holds nothing, GPL reports "no placeable instances" and skips placement, CTS
+    finds no clock nets — and the first tool rude enough to object is
+    ``estimate_parasitics -global_routing``, four stages later, with "[ERROR
+    EST-0005] Run global_route before estimating parasitics". That names a command
+    which DID run, points at the wrong tool, and says nothing whatsoever about the
+    undriven output that caused it.
+
+    Checking here costs one regex against a log we already have in hand, and turns
+    a five-stage pod run into a twenty-second answer.
+    """
+    text = stage_log or ""
+    if not (_EMPTY_AREA_RE.search(text) or _EMPTY_INSTANCES_RE.search(text)):
+        return ""
+
+    evidence: List[str] = []
+    for pattern in _EMPTY_EVIDENCE_RES:
+        for line in pattern.findall(text):
+            line = line.strip()
+            if line and line not in evidence:
+                evidence.append(line)
+
+    module = (top or "").strip() or "the top module"
+    parts = [
+        "Synthesis produced an EMPTY netlist — 0 cells, 0 nets — so there is "
+        "nothing to floorplan, place or route. Later stages would no-op on it "
+        "and the route stage would fail with [ERROR EST-0005], because global "
+        "routing had no nets to route.",
+    ]
+    if evidence:
+        parts.append("The tools reported:\n"
+                     + "\n".join(f"  {line}" for line in evidence[:10]))
+    parts.append(
+        "Usual causes, most likely first:\n"
+        f"  - An output of module '{module}' is never assigned, so all of its "
+        "logic is dead and opt_clean deletes it. Drive every output port.\n"
+        f"  - The 'top' port names the wrong module (it is '{module}' here).\n"
+        f"  - Module '{module}' declares no output ports, so nothing it computes "
+        "is observable from outside."
+    )
+    parts.append(
+        "Wire this RTL into a verilator block (mode=lint) or a yosys block first "
+        "— both catch this in seconds, without renting a pod."
+    )
+    return "\n\n".join(parts)
 
 
 def globs_for(kind: str, *, work_dir: str = WORK_DIR, platform: str = "",
@@ -895,12 +1184,46 @@ def run_orfs(
     source_text = rtl or netlist
     stages = stages_between(req.from_stage, req.to_stage)
 
+    # Nothing to build. Caught before the first make rather than out on the pod,
+    # because ORFS's own failure for a zero-byte source is a yosys parse error
+    # that says nothing about which port the user forgot to wire.
+    if not source_text:
+        return {
+            "outputs": {
+                "top": design, "pdk": platform, "stage": "", "status": "error",
+                "metrics": "{}", "log": "", "warnings": "",
+                "errors": (
+                    "No design source: the 'rtl' and 'netlist' input ports are "
+                    "both empty. Wire a code block's output into 'rtl', or a "
+                    "yosys block's 'netlist' output into 'netlist'."
+                ),
+            },
+            "_status": "error",
+            "_stage": "",
+            "_stages_done": [],
+            "_globs": globs_for("openroad", platform=platform, design=design),
+        }
+
     # config.mk is read by make, which does not expand $FLOW_HOME inside the file
     # the same way the shell does, so paths inside it use make's own variable.
     cfg_design_dir = f"./designs/{platform}/{design}"
     cfg_src_dir = f"./designs/src/{design}"
 
-    sdc = req.sdc.strip() or default_sdc(req.clock_port, req.clock_period)
+    # Reconcile clock_port against the ports the design actually declares before
+    # writing the SDC. A create_clock aimed at a port that does not exist does not
+    # fail — OpenSTA substitutes a virtual clock, CTS then builds no clock tree,
+    # and nothing says so until someone reads the log line by line. A user-supplied
+    # SDC is used verbatim; it is theirs, not ours to second-guess.
+    preflight: List[str] = []
+    if req.sdc.strip():
+        sdc = req.sdc.strip()
+    else:
+        clock_port, clock_note = resolve_clock_port(
+            source_text, design, req.clock_port)
+        if clock_note:
+            preflight.append(clock_note)
+        sdc = (default_sdc(clock_port, req.clock_period) if clock_port
+               else virtual_clock_sdc(req.clock_period))
     config = build_orfs_config(
         design=design,
         platform=platform,
@@ -964,6 +1287,17 @@ def run_orfs(
         log_parts.append(f"$ make {stage}\n{out}\n{err}")
         reached = stage
         if code == 0:
+            # `make synth` exits 0 even on a design that synthesized to nothing.
+            # Stop here rather than spend four more stages to fail at route with
+            # an error naming the wrong tool — see synth_produced_nothing.
+            empty = ("" if stage != "synth" or _allow_empty_netlist()
+                     else synth_produced_nothing(f"{out}\n{err}", design))
+            if empty:
+                on_stage(stage, "failed")
+                failed = True
+                outputs["errors"] = (
+                    f"Stage 'synth' produced no netlist.\n\n{empty}")
+                break
             stages_done.append(stage)
             on_stage(stage, "done")
             continue
@@ -1018,10 +1352,13 @@ def run_orfs(
     outputs["status"] = "error" if failed else "ok"
     outputs["metrics"] = json.dumps(metrics)
     outputs["log"] = "\n".join(log_parts)
-    outputs["warnings"] = "\n".join(
+    scraped = "\n".join(
         line for part in log_parts for line in part.splitlines()
         if "warning" in line.lower()
-    )[:20000]
+    )
+    # Preflight notes lead: a clock_port that matches nothing explains a good
+    # share of the warnings underneath it.
+    outputs["warnings"] = "\n".join(preflight + [scraped]).strip()[:20000]
     outputs.setdefault("errors", "")
     return {
         "outputs": outputs,

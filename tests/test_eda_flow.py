@@ -542,3 +542,163 @@ def test_globs_for_verilator_collects_waveforms():
 
 def test_globs_for_yosys_collects_the_netlist():
     assert any(g.endswith("*.v") for g in flow.globs_for("yosys"))
+
+
+# ---------------------------------------------------------------------------
+# Module ports and clock reconciliation
+# ---------------------------------------------------------------------------
+
+def test_module_ports_reads_an_ansi_header():
+    rtl = "module calc(input wire clk, input [3:0] a, output reg [7:0] q);\nendmodule\n"
+    assert flow.module_ports(rtl, "calc") == ["clk", "a", "q"]
+
+
+def test_module_ports_reads_a_non_ansi_header():
+    rtl = "module calc(a, b, y);\n  input a, b;\n  output y;\nendmodule\n"
+    assert flow.module_ports(rtl, "calc") == ["a", "b", "y"]
+
+
+def test_module_ports_skips_the_parameter_list():
+    rtl = "module counter #(parameter W = 8) (input clk, output [W-1:0] q);\nendmodule\n"
+    assert flow.module_ports(rtl, "counter") == ["clk", "q"]
+
+
+def test_module_ports_ignores_comments():
+    rtl = (
+        "module calc(\n"
+        "    input clk,          // the clock\n"
+        "    /* the answer */ output [7:0] q\n"
+        ");\nendmodule\n"
+    )
+    assert flow.module_ports(rtl, "calc") == ["clk", "q"]
+
+
+def test_module_ports_on_an_unreadable_header_says_it_does_not_know():
+    """An empty list must read as "could not tell", never "this module is portless"."""
+    assert flow.module_ports("module calc(input clk", "calc") == []   # never closes
+    assert flow.module_ports("module other(input clk);", "calc") == []  # wrong module
+    assert flow.module_ports("", "calc") == []
+
+
+def test_resolve_clock_port_accepts_a_real_port():
+    rtl = "module calc(input clk, output q); endmodule"
+    assert flow.resolve_clock_port(rtl, "calc", "clk") == ("clk", "")
+
+
+def test_resolve_clock_port_swaps_in_the_designs_own_clock_name():
+    rtl = "module calc(input sys_clk, input rst, output q); endmodule"
+    port, note = flow.resolve_clock_port(rtl, "calc", "clk")
+    assert port == "sys_clk"
+    assert "sys_clk" in note
+    assert "clock_port" in note
+
+
+def test_resolve_clock_port_reports_a_design_with_no_clock():
+    """
+    The shape that produced EST-0005: no clock port at all, so ``create_clock
+    [get_ports {clk}]`` had nothing to attach to and OpenSTA quietly made the
+    clock virtual instead of complaining.
+    """
+    rtl = ("module calculator(input [7:0] a, input [7:0] b, "
+           "output [7:0] result); endmodule")
+    port, note = flow.resolve_clock_port(rtl, "calculator", "clk")
+    assert port == ""
+    assert "no clock port" in note
+    assert "result" in note          # the real ports are named back to the user
+
+
+def test_resolve_clock_port_does_not_guess_from_an_unreadable_header():
+    assert flow.resolve_clock_port("!! not verilog !!", "calc", "clk") == ("clk", "")
+
+
+def test_virtual_clock_sdc_attaches_to_nothing():
+    sdc = flow.virtual_clock_sdc("4")
+    assert "create_clock" in sdc
+    assert "-period 4" in sdc
+    assert "get_ports" not in sdc     # the whole point — there is no port to name
+    assert "all_inputs" in sdc
+    assert "all_outputs" in sdc
+
+
+# ---------------------------------------------------------------------------
+# The empty-netlist gate
+# ---------------------------------------------------------------------------
+
+# Trimmed from a real failing run: an openroad block on a `calculator` design
+# whose RTL had no clock port and an undriven output.  `make synth` exited 0.
+_EMPTY_SYNTH_LOG = r"""
+3.3. Executing CHECK pass (checking for obvious problems).
+Warning: Wire calculator.\valid_operation is used but has no driver.
+link_design calculator
+read_sdc ./results/sky130hd/calculator/base/1_2_yosys.sdc
+[WARNING STA-0366] port 'clk' not found.
+eliminate_dead_logic
+Removed 0 unused instances and 0 unused nets.
+Design area 0 um^2 100% utilization.
+write_db ./results/sky130hd/calculator/base/1_synth.odb
+"""
+
+_HEALTHY_SYNTH_LOG = r"""
+7. Executing OPT_CLEAN pass (remove unused cells and wires).
+Warning: Ignoring module counter because it contains processes (run 'proc' command first).
+eliminate_dead_logic
+Removed 0 unused instances and 0 unused nets.
+Design area 1284 um^2 14% utilization.
+"""
+
+
+def test_synth_produced_nothing_catches_the_empty_netlist():
+    out = flow.synth_produced_nothing(_EMPTY_SYNTH_LOG, "calculator")
+    assert "EMPTY netlist" in out
+    assert "valid_operation" in out      # the tool's own words, quoted back
+    assert "STA-0366" in out
+    assert "calculator" in out           # and the module to go and fix
+
+
+def test_synth_produced_nothing_stays_quiet_on_a_real_design():
+    assert flow.synth_produced_nothing(_HEALTHY_SYNTH_LOG, "counter") == ""
+
+
+def test_synth_produced_nothing_reads_the_instance_count_too():
+    assert flow.synth_produced_nothing(
+        "number instances in verilog is 0\n", "calc") != ""
+
+
+def test_synth_produced_nothing_does_not_blame_the_benign_processes_warning():
+    """
+    "contains processes (run 'proc' command first)" is printed by the
+    canonicalize step of EVERY healthy run.  Repeating it as though it were the
+    diagnosis would send people chasing a non-problem.
+    """
+    log = (_EMPTY_SYNTH_LOG + "\nWarning: Ignoring module calculator because it "
+           "contains processes (run 'proc' command first).\n")
+    assert "contains processes" not in flow.synth_produced_nothing(log, "calculator")
+
+
+def test_explain_orfs_failure_translates_the_route_stage_symptom():
+    """
+    The error the user actually saw.  It names ``estimate_parasitics`` — a command
+    that ran perfectly — and says nothing about the empty netlist four stages
+    upstream that is the real cause.
+    """
+    log = (
+        "[INFO GRT-0018] Total wirelength: 0 um\n"
+        "[ERROR EST-0005] Run global_route before estimating parasitics for "
+        "global routing.\n"
+        "Error: global_route.tcl, 175 EST-0005\n"
+    )
+    out = flow.explain_orfs_failure(log)
+    assert "EST-0005" in out
+    assert "empty netlist" in out
+
+
+def test_explain_orfs_failure_finds_a_hint_that_was_only_ever_a_warning():
+    """
+    CTS reports a missing clock as a WARNING and carries on, so a hint keyed on it
+    is only reachable if the whole log — not just the ERROR lines — is searched.
+    """
+    log = ("[WARNING CTS-0083] No clock nets have been found.\n"
+           "[ERROR XYZ-1] something later blew up\n")
+    out = flow.explain_orfs_failure(log)
+    assert "XYZ-1" in out            # the unrecognised error is still surfaced
+    assert "clock_port" in out       # and the earlier warning explains it
