@@ -20,8 +20,9 @@ sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), ".."
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from EDA.models import EDA_KINDS  # noqa: E402
+from EDA.models import DEFAULT_IMAGE, DEFAULT_VERIFY_IMAGE, EDA_KINDS  # noqa: E402
 from EDA.registry import EdaRecord, registry  # noqa: E402
+from EDA.router_base import _coerce_kind  # noqa: E402
 from EDA.models import EdaSpec  # noqa: E402
 
 
@@ -81,6 +82,52 @@ def test_run_body_fields_are_parsed_not_ignored(client, kind):
     resp = client.post(f"/{kind}/does-not-exist/run", json=payloads[kind])
     assert resp.status_code == 200, resp.text
     assert resp.json()["kind"] == kind
+
+
+def test_run_accepts_the_cocotb_body_fields(client):
+    """
+    The cocotb inputs go through the same runtime-annotation path as everything
+    else on /run, so a new field that FastAPI cannot resolve would demote the
+    whole body to a query parameter and 422 every run.
+    """
+    resp = client.post("/verilator/does-not-exist/run", json={
+        "rtl": "module m(); endmodule", "testbench": "import cocotb",
+        "mode": "cocotb", "simulator": "icarus", "tests": "test_a",
+        "seed": "42", "coverage": "1", "sva": "bind m chk c(.*);",
+    })
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["kind"] == "verilator"
+
+
+# ---------------------------------------------------------------------------
+# Per-kind image and disk
+# ---------------------------------------------------------------------------
+
+def test_a_verilator_block_gets_the_light_verify_image():
+    """
+    A simulation takes seconds; pulling the multi-gigabyte ORFS image to run it is
+    most of the wall clock and most of the cost, and the fix loop pays that on
+    every iteration.
+    """
+    spec = _coerce_kind(EdaSpec(), "verilator")
+    assert spec.kind == "verilator"
+    assert spec.image == DEFAULT_VERIFY_IMAGE
+    assert spec.container_disk_gb == 20
+
+
+@pytest.mark.parametrize("kind", ["yosys", "openroad"])
+def test_synthesis_kinds_keep_the_pdk_image(kind):
+    spec = _coerce_kind(EdaSpec(), kind)
+    assert spec.image == DEFAULT_IMAGE
+    assert spec.container_disk_gb == 60
+
+
+def test_an_explicitly_pinned_image_is_never_replaced():
+    """An image on the block's port is the user pinning a toolchain."""
+    spec = _coerce_kind(EdaSpec(image="ghcr.io/me/my-eda:tag",
+                                container_disk_gb=100), "verilator")
+    assert spec.image == "ghcr.io/me/my-eda:tag"
+    assert spec.container_disk_gb == 100
 
 
 # ---------------------------------------------------------------------------

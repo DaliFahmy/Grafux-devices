@@ -93,6 +93,14 @@ services:
       # "no public-IP networking" error). PIN THE TAG; never track :latest here.
       - key: EDA_DEFAULT_IMAGE
         value: "ghcr.io/dalifahmy/grafux-eda:sky130-20260901"
+      # The VERIFY image, used for the verilator kind only: Verilator + cocotb +
+      # Icarus, no PDK and no OpenROAD (see EDA/docker/Dockerfile.verify). A
+      # cocotb run takes seconds, so on the full EDA image the pull is nearly the
+      # whole wall clock and the whole cost — and the verification fix loop pays
+      # that on every iteration. Same rules as above: PIN THE TAG, and the GHCR
+      # package must be PUBLIC or RunPod's anonymous pull fails silently.
+      - key: EDA_VERIFY_IMAGE
+        value: "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902"
       # Default process design kit / OpenROAD platform. sky130hd is the standard
       # open-source target and what every public ORFS example uses.
       - key: EDA_DEFAULT_PDK

@@ -70,6 +70,35 @@ ORFS_STAGES = ("synth", "floorplan", "place", "cts", "route", "final")
 # The kinds this package serves, one per Grafux block type.
 EDA_KINDS = ("verilator", "yosys", "openroad")
 
+# The light verification image: Verilator + cocotb + iverilog, no PDK and no
+# OpenROAD.  It exists because pod placement and image pull dominate a simulation
+# that itself takes seconds -- pulling a multi-gigabyte ORFS image to run a
+# 200-cycle FIFO test is most of the wall clock and most of the cost, and the fix
+# loop pays that price on every iteration.  Built from EDA/docker/Dockerfile.verify.
+#
+# PIN THE TAG, for the same reason DEFAULT_IMAGE is pinned.  Verilator is held at
+# the SAME version in both images: a design that simulates in one and fails in the
+# other is a bug report nobody can reproduce.
+DEFAULT_VERIFY_IMAGE = os.environ.get(
+    "EDA_VERIFY_IMAGE",
+    "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902",
+)
+
+
+def image_for_kind(kind: str) -> str:
+    """
+    The default image for an EDA kind.
+
+    Only synthesis and place-and-route need the PDK and the OpenROAD toolchain;
+    verilator needs a simulator and cocotb, which is a tenth of the size.
+    """
+    return DEFAULT_VERIFY_IMAGE if (kind or "") == "verilator" else DEFAULT_IMAGE
+
+
+def disk_for_kind(kind: str) -> int:
+    """Container disk in GB for an EDA kind -- the verify image needs far less."""
+    return 20 if (kind or "") == "verilator" else 60
+
 
 class EdaSpec(BaseModel):
     """The persistent definition of an EDA pod (everything except the live run)."""
@@ -145,12 +174,40 @@ class VerilatorRunRequest(_RunBase):
         ),
     )
     top: str = Field("", description="Top module name; inferred from the RTL when empty.")
-    mode: str = Field("sim", description="'sim' (build + run a testbench) or 'lint' (lint only).")
+    mode: str = Field(
+        "sim",
+        description=(
+            "'sim' (build + run a C++ harness), 'lint' (lint only), or 'cocotb' "
+            "(run a Python cocotb testbench). A Python testbench is detected and "
+            "run as cocotb even when mode is left at 'sim'."
+        ),
+    )
     defines: str = Field("", description="Preprocessor defines, e.g. 'WIDTH=8 DEBUG'.")
     include_dirs: str = Field("", description="Space- or newline-separated +incdir paths.")
     trace: str = Field("1", description="'1' to build with --trace and emit a VCD waveform.")
     sim_args: str = Field("", description="argv passed to the compiled simulation binary.")
     verilator_flags: str = Field("", description="Extra flags passed to verilator.")
+    sva: str = Field(
+        "",
+        description=(
+            "Optional SystemVerilog assertions compiled alongside the design "
+            "(cocotb mode; enables --assert)."
+        ),
+    )
+    simulator: str = Field(
+        "verilator",
+        description=(
+            "cocotb mode only: 'verilator' (default) or 'icarus' -- the escape "
+            "hatch when a Verilator/cocotb version pair misbehaves."
+        ),
+    )
+    tests: str = Field(
+        "", description="cocotb mode: comma-separated testcase names to run; empty runs all."
+    )
+    seed: str = Field("", description="cocotb mode: RNG seed, for a reproducible run.")
+    coverage: str = Field(
+        "1", description="cocotb mode: '1' to build with --coverage and report line/branch coverage."
+    )
 
 
 class YosysRunRequest(_RunBase):

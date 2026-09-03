@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1234"/>
+    <testcase name="test_reset_values" classname="test_sync_fifo" file="test_sync_fifo.py" time="0.01"/>
+    <testcase name="test_push_pop_roundtrip" classname="test_sync_fifo" file="test_sync_fifo.py" time="0.02"/>
+    <testcase name="test_full_asserts_at_depth" classname="test_sync_fifo" file="test_sync_fifo.py" time="0.03"/>
+  </testsuite>
+</testsuites>

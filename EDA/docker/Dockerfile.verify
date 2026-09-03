@@ -1,0 +1,123 @@
+# The Grafux VERIFY image: Verilator + cocotb + Icarus, reachable over SSH.
+#
+# WHY A SECOND IMAGE.  ../Dockerfile builds on openroad/orfs, which carries a PDK
+# and the whole OpenROAD toolchain -- several gigabytes that synthesis and
+# place-and-route genuinely need and that a simulation never touches.  A cocotb
+# run of a small design takes SECONDS, so on that image pod placement and the
+# image pull are essentially the entire wall clock and essentially the entire
+# cost.  The verification fix loop pays that on every iteration, which is what
+# makes it worth maintaining a second, small image rather than one big one.
+#
+# The pod is provisioned per BLOCK, from an EdaSpec that has no idea whether the
+# next run will be lint, sim or cocotb -- so this image serves all three, and
+# EDA/models.py: image_for_kind() selects it for the whole `verilator` kind.
+# A verilator pod therefore has no yosys and no openroad on it.  Nothing in
+# run_verilator/run_cocotb invokes either (liberty resolution is yosys/ORFS-only),
+# so that is a size saving rather than a missing feature.
+#
+# Same sshd contract as the EDA image, and for the same reason: RunPod injects a
+# key through PUBLIC_KEY but does NOT add an sshd to arbitrary images, and a pod
+# with nothing listening on 22 fails provisioning with a misleading "does not
+# provide direct public-IP networking" error.  start.sh is shared verbatim.
+#
+# Build and push (PIN THE TAG; see EDA/models.py DEFAULT_VERIFY_IMAGE):
+#   docker build -t ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902 \
+#       -f EDA/docker/Dockerfile.verify EDA/docker
+#   docker push  ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902
+#
+# The pushed GHCR package must be PUBLIC: RunPod pulls anonymously, and a private
+# package fails the pull silently -- the pod comes up with no image and times out
+# with the same misleading 'no public-IP networking' error as a missing sshd.
+#
+# Verify before shipping a new tag:
+#   docker run --rm <img> bash -lc 'command -v verilator iverilog lcov sshd; \
+#     verilator --version; \
+#     /opt/cocotb-venv/bin/python -c "import cocotb, cocotb_tools.runner; print(cocotb.__version__)"'
+# Expect Verilator 5.050 and cocotb 2.0.x, and cocotb_tools.runner must import --
+# that module is where get_runner lives in cocotb 2.x, and the generated
+# run_cocotb.py fails inside the pod if it is missing.
+#
+# Local development (no RunPod account, no spend) -- what EDA_LOCAL_SSH=1 talks to:
+#   ssh-keygen -t rsa -b 2048 -f /tmp/eda_key -N ''
+#   docker run -d --name grafux-verify -p 2222:22 \
+#       -e PUBLIC_KEY="$(cat /tmp/eda_key.pub)" <img>
+#   EDA_LOCAL_SSH=1 EDA_LOCAL_KEY=/tmp/eda_key uvicorn device.app:app
+
+# ---------------------------------------------------------------------------
+# Stage 1: build Verilator from source.
+# ---------------------------------------------------------------------------
+# ubuntu:22.04 rather than 24.04 because it is what openroad/orfs derives from:
+# a Verilator built on a different libc than the one in ../Dockerfile could
+# behave differently on the same design, and "it simulates in one block and not
+# the other" is a bug report nobody can reproduce.
+FROM ubuntu:22.04 AS verilator-build
+
+# PIN THIS, and keep it IDENTICAL to VERILATOR_TAG in ../Dockerfile. Ubuntu's own
+# package is Verilator 4.038 (2020), far behind the SystemVerilog an LLM writing
+# RTL will happily emit; and cocotb 2.x needs >= 5.036 for --timing.
+ARG VERILATOR_TAG=v5.050
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates git make g++ autoconf flex bison perl python3 \
+        libfl-dev zlib1g-dev help2man \
+ && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "${VERILATOR_TAG}" \
+        https://github.com/verilator/verilator.git /tmp/verilator \
+ && cd /tmp/verilator \
+ && autoconf \
+ && ./configure \
+ && make -j"$(nproc)" \
+ && make install \
+ && cd / \
+ && rm -rf /tmp/verilator
+
+# ---------------------------------------------------------------------------
+# Stage 2: the runtime image.
+# ---------------------------------------------------------------------------
+FROM ubuntu:22.04
+
+# g++, make and perl are RUNTIME dependencies here, not just build ones:
+# `verilator` is a Perl script, and it compiles the C++ model it generates at
+# simulation time. iverilog is the escape hatch for designs Verilator refuses;
+# lcov is only for genhtml (the coverage summary is parsed from the .info file
+# that verilator_coverage writes on its own, so lcov's absence never fails a run).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        openssh-server rsync ca-certificates \
+        g++ make perl python3 python3-venv \
+        zlib1g libfl2 iverilog lcov \
+ && mkdir -p /var/run/sshd /root/.ssh \
+ && chmod 700 /root/.ssh \
+ && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+ && sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+ && rm -rf /var/lib/apt/lists/*
+
+# The share tree is not optional: it carries verilated.h and the rest of the
+# C++ runtime the generated model includes, so without it every simulation fails
+# at compile time with a missing-header error that looks like a user problem.
+COPY --from=verilator-build /usr/local/bin/verilator* /usr/local/bin/
+COPY --from=verilator-build /usr/local/share/verilator /usr/local/share/verilator
+
+# cocotb in its own virtualenv, not in the system python: Verilator's own
+# tooling uses system python3, and a shared site-packages is how that breaks.
+#
+# The exact patch version is pinned, not a >=2.0,<3 range. cocotb 2.0 renamed
+# both the runner module (cocotb.runner -> cocotb_tools.runner) and several
+# environment variables; letting a future 2.x land silently is precisely the
+# class of surprise this whole design is built to avoid.
+RUN python3 -m venv /opt/cocotb-venv \
+ && /opt/cocotb-venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/cocotb-venv/bin/pip install --no-cache-dir "cocotb==2.0.0" "pytest==8.3.4"
+
+# This PATH is for `docker run ... bash -lc` smoke tests ONLY. An SSH exec does
+# NOT inherit Docker ENV -- that is the whole reason _EDA_ENV exists in
+# pod_client.py -- so what actually puts cocotb on the PATH for a real run is
+# _COCOTB_ENV in EDA/flow.py. Do not delete either as redundant; they cover
+# different callers.
+ENV PATH="/opt/cocotb-venv/bin:${PATH}"
+
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+EXPOSE 22
+CMD ["/start.sh"]

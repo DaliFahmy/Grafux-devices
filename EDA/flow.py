@@ -21,11 +21,13 @@ downloadable — which is usually exactly what the user needs to see.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import os
 import re
 import shlex
+import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .models import ORFS_STAGES
@@ -462,6 +464,296 @@ int main(int argc, char** argv) {{
 """
 
 
+# ---------------------------------------------------------------------------
+# cocotb: build the runner script that drives a Python testbench
+# ---------------------------------------------------------------------------
+#
+# WHY A GENERATED SCRIPT rather than a Makefile.  cocotb's classic entry point is
+# a Makefile that pulls in `$(shell cocotb-config --makefiles)/Makefile.sim`, which
+# hard-codes assumptions about the build directory and is awkward to drive over a
+# non-login SSH exec.  cocotb 2.x ships a first-class Python runner instead, so a
+# ~30-line script gives exact control over the build flags, the results path and
+# the stage markers, and it fails in Python where the traceback is readable.
+
+# cocotb's runner puts the compiled simulation and verilator's coverage.dat here.
+COCOTB_BUILD_DIR = "sim_build"
+COCOTB_RESULTS_XML = "results.xml"
+COCOTB_COVERAGE_DAT = f"{COCOTB_BUILD_DIR}/coverage.dat"
+COCOTB_COVERAGE_INFO = "coverage.info"
+
+# A testbench arrives as a lump of text on a port, with nothing to say what
+# language it is written in.  Classifying it is what lets `mode=sim` — the default
+# every verilator block already carries — keep working the moment a testbench
+# block is wired in: the cocotb tests are recognised and run as cocotb instead of
+# being handed to a C++ compiler that would reject them as syntax errors.
+_COCOTB_MARKERS = ("import cocotb", "from cocotb", "@cocotb.test")
+_CPP_MARKERS = ("#include", "Verilated", "sc_time_stamp", "int main(")
+
+
+def testbench_kind(testbench: str) -> str:
+    """
+    Classify a testbench as ``"python"`` (cocotb), ``"cpp"``, or ``""``.
+
+    ``""`` means "cannot tell", never "there is no testbench", so callers fall back
+    to the mode they were explicitly asked for rather than guessing.
+    """
+    text = testbench or ""
+    if not text.strip():
+        return ""
+    if any(marker in text for marker in _COCOTB_MARKERS):
+        return "python"
+    if any(marker in text for marker in _CPP_MARKERS):
+        return "cpp"
+    # Last resort: a file that parses as Python is Python, whatever it imports.
+    # Handing a testbench with no cocotb import to a C++ compiler produces a wall
+    # of syntax errors that reads as the user's fault rather than the tool's.
+    try:
+        ast.parse(text)
+    except SyntaxError:
+        return ""
+    return "python"
+
+
+def resolve_verilator_mode(mode: str, testbench: str) -> Tuple[str, str]:
+    """
+    The mode a verilator run should actually use, and why, if it differs.
+
+    Every verilator block created before cocotb existed carries ``mode="sim"``, and
+    so does the creation dialog's default — so wiring a testbench block into one
+    has to simply work rather than feeding Python to a C++ compiler.  A Python
+    testbench therefore promotes "sim" to "cocotb", and the returned note goes onto
+    the warnings port so the user can see why the run took that path.
+
+    ``lint`` is NEVER promoted: it is a deliberate "do not simulate" request, and
+    quietly turning it into a simulation would spend pod-minutes nobody asked for.
+    """
+    requested = (mode or "sim").strip().lower()
+    kind = testbench_kind(testbench)
+    if requested == "lint":
+        return "lint", ""
+    if requested == "cocotb":
+        if kind == "cpp":
+            return "cocotb", (
+                "mode=cocotb was requested but the testbench looks like a C++ "
+                "harness; it is being run as cocotb anyway.")
+        if not kind:
+            return "cocotb", "mode=cocotb was requested with no Python testbench."
+        return "cocotb", ""
+    if kind == "python":
+        return "cocotb", (
+            f"The testbench is a cocotb (Python) testbench, so it was run with "
+            f"mode=cocotb rather than the requested mode={requested}.")
+    return requested, ""
+
+
+def cocotb_build_args(
+    simulator: str,
+    *,
+    trace: bool = True,
+    coverage: bool = True,
+    assertions: bool = False,
+    extra_flags: str = "",
+) -> List[str]:
+    """
+    Simulator-specific build flags for a cocotb run.
+
+    ``--timing`` is not optional for Verilator: cocotb 2.x drives the design from
+    Python coroutines, and without the timing-aware scheduler a testbench that
+    awaits a clock edge hangs until the timeout instead of failing loudly.
+
+    ``-Wno-fatal`` is deliberate.  Verilator promotes most warnings to errors by
+    default, so a single width mismatch in AI-drafted RTL would kill the build
+    before a single test ran — turning "your FIFO drops the last entry", which is
+    what the user needs to hear, into "verilator exited 1".  Lint is its own mode
+    for exactly this reason; here the tests are the verdict.
+    """
+    sim = (simulator or "verilator").strip().lower()
+    args: List[str] = []
+    if sim == "verilator":
+        # --public-flat-rw is what makes the design's ports visible over VPI;
+        # without it every dut.<signal> in the testbench fails with "not found",
+        # which reads as a broken testbench rather than a missing flag. cocotb's
+        # own runner adds it in most versions — passing it is harmless if so.
+        args += ["--timing", "--public-flat-rw", "-Wno-fatal"]
+        if trace:
+            args.append("--trace")
+        if coverage:
+            args.append("--coverage")
+        if assertions:
+            # Only when the user actually wired SVA in: --assert makes Verilator
+            # honour `assert property`, and turning it on unconditionally would
+            # change how an ordinary design's own assertions behave.
+            args.append("--assert")
+    elif sim == "icarus":
+        # cocotb needs the 2012 dialect for anything past plain Verilog-2001.
+        args.append("-g2012")
+    args += _split_tokens(extra_flags)
+    return args
+
+
+def normalize_simulator(simulator: str) -> str:
+    """Map the simulator port value onto a name ``cocotb_tools.runner`` knows."""
+    sim = (simulator or "").strip().lower()
+    if sim in ("iverilog", "icarus"):
+        return "icarus"
+    return "verilator"
+
+
+def sva_binding_problem(sva: str) -> str:
+    """
+    Why this SVA text cannot be compiled in, or "" when it can.
+
+    An assertion module that is never ``bind``-ed compiles cleanly, runs nothing,
+    and reports success — a false green, which is the one outcome a verification
+    block must never produce.  Without a bind statement we would have to guess the
+    port mapping, so it is refused and the reason goes on the warnings port.
+    """
+    text = (sva or "").strip()
+    if not text:
+        return ""
+    if not re.search(r"\bbind\b", text):
+        return ("the SVA text has no `bind` statement, so its assertions would "
+                "never be attached to the design and would report success without "
+                "checking anything; it was skipped")
+    return ""
+
+
+def build_cocotb_runner_script(
+    *,
+    top: str,
+    sources: Sequence[str],
+    test_module: str,
+    simulator: str = "verilator",
+    trace: bool = True,
+    coverage: bool = True,
+    assertions: bool = False,
+    seed: str = "",
+    tests: str = "",
+    extra_flags: str = "",
+    build_dir: str = COCOTB_BUILD_DIR,
+) -> str:
+    """
+    The ``run_cocotb.py`` text: build the design, run the tests, write results.xml.
+
+    ``cocotb_tools.runner`` is the cocotb **2.x** location; ``cocotb.runner`` is the
+    1.x one and importing it here fails only inside the pod, at run time.
+
+    The script prints ``GRAFUX_STAGE <name>`` markers so one invocation still
+    reports build and simulation as separate stages, and it swallows the non-zero
+    exit a failing test produces — a failing test is a normal result for this
+    block, and ``results.xml`` is what the caller judges on.
+    """
+    sim = normalize_simulator(simulator)
+    build_args = cocotb_build_args(
+        sim, trace=trace, coverage=coverage, assertions=assertions,
+        extra_flags=extra_flags)
+    testcases = _split_tokens(tests)
+    # cocotb wants an int seed; anything else is dropped rather than crashing the
+    # run inside the pod over a stray character in a port value.
+    seed_val = (seed or "").strip()
+    if not seed_val.isdigit():
+        seed_val = ""
+    return f'''# Auto-generated by Grafux - do not edit; regenerate from EDA/flow.py.
+import os
+import sys
+import traceback
+
+# cocotb moved its runner from `cocotb.runner` (1.x) to `cocotb_tools.runner`
+# (2.x). Trying both, and saying which one answered, turns a version mismatch
+# into one readable line in the log instead of an ImportError inside a pod.
+try:
+    from cocotb_tools.runner import get_runner
+    print("GRAFUX_COCOTB_RUNNER cocotb_tools.runner", flush=True)
+except ImportError:
+    from cocotb.runner import get_runner
+    print("GRAFUX_COCOTB_RUNNER cocotb.runner", flush=True)
+
+TOP = {json.dumps(top)}
+SOURCES = {json.dumps(list(sources))}
+TEST_MODULE = {json.dumps(test_module)}
+SIMULATOR = {json.dumps(sim)}
+BUILD_ARGS = {json.dumps(build_args)}
+BUILD_DIR = {json.dumps(build_dir)}
+TESTCASES = {json.dumps(testcases)}
+SEED = {json.dumps(seed_val)}
+WAVES = {bool(trace)!r}
+
+# An absolute path is used as-is by the runner; a relative one would land inside
+# the build directory, where the caller does not look for it. A results file that
+# cannot be found is indistinguishable from tests that never ran, so it is pinned
+# three ways: this path, TEST_DIR below, and a glob on the way back out.
+TEST_DIR = os.getcwd()
+RESULTS_XML = os.path.abspath({json.dumps(COCOTB_RESULTS_XML)})
+
+# Both spellings: cocotb 2.0 renamed these, and setting only one silently no-ops.
+ENV = dict(COCOTB_ANSI_OUTPUT="0", COCOTB_REDUCED_LOG_FMT="1",
+           COCOTB_RESULTS_FILE=RESULTS_XML)
+if SEED:
+    ENV["COCOTB_RANDOM_SEED"] = SEED
+    ENV["RANDOM_SEED"] = SEED
+
+runner = get_runner(SIMULATOR)
+
+print("GRAFUX_STAGE build", flush=True)
+try:
+    runner.build(verilog_sources=SOURCES, hdl_toplevel=TOP,
+                 build_args=BUILD_ARGS, build_dir=BUILD_DIR,
+                 waves=WAVES, always=True)
+except Exception:
+    traceback.print_exc()
+    print("GRAFUX_BUILD_FAILED", flush=True)
+    sys.exit(2)
+
+print("GRAFUX_STAGE sim", flush=True)
+kwargs = dict(hdl_toplevel=TOP, test_module=TEST_MODULE, build_dir=BUILD_DIR,
+              test_dir=TEST_DIR, results_xml=RESULTS_XML, waves=WAVES,
+              extra_env=ENV)
+if TESTCASES:
+    kwargs["testcase"] = TESTCASES
+if SEED:
+    kwargs["seed"] = int(SEED)
+try:
+    runner.test(**kwargs)
+except SystemExit as exc:
+    # A failing test makes the runner exit non-zero. That is an expected outcome
+    # here, not a tool crash: results.xml carries the verdict.
+    print("GRAFUX_TESTS_FAILED %s" % (exc.code,), flush=True)
+except TypeError:
+    # An older/newer runner that does not accept one of the optional kwargs;
+    # retry with the minimum that every version has ever supported rather than
+    # failing a run over a keyword name.
+    traceback.print_exc()
+    print("GRAFUX_SIM_RETRY_MINIMAL", flush=True)
+    try:
+        runner.test(hdl_toplevel=TOP, test_module=TEST_MODULE,
+                    build_dir=BUILD_DIR, results_xml=RESULTS_XML)
+    except SystemExit as exc:
+        print("GRAFUX_TESTS_FAILED %s" % (exc.code,), flush=True)
+except Exception:
+    traceback.print_exc()
+    print("GRAFUX_SIM_ERROR", flush=True)
+    sys.exit(3)
+print("GRAFUX_STAGE report", flush=True)
+'''
+
+
+def build_coverage_cmd(out: str = COCOTB_COVERAGE_INFO) -> str:
+    """
+    Turn Verilator's raw ``coverage.dat`` into an lcov ``.info`` report.
+
+    Verilator writes ``coverage.dat`` into whatever directory the simulation ran
+    in, and which directory that is depends on the cocotb version — so the file is
+    located at run time rather than assumed.  Guessing wrong here would report
+    "no coverage" for a run that measured it perfectly well.
+    """
+    candidates = f"coverage.dat {COCOTB_BUILD_DIR}/coverage.dat"
+    return (
+        f'DAT=$(ls -1 {candidates} 2>/dev/null | head -1); '
+        f'if [ -n "$DAT" ]; then verilator_coverage --write-info {out} "$DAT"; '
+        f'else echo "no coverage.dat was produced" >&2; exit 1; fi'
+    )
+
+
 def build_yosys_script(
     *,
     top: str,
@@ -877,6 +1169,139 @@ def synth_produced_nothing(stage_log: str, top: str = "") -> str:
     return "\n\n".join(parts)
 
 
+def parse_cocotb_results(xml_text: str) -> Dict[str, Any]:
+    """
+    Turn cocotb's JUnit ``results.xml`` into a structured summary.
+
+    THE EXIT CODE IS NOT THE VERDICT.  Depending on the cocotb and simulator
+    versions a run with failing tests can still exit 0, and a run where the
+    testbench declared no tests at all exits 0 every time — which would read as a
+    clean pass and is the worst possible lie for a verification block to tell.
+    ``failed == 0 and total > 0`` is the condition callers must decide on.
+
+    Never raises.  A missing or truncated report is itself a result the block has
+    to show, so bad input comes back as an empty summary carrying ``error``.
+    """
+    summary: Dict[str, Any] = {
+        "total": 0, "passed": 0, "failed": 0, "skipped": 0, "tests": [],
+    }
+    text = (xml_text or "").strip()
+    if not text:
+        summary["error"] = "no results.xml was produced"
+        return summary
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        summary["error"] = f"results.xml could not be parsed: {exc}"
+        return summary
+
+    for case in root.iter("testcase"):
+        status = "passed"
+        message = ""
+        for child in case:
+            tag = (child.tag or "").lower()
+            if tag in ("failure", "error"):
+                status = "failed"
+            elif tag == "skipped":
+                status = "skipped"
+            else:
+                continue
+            message = (child.get("message") or (child.text or "")).strip()
+            if tag in ("failure", "error"):
+                break
+        try:
+            elapsed = float(case.get("time") or 0.0)
+        except ValueError:
+            elapsed = 0.0
+        summary["tests"].append({
+            "name": (case.get("name") or "").strip(),
+            "classname": (case.get("classname") or "").strip(),
+            "status": status,
+            "time": elapsed,
+            "message": message,
+        })
+        summary["total"] += 1
+        summary[status] += 1
+
+    if summary["total"] == 0:
+        summary["error"] = (
+            "the testbench declared no tests — check that it defines at least one "
+            "@cocotb.test() and that its module name matches"
+        )
+    return summary
+
+
+# lcov records, summed across every source file in the report:
+#   LF/LH  lines found / hit      BRF/BRH  branches found / hit
+_LCOV_RECORD_RE = {
+    "lines": (re.compile(r"^LF:(\d+)", re.MULTILINE),
+              re.compile(r"^LH:(\d+)", re.MULTILINE)),
+    "branches": (re.compile(r"^BRF:(\d+)", re.MULTILINE),
+                 re.compile(r"^BRH:(\d+)", re.MULTILINE)),
+}
+
+
+def parse_lcov_summary(info_text: str) -> Dict[str, Any]:
+    """
+    Summarize an lcov ``.info`` file into hit/total/percent per metric.
+
+    Verilator's coverage is line and branch (toggle coverage is folded into lines
+    by ``verilator_coverage --write-info``), and a report with no records at all —
+    a design that never ran — yields zeros rather than a division error.
+    """
+    text = info_text or ""
+    out: Dict[str, Any] = {}
+    for metric, (found_re, hit_re) in _LCOV_RECORD_RE.items():
+        total = sum(int(n) for n in found_re.findall(text))
+        hit = sum(int(n) for n in hit_re.findall(text))
+        pct = round(100.0 * hit / total, 1) if total else 0.0
+        out[metric] = {"hit": hit, "total": total, "pct": pct}
+    return out
+
+
+def summarize_failures(
+    results: Dict[str, Any],
+    *,
+    max_tests: int = 10,
+    max_chars: int = 4000,
+) -> str:
+    """
+    The feedback payload: what failed, named, with the assertion message.
+
+    This text is what a human reads on the ``failures`` port AND what gets wired
+    into the code block's ``feedback`` port to drive an RTL repair, so it names the
+    test and quotes its assertion rather than dumping a log — the fix prompt has to
+    be able to tell which behaviour was wrong.
+
+    Returns "" when nothing failed, so an empty ``failures`` port means "clean".
+    """
+    if not results:
+        return ""
+    if results.get("error") and not results.get("tests"):
+        return str(results["error"])
+
+    failed = [t for t in results.get("tests", []) if t.get("status") == "failed"]
+    if not failed:
+        return str(results.get("error") or "")
+
+    total = int(results.get("total", 0) or 0)
+    header = f"{len(failed)} of {total} cocotb tests failed."
+    parts = [header, ""]
+    for test in failed[:max_tests]:
+        name = test.get("name") or "(unnamed test)"
+        parts.append(f"FAILED {name}")
+        message = " ".join(str(test.get("message", "")).split())
+        if message:
+            parts.append(f"  {message}")
+    if len(failed) > max_tests:
+        parts.append(f"... and {len(failed) - max_tests} more failing tests.")
+
+    text = "\n".join(parts)
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + "\n... (truncated)"
+    return text
+
+
 def globs_for(kind: str, *, work_dir: str = WORK_DIR, platform: str = "",
               design: str = "") -> List[str]:
     """
@@ -886,7 +1311,17 @@ def globs_for(kind: str, *, work_dir: str = WORK_DIR, platform: str = "",
     placement DEF and the reports that explain why.
     """
     if kind == "verilator":
-        return [f"{work_dir}/*.vcd", f"{work_dir}/*.log", f"{work_dir}/obj_dir/*.log"]
+        # The last five are the cocotb mode's: the JUnit report and the lcov
+        # summary are read back inline as well, but they are collected as
+        # artifacts too so a user can open the raw report, and depending on the
+        # cocotb version the waveform and build log land either beside the design
+        # or inside the runner's own build directory — so both are globbed.
+        return [f"{work_dir}/*.vcd", f"{work_dir}/*.fst",
+                f"{work_dir}/*.log", f"{work_dir}/obj_dir/*.log",
+                f"{work_dir}/{COCOTB_RESULTS_XML}", f"{work_dir}/{COCOTB_COVERAGE_INFO}",
+                f"{work_dir}/{COCOTB_BUILD_DIR}/*.vcd",
+                f"{work_dir}/{COCOTB_BUILD_DIR}/*.fst",
+                f"{work_dir}/{COCOTB_BUILD_DIR}/*.log"]
     if kind == "yosys":
         return [f"{work_dir}/*.v", f"{work_dir}/*.log", f"{work_dir}/*.json",
                 f"{work_dir}/*.txt"]
@@ -919,6 +1354,29 @@ def _sh(command: str) -> str:
     return "bash -lc " + shlex.quote(_EDA_ENV + command)
 
 
+# Scoped to the cocotb runner, deliberately NOT folded into _EDA_ENV: prepending
+# a venv to the PATH of every run would shadow the python3 that ORFS's own tooling
+# uses, which is the classic way to break yosys and openroad from a distance.
+#
+# PYTHONUNBUFFERED is not cosmetic. Without it cocotb's output arrives in one lump
+# when the process exits, so the live log tail shows nothing for the whole run and
+# the stage markers all arrive at once, after the stages they announce.
+#
+# There is no SIM=verilator here on purpose: that variable belongs to cocotb's
+# Makefile flow, and get_runner(...) does not read it.
+_COCOTB_ENV = (
+    'export PATH="/opt/cocotb-venv/bin:$PATH"; '
+    'export PYTHONUNBUFFERED=1; '
+    'export PYTHONDONTWRITEBYTECODE=1; '
+    f'export PYTHONPATH="{WORK_DIR}:$PYTHONPATH"; '
+)
+
+
+def _sh_cocotb(command: str) -> str:
+    """``_sh`` plus the cocotb virtualenv and unbuffered Python output."""
+    return _sh(_COCOTB_ENV + command)
+
+
 def _resolve_liberty(client, pdk: str, override: str = "") -> str:
     """
     Find the standard-cell liberty file for the platform inside the container.
@@ -945,15 +1403,26 @@ def run_verilator(
     should_cancel: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """
-    Lint or simulate a design with Verilator.
+    Lint, simulate, or run cocotb tests against a design with Verilator.
 
     Returns the ``outputs`` map for the block's ports plus bookkeeping keys
     (``_globs``, ``_status``, ``_stage``).  Never raises for a tool failure — a
     design that does not compile is a normal, expected result here, and the whole
     point of the block is to report it clearly.
+
+    ``mode="cocotb"`` hands off to :func:`run_cocotb`.  So does ``mode="sim"``
+    when the testbench is plainly Python: every verilator block created before
+    cocotb existed carries ``mode=sim``, and wiring a testbench block into one
+    must simply work rather than feeding Python to a C++ compiler.  Lint never
+    looks at the testbench, so it is left alone.
     """
     top = (req.top or "").strip() or infer_top_module(req.rtl)
-    mode = (req.mode or "sim").strip().lower()
+    mode, mode_note = resolve_verilator_mode(req.mode, req.testbench or "")
+    if mode == "cocotb":
+        if mode_note:
+            logger.info("verilator: %s", mode_note)
+        return run_cocotb(client, req, on_stage=on_stage, on_line=on_line,
+                          should_cancel=should_cancel, note=mode_note)
     trace = str(req.trace or "").strip().lower() in ("1", "true", "yes", "on")
     # The source file MUST be named after the top module. Verilator's -Wall (which
     # lint mode needs, since lint findings are the whole point there) promotes
@@ -1047,6 +1516,187 @@ def run_verilator(
         outputs["warnings"] = (outputs.get("warnings", "") + "\n" + err.strip()).strip()
     return {"outputs": outputs, "_status": "ok" if passed else "error", "_stage": "sim",
             "_globs": globs_for("verilator")}
+
+
+def run_cocotb(
+    client,
+    req,
+    *,
+    on_stage: Callable[[str, str], None],
+    on_line: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    note: str = "",
+) -> Dict[str, Any]:
+    """
+    Run a cocotb testbench against the design and report per-test results.
+
+    This is what makes a generated testbench executable rather than merely
+    readable: the design plus the Python tests go into the pod, cocotb's runner
+    builds and simulates them, and what comes back is a structured verdict
+    (``results``), a feedback payload naming what broke (``failures``) and a
+    coverage summary — the three things the fix loop needs.
+
+    Same contract as :func:`run_verilator`: returns the block's ``outputs`` plus
+    the ``_status``/``_stage``/``_globs`` bookkeeping keys, and never raises for a
+    tool failure. A design that fails its tests is the expected case here.
+
+    ``note`` is carried onto the ``warnings`` port — it is how a user who left the
+    mode at "sim" finds out why the run took the cocotb path.
+    """
+    top = (req.top or "").strip() or infer_top_module(req.rtl)
+    trace = str(req.trace or "").strip().lower() in ("1", "true", "yes", "on")
+    coverage = str(getattr(req, "coverage", "1") or "").strip().lower() in (
+        "1", "true", "yes", "on")
+    simulator = normalize_simulator(getattr(req, "simulator", ""))
+    notes: List[str] = [note] if note else []
+
+    # Coverage is a Verilator feature; icarus is the escape hatch for designs
+    # Verilator refuses, and silently reporting 0% there would look like a broken
+    # testbench rather than an unsupported combination.
+    if coverage and simulator != "verilator":
+        coverage = False
+        notes.append(f"Coverage is not collected with simulator={simulator}.")
+
+    # An unbound assertion module compiles, checks nothing and reports success —
+    # so SVA that cannot be bound is skipped loudly rather than compiled quietly.
+    sva = (getattr(req, "sva", "") or "").strip()
+    sva_problem = sva_binding_problem(sva)
+    if sva_problem:
+        notes.append(sva_problem)
+        sva = ""
+
+    # Same filename rule as sim/lint mode: Verilator's DECLFILENAME check is fatal
+    # when the file does not match the module name.
+    stem = _safe_filename(top)
+    source = f"{stem}.v"
+    test_module = f"test_{stem}"
+    sources = [source] + (["sva.sv"] if sva else [])
+
+    script = build_cocotb_runner_script(
+        top=top,
+        sources=sources,
+        test_module=test_module,
+        simulator=simulator,
+        trace=trace,
+        coverage=coverage,
+        assertions=bool(sva),
+        seed=getattr(req, "seed", "") or "",
+        tests=getattr(req, "tests", "") or "",
+        extra_flags=req.verilator_flags or "",
+    )
+
+    sftp = client.open_sftp()
+    try:
+        _write_file(sftp, f"{WORK_DIR}/{source}", req.rtl or "")
+        _write_file(sftp, f"{WORK_DIR}/{test_module}.py", req.testbench or "")
+        if sva:
+            _write_file(sftp, f"{WORK_DIR}/sva.sv", sva)
+        _write_file(sftp, f"{WORK_DIR}/run_cocotb.py", script)
+    finally:
+        sftp.close()
+
+    outputs: Dict[str, str] = {"top": top, "rtl": req.rtl or "", "lint": ""}
+    log_parts: List[str] = [f"$ cat run_cocotb.py\n{script}"]
+
+    # The generated script prints GRAFUX_STAGE markers so one python invocation
+    # still reports build and simulation as separate stages, instead of the UI
+    # sitting on a single opaque "running" for the whole run.
+    stage = ""
+
+    def handle_line(text: str) -> None:
+        nonlocal stage
+        marker = text.strip()
+        if marker.startswith("GRAFUX_STAGE "):
+            nxt = marker.split(None, 1)[1].strip()
+            if stage:
+                on_stage(stage, "done")
+            if nxt != "report":
+                on_stage(nxt, "running")
+            stage = nxt
+            return
+        if on_line:
+            on_line(text)
+
+    code, out, err = exec_stream(
+        client, _sh_cocotb(f"cd {WORK_DIR} && python3 run_cocotb.py"),
+        timeout=int(req.timeout or 900),
+        on_line=handle_line, should_cancel=should_cancel,
+    )
+    log_parts.append(f"$ python3 run_cocotb.py\n{out}\n{err}")
+    last_stage = stage or "build"
+    if last_stage != "report":
+        on_stage(last_stage, "done" if code == 0 else "failed")
+
+    if code in (-1, -2):
+        outputs.update({
+            "status": "error", "passed": "false", "results": "", "failures": "",
+            "coverage": "", "sim_output": out.strip(), "warnings": "\n".join(notes),
+            "errors": ("The cocotb run was cancelled" if code == -1
+                       else "The cocotb run exceeded its timeout"),
+            "log": "\n".join(log_parts),
+        })
+        return {"outputs": outputs, "_status": "error", "_stage": last_stage,
+                "_globs": globs_for("verilator")}
+
+    build_failed = "GRAFUX_BUILD_FAILED" in out or "GRAFUX_BUILD_FAILED" in err
+
+    # results.xml is the verdict, NOT the exit code — see parse_cocotb_results.
+    _rc, xml_text, _re = exec_simple(
+        client, _sh(f"cat {WORK_DIR}/{COCOTB_RESULTS_XML} 2>/dev/null"), timeout=60)
+    results = parse_cocotb_results(xml_text)
+    passed = results["failed"] == 0 and results["total"] > 0 and not build_failed
+
+    coverage_summary: Dict[str, Any] = {}
+    if coverage and results["total"] and not build_failed:
+        on_stage("coverage", "running")
+        cov_cmd = build_coverage_cmd()
+        ccode, cout, cerr = exec_stream(
+            client, _sh(f"cd {WORK_DIR} && {cov_cmd}"), timeout=300,
+            on_line=on_line, should_cancel=should_cancel,
+        )
+        log_parts.append(f"$ {cov_cmd}\n{cout}\n{cerr}")
+        if ccode == 0:
+            _cc, info_text, _ce = exec_simple(
+                client, _sh(f"cat {WORK_DIR}/{COCOTB_COVERAGE_INFO} 2>/dev/null"),
+                timeout=60)
+            coverage_summary = parse_lcov_summary(info_text)
+        else:
+            notes.append("Coverage could not be summarized; see the log.")
+        # Coverage is a nice-to-have: a design whose tests all passed must not be
+        # reported as failed because verilator_coverage had nothing to chew on.
+        on_stage("coverage", "done" if ccode == 0 else "failed")
+
+    failures = summarize_failures(results)
+    if build_failed:
+        hint = (
+            "The design did not build, so no test ran. The build log is above."
+        )
+        if sva:
+            hint += (
+                "  The `sva` port was wired in and is compiled alongside the "
+                "design — unbind it to rule the assertions out as the cause."
+            )
+        failures = hint if not failures else f"{hint}\n\n{failures}"
+
+    outputs.update({
+        "results": json.dumps(results, ensure_ascii=False),
+        "failures": failures,
+        "coverage": (json.dumps(coverage_summary, ensure_ascii=False)
+                     if coverage_summary else ""),
+        "sim_output": out.strip(),
+        # Notes explain the run's shape (why cocotb, why no coverage, skipped
+        # SVA); stderr is only worth surfacing when the run otherwise went well.
+        "warnings": "\n".join(notes + ([err.strip()] if err.strip() and passed else [])),
+        "passed": "true" if passed else "false",
+        "status": "ok" if passed else "error",
+        "errors": "" if passed else (
+            failures or str(results.get("error", ""))
+            or err.strip() or f"The cocotb run exited with code {code}"
+        ),
+        "log": "\n".join(log_parts),
+    })
+    return {"outputs": outputs, "_status": "ok" if passed else "error",
+            "_stage": last_stage, "_globs": globs_for("verilator")}
 
 
 def run_yosys(

@@ -44,23 +44,44 @@ from .models import (
     EdaSpec,
     EdaStatusResponse,
     EdaSummary,
+    DEFAULT_IMAGE,
+    disk_for_kind,
+    image_for_kind,
 )
 from .registry import registry
 
 logger = logging.getLogger("eda.router")
 
+# The EdaSpec default; anything else is a deliberate choice by the caller.
+_DEFAULT_DISK_GB = EdaSpec.model_fields["container_disk_gb"].default
+
 
 def _coerce_kind(spec: EdaSpec, kind: str) -> EdaSpec:
     """
-    Force the spec's kind to match the router it arrived on.
+    Force the spec's kind to match the router it arrived on, and give it the image
+    and disk that kind actually needs.
 
     The block sends its whole config blob and may not set ``kind`` at all; taking
     it from the URL means a yosys block can never accidentally provision itself as
     an openroad one and then fail confusingly at run time.
+
+    Image and disk are only filled in when the caller left them at the model
+    default -- an explicit value on the block's ``image`` port is the user pinning
+    a toolchain, and silently replacing it would be the most confusing bug in this
+    file.
     """
+    update: dict = {}
     if spec.kind != kind:
-        spec = spec.model_copy(update={"kind": kind})
-    return spec
+        update["kind"] = kind
+    if spec.image == DEFAULT_IMAGE:
+        wanted = image_for_kind(kind)
+        if wanted != spec.image:
+            update["image"] = wanted
+    if spec.container_disk_gb == _DEFAULT_DISK_GB:
+        wanted_disk = disk_for_kind(kind)
+        if wanted_disk != spec.container_disk_gb:
+            update["container_disk_gb"] = wanted_disk
+    return spec.model_copy(update=update) if update else spec
 
 
 def make_router(
