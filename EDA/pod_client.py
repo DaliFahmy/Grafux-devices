@@ -72,6 +72,14 @@ _EDA_ENV = (
 # The working directory inputs are staged into and results are read from.
 WORK_DIR = "/workspace/grafux"
 
+# Pod lifecycle states that mean the pod is not coming up.  RunPod's desiredStatus
+# enum is RUNNING | EXITED | TERMINATED; EXITED is what an image that cannot be
+# pulled lands in, and leaving it out is how such a pod used to burn the whole
+# _PUBLIC_IP_GRACE and then get blamed on the machine's networking.  An EDA pod
+# never exits on its own — start.sh runs sshd in the foreground — so EXITED here
+# always means failure.
+_TERMINAL_STATUSES = ("TERMINATED", "FAILED", "EXITED")
+
 
 class ProvisionError(RuntimeError):
     """
@@ -88,6 +96,19 @@ class CapacityError(ProvisionError):
 
 class NoEndpointError(ProvisionError):
     """A pod came up but never exposed a public SSH endpoint (machine has no public IP)."""
+
+
+class ImagePullError(RuntimeError):
+    """
+    The pod's container image cannot be pulled — a broken *configuration*, not a
+    placement failure.
+
+    Deliberately NOT a ProvisionError.  A fresh machine pulls the same missing or
+    private image and fails identically, so ``provision_eda`` must not hop: falling
+    through to its generic ``except Exception`` gives one terminate and an immediate
+    fatal error carrying the fix, instead of three pods and a misleading
+    "no public-IP networking" message several minutes later.
+    """
 
 
 # Substrings (case-insensitive) in a RunPod create error body that mean the failure
@@ -107,6 +128,70 @@ def _is_capacity_error(text: str) -> bool:
     """True if a RunPod create error body indicates a retryable placement failure."""
     low = (text or "").lower()
     return any(marker in low for marker in _CAPACITY_MARKERS)
+
+
+# Substrings (case-insensitive) that mean the *image* cannot be pulled.  Unlike a
+# capacity error this is never fixed by a fresh placement — every machine pulls the
+# same missing or private image — so it must be classified separately and fatally.
+# Sources: RunPod's own pod lifecycle text ("IMAGE_AUTH_ERROR", "problem pulling
+# the image"), Docker/containerd registry errors, and Kubernetes-style pull states.
+_IMAGE_ERROR_MARKERS = (
+    "image_auth_error",
+    "imagepullbackoff",
+    "errimagepull",
+    "manifest unknown",
+    "was not found on the registry",
+    "problem pulling the image",
+    "invalid reference format",
+    "pull access denied",
+    "repository does not exist",
+    "unauthorized: authentication required",
+)
+
+# "denied" is the tail of the registry's "denied: requested access to the resource
+# is denied" — but it is ALSO how RunPod words a rejection of our own API key, and
+# telling someone with a bad rp_... key to go change a GHCR package's visibility
+# sends them a long way in the wrong direction.  So these are only trusted when the
+# same text is visibly talking about an image.
+_IMAGE_ERROR_WEAK_MARKERS = ("denied", "not found")
+_IMAGE_CONTEXT_MARKERS = ("image", "pull", "registry", "manifest", "repository", "docker")
+
+
+def _is_image_error(text: str, image: str = "") -> bool:
+    """
+    True if ``text`` describes a failure to pull the pod image.
+
+    ``image``, when given, widens the weak tier: its repository path appearing in
+    the text is itself proof the message is about the image.
+    """
+    low = (text or "").lower()
+    if not low:
+        return False
+    if any(marker in low for marker in _IMAGE_ERROR_MARKERS):
+        return True
+    if any(marker in low for marker in _IMAGE_ERROR_WEAK_MARKERS):
+        context = list(_IMAGE_CONTEXT_MARKERS)
+        if image:
+            # Tag-insensitive: the reason text may name the repo without the tag.
+            context.append(image.lower().split(":")[0])
+        return any(marker in low for marker in context)
+    return False
+
+
+def _pod_image(pod: Dict[str, Any]) -> str:
+    """The image a pod payload reports (REST v1 says ``image``; be tolerant)."""
+    return str(pod.get("image") or pod.get("imageName") or "")
+
+
+def _pod_image_error(pod: Dict[str, Any]) -> str:
+    """
+    The pod's ``lastStatusChange`` when it describes a pull failure, else "".
+
+    ``lastStatusChange`` is RunPod's "text describing final lifecycle event" — it is
+    where IMAGE_AUTH_ERROR shows up, and the only place the reason is available.
+    """
+    reason = str(pod.get("lastStatusChange") or "")
+    return reason if _is_image_error(reason, _pod_image(pod)) else ""
 
 
 # RunPod's CPU flavour families, from the REST v1 schema's ``cpuFlavorIds`` enum.
@@ -215,11 +300,23 @@ def phase_from_pod(pod: Dict[str, Any]) -> Tuple[str, str]:
     creating       — placed but not yet RUNNING (still starting the container)
     pulling_image  — RUNNING but no public SSH endpoint yet (image still pulling)
     ready          — RUNNING with a public SSH endpoint
-    error          — TERMINATED / FAILED
+    error          — TERMINATED / FAILED / EXITED, or an image that cannot be pulled
+
+    The image check comes first: an unpullable image otherwise reports
+    ``pulling_image`` — technically true, permanently — so the block's live status
+    sits on a spinner instead of showing the one thing that would fix it.
     """
+    reason = _pod_image_error(pod)
+    if reason:
+        return "error", (
+            f"image {_pod_image(pod)} could not be pulled — it must exist and be "
+            f"PUBLIC (RunPod pulls anonymously): {reason.strip()[:160]}"
+        )
     status = (pod.get("desiredStatus") or pod.get("status") or "").upper()
-    if status in ("TERMINATED", "FAILED"):
-        return "error", f"pod entered status {status}"
+    if status in _TERMINAL_STATUSES:
+        detail = f"pod entered status {status}"
+        last = str(pod.get("lastStatusChange") or "").strip()
+        return "error", (f"{detail}: {last[:160]}" if last else detail)
     if _ssh_endpoint(pod):
         return "ready", ""
     if status == "RUNNING" or pod.get("machineId"):
@@ -328,6 +425,19 @@ def create_pod(api_key: str, spec, public_key: str) -> str:
         resp = client.post(f"{REST_BASE}/pods", headers=_headers(api_key), json=body)
     if resp.status_code not in (200, 201):
         text = resp.text or ""
+        # An image RunPod cannot resolve is a permanently broken config, so it is
+        # classified BEFORE capacity: RunPod answers both a bad image and genuine
+        # scarcity with a 500, and a body that matches both must be fatal — hopping
+        # machines over an unpullable image is pure spend.  401/403 are excluded on
+        # purpose: those are OUR api key being rejected, and an "access denied" there
+        # must never be blamed on the image.
+        if resp.status_code in (400, 404, 422, 500) and _is_image_error(text, spec.image):
+            raise ImagePullError(
+                _image_error_message(
+                    spec.image,
+                    f"RunPod rejected the create ({resp.status_code}): {text.strip()[:300]}",
+                )
+            )
         # A 429/500 whose body matches one of these is a *placement* failure, not a
         # bad request — escaped by a fresh placement, so raise a retryable error and
         # let provision_eda hop to another machine instead of failing the Run.
@@ -453,6 +563,34 @@ def _status_summary(pod: Dict[str, Any]) -> str:
     return "Pod: " + ", ".join(parts) + ". Networking: " + _net_summary(pod)
 
 
+def _image_error_message(
+    image: str,
+    reason: str,
+    pod_id: str = "",
+    pod: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    One wording for an unpullable image, shared by create and wait.
+
+    It has to say *both* halves of the contract, because either one alone produces
+    the identical registry "denied": the tag must actually exist, and the package
+    must be readable without credentials.
+    """
+    where = f"Pod {pod_id} " if pod_id else ""
+    tail = f" {_status_summary(pod)}" if pod else ""
+    return (
+        f"{where}could not pull its image {image!r}: {reason.strip()[:300]} "
+        "This is NOT a placement problem and retrying will not help. RunPod pulls "
+        "ANONYMOUSLY, so the image must (a) exist at that exact tag — build and push "
+        "it (EDA/docker/Dockerfile.verify for the verify image, EDA/docker/Dockerfile "
+        "for the full EDA image; the 'Build verify image' GitHub Actions workflow does "
+        "both steps) — and (b) be readable with no credentials: on GitHub open the "
+        "package -> Package settings -> Change visibility -> PUBLIC. Or point the "
+        "block's 'image' port (or EDA_VERIFY_IMAGE / EDA_DEFAULT_IMAGE on the devices "
+        f"server) at an image that is already published.{tail}"
+    )
+
+
 def wait_until_ready(
     api_key: str,
     pod_id: str,
@@ -463,8 +601,9 @@ def wait_until_ready(
     """
     Poll a pod until it is RUNNING with an SSH endpoint, returning (ip, port).
 
-    Raises NoEndpointError on timeout, on a terminal pod state, or as soon as it is
-    clear the machine has no public-IP networking.
+    Raises ImagePullError (fatal, never retried) as soon as the pod reports that it
+    cannot pull its image, and NoEndpointError (retryable) on timeout, on a terminal
+    pod state, or as soon as it is clear the machine has no public-IP networking.
     """
     if timeout_s is None:
         timeout_s = _PROVISION_TIMEOUT
@@ -473,8 +612,21 @@ def wait_until_ready(
     last: Dict[str, Any] = {}
     while time.monotonic() < deadline:
         last = get_pod(api_key, pod_id)
+        # The image check runs FIRST, and on every poll rather than only on a
+        # terminal status.  First, because RunPod writes IMAGE_AUTH_ERROR into
+        # lastStatusChange at the same moment it sets desiredStatus=EXITED: if the
+        # terminal branch below won the race the caller would get a *retryable*
+        # NoEndpointError and provision_eda would hop machines three times over an
+        # image that can never be pulled.  Every poll, because a backing-off pull can
+        # sit at RUNNING and never reach a terminal status at all — and because this
+        # way the failure is reported on the first poll instead of at _PUBLIC_IP_GRACE.
+        image_reason = _pod_image_error(last)
+        if image_reason:
+            raise ImagePullError(
+                _image_error_message(_pod_image(last), image_reason, pod_id, last)
+            )
         status = (last.get("desiredStatus") or last.get("status") or "").upper()
-        if status in ("TERMINATED", "FAILED"):
+        if status in _TERMINAL_STATUSES:
             raise NoEndpointError(
                 f"Pod {pod_id} entered status {status}. {_status_summary(last)}"
             )

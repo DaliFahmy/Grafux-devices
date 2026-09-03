@@ -248,6 +248,56 @@ def captured_body(monkeypatch):
     return sink
 
 
+def _fake_httpx_post(code: int, text: str):
+    """A fake httpx module whose POST always answers ``code`` with ``text``."""
+    class _Resp:
+        def __init__(self):
+            self.status_code, self.text = code, text
+
+        @staticmethod
+        def json():
+            return {}
+
+    class _C:
+        def __init__(self, **kw): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def post(self, *a, **kw): return _Resp()
+
+    class _M:
+        Client = staticmethod(lambda **kw: _C())
+
+    return _M
+
+
+@pytest.fixture
+def fake_clock_pod(monkeypatch):
+    """
+    Drive the REAL ``wait_until_ready`` against a scripted pod and a fake clock.
+
+    Set ``state["pod"]`` to the payload ``get_pod`` should return; read
+    ``state["t"]`` afterwards to prove the loop bailed early rather than burning
+    the grace window or the timeout.  Ported from ``test_gpu_runtime.py``.
+    """
+    state = {"pod": {}, "t": 0.0}
+    monkeypatch.setattr(pod_client, "get_pod", lambda api_key, pod_id: state["pod"])
+    monkeypatch.setattr(pod_client, "_PUBLIC_IP_GRACE", 10)
+    monkeypatch.setattr(pod_client.time, "monotonic", lambda: state["t"])
+    monkeypatch.setattr(pod_client.time, "sleep",
+                        lambda s: state.__setitem__("t", state["t"] + s))
+    return state
+
+
+# The verbatim reason RunPod writes into lastStatusChange when GHCR refuses an
+# anonymous pull — a missing tag and a private package produce the same text.
+IMAGE_AUTH_REASON = (
+    "IMAGE_AUTH_ERROR:Error response from daemon: Head "
+    '"https://ghcr.io/v2/dalifahmy/grafux-verify/manifests/v5050-cocotb20-20260902"'
+    ": denied"
+)
+VERIFY_IMAGE = "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902"
+
+
 def test_cpu_pod_body_uses_flavor_family_and_vcpu_count(captured_body):
     """
     RunPod selects a CPU pod by flavour FAMILY plus a separate vCPU count.
@@ -299,36 +349,127 @@ def test_gpu_fallback_body_is_unchanged(captured_body):
 
 def test_capacity_errors_are_retryable_but_other_4xx_are_not(monkeypatch):
     """A bad-request 400 must NOT be mistaken for transient scarcity."""
-    class _Resp:
-        def __init__(self, code, text):
-            self.status_code, self.text = code, text
-
-        def json(self):
-            return {}
-
-    def make_module(code, text):
-        class _C:
-            def __init__(self, **kw): pass
-            def __enter__(self): return self
-            def __exit__(self, *a): return False
-            def post(self, *a, **kw): return _Resp(code, text)
-
-        class _M:
-            Client = staticmethod(lambda **kw: _C())
-        return _M
-
     spec = EdaSpec(compute_type="CPU", instance_type="cpu3c-8")
 
+    # Still a CapacityError even though the image branch is now checked first on
+    # the same 500 — the ordering guard for that branch.
     monkeypatch.setattr(pod_client, "_httpx",
-                        lambda: make_module(500, "There are no instances currently available"))
+                        lambda: _fake_httpx_post(500,
+                                                 "There are no instances currently available"))
     with pytest.raises(pod_client.CapacityError):
         pod_client.create_pod("rp_k", spec, "pk")
 
     monkeypatch.setattr(pod_client, "_httpx",
-                        lambda: make_module(400, "cpuFlavorIds: invalid value"))
+                        lambda: _fake_httpx_post(400, "cpuFlavorIds: invalid value"))
     with pytest.raises(RuntimeError) as exc:
         pod_client.create_pod("rp_k", spec, "pk")
     assert not isinstance(exc.value, pod_client.ProvisionError)
+
+
+# ---------------------------------------------------------------------------
+# Unpullable image — fatal, fast, and never blamed on the machine
+#
+# The failure these cover: the verilator kind was pointed at a grafux-verify tag
+# that had never been pushed, so RunPod stopped every pod with IMAGE_AUTH_ERROR.
+# wait_until_ready saw only "not TERMINATED/FAILED", burned _PUBLIC_IP_GRACE, and
+# raised the *retryable* NoEndpointError blaming the machine's networking — so
+# provision_eda hopped and created three pods before giving up.
+# ---------------------------------------------------------------------------
+
+def test_image_pull_error_is_not_a_provision_error():
+    """The single fact provision_eda's handler ordering depends on."""
+    assert issubclass(pod_client.ImagePullError, RuntimeError)
+    assert not issubclass(pod_client.ImagePullError, pod_client.ProvisionError)
+
+
+def test_image_and_capacity_markers_never_cross_match():
+    """The two classifiers must stay disjoint, or 500s get routed at random."""
+    for marker in pod_client._IMAGE_ERROR_MARKERS:
+        assert not pod_client._is_capacity_error(marker), marker
+    for marker in pod_client._CAPACITY_MARKERS:
+        assert not pod_client._is_image_error(marker), marker
+
+
+def test_wait_until_ready_reports_an_unpullable_image_on_the_first_poll(fake_clock_pod):
+    """The real failure: EXITED + IMAGE_AUTH_ERROR, named and fatal."""
+    fake_clock_pod["pod"] = {
+        "desiredStatus": "EXITED", "machineId": "m1",
+        "image": VERIFY_IMAGE, "lastStatusChange": IMAGE_AUTH_REASON,
+    }
+    with pytest.raises(pod_client.ImagePullError) as exc:
+        pod_client.wait_until_ready("rp_k", "pod-1", timeout_s=900, poll_s=5)
+    message = str(exc.value)
+    assert VERIFY_IMAGE in message
+    assert "PUBLIC" in message
+    # Reported immediately, not at _PUBLIC_IP_GRACE (10 here) or the 900s timeout.
+    assert fake_clock_pod["t"] < 10
+
+
+def test_wait_until_ready_catches_an_image_error_before_the_pod_exits(fake_clock_pod):
+    """A backing-off pull can sit at RUNNING and never reach a terminal status."""
+    fake_clock_pod["pod"] = {
+        "desiredStatus": "RUNNING", "machineId": "m1",
+        "image": VERIFY_IMAGE, "lastStatusChange": IMAGE_AUTH_REASON,
+    }
+    with pytest.raises(pod_client.ImagePullError):
+        pod_client.wait_until_ready("rp_k", "pod-1", timeout_s=900, poll_s=5)
+
+
+def test_wait_until_ready_treats_exited_as_terminal(fake_clock_pod):
+    """EXITED for a non-image reason is still terminal — and still retryable."""
+    fake_clock_pod["pod"] = {
+        "desiredStatus": "EXITED", "machineId": "m1",
+        "image": VERIFY_IMAGE, "lastStatusChange": "container exited",
+    }
+    with pytest.raises(pod_client.NoEndpointError) as exc:
+        pod_client.wait_until_ready("rp_k", "pod-1", timeout_s=900, poll_s=5)
+    assert isinstance(exc.value, pod_client.ProvisionError)
+    assert fake_clock_pod["t"] < 10
+
+
+def test_create_pod_rejects_a_missing_image_fatally(monkeypatch):
+    """RunPod answers a bad image with a 500 — the same code as scarcity."""
+    spec = EdaSpec(kind="verilator", compute_type="CPU", instance_type="cpu3c-8",
+                   image=VERIFY_IMAGE)
+    monkeypatch.setattr(
+        pod_client, "_httpx",
+        lambda: _fake_httpx_post(
+            500, f'{{"error":"Container image {VERIFY_IMAGE} was not found on the registry"}}'),
+    )
+    with pytest.raises(pod_client.ImagePullError) as exc:
+        pod_client.create_pod("rp_k", spec, "pk")
+    assert not isinstance(exc.value, pod_client.ProvisionError)
+
+
+def test_create_pod_never_blames_the_image_for_an_api_key_rejection(monkeypatch):
+    """A 401 'access denied' is OUR key, not the GHCR package's visibility."""
+    spec = EdaSpec(kind="verilator", compute_type="CPU", instance_type="cpu3c-8",
+                   image=VERIFY_IMAGE)
+    monkeypatch.setattr(pod_client, "_httpx",
+                        lambda: _fake_httpx_post(401, "Access denied"))
+    with pytest.raises(RuntimeError) as exc:
+        pod_client.create_pod("rp_k", spec, "pk")
+    assert not isinstance(exc.value, pod_client.ImagePullError)
+
+
+def test_phase_from_pod_names_the_image_instead_of_pulling_forever():
+    """Live /status must show the reason, not spin on 'pulling_image'."""
+    bad = {"desiredStatus": "EXITED", "machineId": "m1",
+           "image": VERIFY_IMAGE, "lastStatusChange": IMAGE_AUTH_REASON}
+    phase, detail = pod_client.phase_from_pod(bad)
+    assert phase == "error"
+    assert VERIFY_IMAGE in detail
+
+    exited = dict(bad, lastStatusChange="container exited")
+    assert pod_client.phase_from_pod(exited)[0] == "error"
+
+    # The happy shapes must survive the new first branch.
+    assert pod_client.phase_from_pod(
+        {"desiredStatus": "RUNNING", "publicIp": "1.2.3.4",
+         "portMappings": {"22": 40022}})[0] == "ready"
+    assert pod_client.phase_from_pod(
+        {"desiredStatus": "RUNNING", "machineId": "m1"})[0] == "pulling_image"
+    assert pod_client.phase_from_pod({})[0] == "creating"
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +599,30 @@ def test_provision_terminates_the_pod_when_it_never_comes_up(monkeypatch, fake_p
     result = runtime.provision_eda(EdaSpec(kind="yosys"))
     assert result["status"] == "error"
     assert len(fake_pod["terminate"]) == runtime._PROVISION_ATTEMPTS
+
+
+def test_provision_does_not_hop_machines_on_an_unpullable_image(monkeypatch, fake_pod):
+    """
+    The regression guard for the three-pod burn.
+
+    Every machine pulls the same missing image, so a hop is pure spend: exactly one
+    pod may be created, and it must be freed with the fix on the errors port.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    monkeypatch.setattr(runtime, "_RETRY_BACKOFF_S", 0)
+
+    def unpullable(api_key, pod_id, **kwargs):
+        raise pod_client.ImagePullError(
+            pod_client._image_error_message(VERIFY_IMAGE, IMAGE_AUTH_REASON, pod_id)
+        )
+
+    monkeypatch.setattr(pod_client, "wait_until_ready", unpullable)
+    result = runtime.provision_eda(EdaSpec(kind="verilator"))
+    assert result["status"] == "error"
+    assert len(fake_pod["create"]) == 1          # NOT _PROVISION_ATTEMPTS
+    assert fake_pod["terminate"] == ["pod-1"]
+    assert "PUBLIC" in result["errors"]
+    assert VERIFY_IMAGE in result["errors"]
 
 
 def test_provision_terminates_on_an_unexpected_error(monkeypatch, fake_pod):

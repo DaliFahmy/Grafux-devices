@@ -1,0 +1,123 @@
+# Build and publish the VERIFY image (Verilator + cocotb + Icarus) to GHCR.
+#
+# WHY THIS EXISTS AS CI.  The image is built from source (Verilator v5.050), which
+# is slow and awkward on a laptop, and the tag it publishes is pinned in three
+# places that must agree byte-for-byte -- EDA/models.py DEFAULT_VERIFY_IMAGE,
+# render.yaml EDA_VERIFY_IMAGE, and the input default below.  Building it by hand
+# is how the tag ended up referenced everywhere but never actually pushed, which
+# fails at RunPod with a misleading IMAGE_AUTH_ERROR.
+#
+# MANUAL STEP AFTER THE FIRST RUN.  GHCR container packages are created PRIVATE on
+# first push even from a public repo, and GitHub exposes no API to change container
+# package visibility.  Flip it once at
+#   https://github.com/users/DaliFahmy/packages/container/grafux-verify/settings
+#   -> Danger Zone -> Change visibility -> Public
+# RunPod pulls ANONYMOUSLY, so a private package fails the pull.  The last step
+# below probes GHCR anonymously and fails the job if it is still private, so this
+# can never be silently forgotten again.
+name: Build verify image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Image tag to build. MUST match EDA/models.py DEFAULT_VERIFY_IMAGE and
+          render.yaml EDA_VERIFY_IMAGE, or the devices server asks RunPod for an
+          image that was never published.
+        required: true
+        default: "v5050-cocotb20-20260902"
+      push_image:
+        description: "Push to GHCR (uncheck to build + smoke-test only)"
+        type: boolean
+        required: true
+        default: true
+
+env:
+  IMAGE: ghcr.io/dalifahmy/grafux-verify
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build and LOAD rather than push: the smoke test below has to run against
+      # the real image before anything is published, because a tag that is already
+      # public and broken is worse than one that is missing.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: EDA/docker
+          file: EDA/docker/Dockerfile.verify
+          # RunPod CPU pods are amd64. Building anything else here would produce an
+          # image that pulls fine and then cannot start.
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}:${{ inputs.tag }}
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The exact check EDA/docker/Dockerfile.verify prescribes before shipping a
+      # tag. cocotb_tools.runner is where get_runner lives in cocotb 2.x; the
+      # run_cocotb.py that EDA/flow.py generates fails inside the pod without it,
+      # and that failure is invisible until someone rents a machine.
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          img="${IMAGE}:${{ inputs.tag }}"
+          out=$(docker run --rm "$img" bash -lc '
+            set -e
+            command -v verilator iverilog lcov sshd
+            verilator --version
+            /opt/cocotb-venv/bin/python -c "import cocotb, cocotb_tools.runner; print(\"cocotb\", cocotb.__version__)"
+          ')
+          echo "$out"
+          echo "$out" | grep -q "Verilator 5.050" \
+            || { echo "::error::expected Verilator 5.050"; exit 1; }
+          echo "$out" | grep -qE "^cocotb 2\.0\." \
+            || { echo "::error::expected cocotb 2.0.x with cocotb_tools.runner importable"; exit 1; }
+
+      - name: Push
+        if: ${{ inputs.push_image }}
+        run: docker push "${IMAGE}:${{ inputs.tag }}"
+
+      # RunPod pulls with no credentials, so "it pushed" is not the same as "it
+      # works". Ask GHCR for an anonymous pull token exactly the way RunPod's
+      # daemon does; DENIED means the package is still private.
+      - name: Verify the package is anonymously pullable
+        if: ${{ inputs.push_image }}
+        run: |
+          set -uo pipefail
+          img="${IMAGE}:${{ inputs.tag }}"
+          body=$(curl -sS "https://ghcr.io/token?scope=repository:dalifahmy/grafux-verify:pull&service=ghcr.io")
+          if echo "$body" | grep -q '"token"'; then
+            echo "### Published: \`$img\` (public, anonymously pullable)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Pushed \`$img\`, but the GHCR package is still PRIVATE"
+            echo ""
+            echo "RunPod pulls anonymously and will fail with \`IMAGE_AUTH_ERROR ... denied\`."
+            echo ""
+            echo "Fix it once, by hand:"
+            echo "https://github.com/users/DaliFahmy/packages/container/grafux-verify/settings"
+            echo "-> Danger Zone -> Change visibility -> Public"
+            echo ""
+            echo "GHCR said: \`$body\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::grafux-verify is not anonymously pullable; make the GHCR package public"
+          exit 1
