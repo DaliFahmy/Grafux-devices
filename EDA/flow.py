@@ -692,6 +692,56 @@ if SEED:
     ENV["COCOTB_RANDOM_SEED"] = SEED
     ENV["RANDOM_SEED"] = SEED
 
+
+# cocotb's VPI shim EMBEDS CPython inside the simulator binary, so it needs the
+# SHARED libpython, not merely a working `python3`. Debian and Ubuntu link the
+# interpreter statically and ship libpython3.x.so in a separate package, so an
+# image with python3 and cocotb installed still reaches this point and then dies
+# inside the runner with "Unable to find libpython" -- after a full, successful
+# Verilator build, which is what makes it read like a simulation bug.
+#
+# The image installs it (see EDA/docker/Dockerfile.verify). This resolver is the
+# belt-and-braces for an image that carries the library somewhere cocotb's own
+# find_libpython does not look, and it turns "genuinely not installed" into one
+# named marker the caller can explain instead of a traceback out of cocotb.
+def resolve_libpython():
+    loc = os.environ.get("LIBPYTHON_LOC", "")
+    if loc and os.path.exists(loc):
+        return loc
+    try:
+        import find_libpython
+        found = find_libpython.find_libpython()
+        if found:
+            return found
+    except Exception:
+        pass
+    import glob
+    import sysconfig
+    tag = "%d.%d" % sys.version_info[:2]
+    # LIBDIR/LIBPL point at the BASE interpreter even from inside a virtualenv,
+    # which is exactly where the distro puts the library.
+    dirs = [sysconfig.get_config_var("LIBDIR"), sysconfig.get_config_var("LIBPL"),
+            "/usr/lib/x86_64-linux-gnu", "/usr/lib", "/usr/local/lib"]
+    for directory in dirs:
+        if not directory:
+            continue
+        for pattern in ("libpython%s*.so" % tag, "libpython%s*.so.*" % tag):
+            hits = sorted(glob.glob(os.path.join(directory, pattern)))
+            if hits:
+                return hits[0]
+    return ""
+
+
+LIBPYTHON = resolve_libpython()
+if LIBPYTHON:
+    # os.environ, not just extra_env: the runner copies os.environ over its own
+    # env dict, so setting only extra_env is the version-dependent half of this.
+    os.environ["LIBPYTHON_LOC"] = LIBPYTHON
+    ENV["LIBPYTHON_LOC"] = LIBPYTHON
+    print("GRAFUX_LIBPYTHON %s" % (LIBPYTHON,), flush=True)
+else:
+    print("GRAFUX_LIBPYTHON_MISSING", flush=True)
+
 runner = get_runner(SIMULATOR)
 
 print("GRAFUX_STAGE build", flush=True)
@@ -1377,6 +1427,81 @@ def _sh_cocotb(command: str) -> str:
     return _sh(_COCOTB_ENV + command)
 
 
+# Pods are created once and then REUSED for the life of their block, and the
+# image tag is not part of any reuse key -- so fixing Dockerfile.verify does not
+# retroactively fix a pod that is already warm, and a user keeps hitting the
+# stale image until it idles out. This heals such a pod in place instead.
+#
+# `ldconfig -p` is the check because the library's exact name and directory are
+# distro-specific (libpython3.10.so.1.0 under /usr/lib/x86_64-linux-gnu here) and
+# the linker cache is the one place that knows all of them. It is also cheap: on
+# a correct image this is a grep against an in-memory table, which is what makes
+# it acceptable on every run. -dev goes in alongside the runtime package because
+# it carries the unversioned libpython3.10.so symlink that cocotb's own
+# find_libpython matches on -- the same pair the image installs at build time.
+#
+# Every apt line is redirected away and one deliberate marker is echoed instead:
+# a hundred lines of dpkg output in the block's log would bury the simulation
+# the user actually came to read.
+_LIBPYTHON_PREFLIGHT = (
+    "ldconfig -p 2>/dev/null | grep -q libpython3 "
+    "&& echo GRAFUX_LIBPYTHON_PRESENT "
+    "|| { apt-get update -qq >/dev/null 2>&1 "
+    "&& DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
+    "--no-install-recommends libpython3.10 libpython3.10-dev >/dev/null 2>&1 "
+    "&& echo GRAFUX_LIBPYTHON_INSTALLED "
+    "|| echo GRAFUX_LIBPYTHON_UNAVAILABLE; }"
+)
+
+
+def _ensure_libpython(client, notes: List[str],
+                      should_cancel: Optional[Callable[[], bool]] = None) -> None:
+    """
+    Give the pod the SHARED libpython cocotb needs, installing it if it is absent.
+
+    cocotb embeds CPython inside the simulator binary, so without this library a
+    design VERILATES AND COMPILES CLEANLY and only then dies in the runner with
+    "Unable to find libpython" -- a failure that reads like a broken testbench.
+    The verify image installs it; this covers the pod that was provisioned before
+    it did, which is the pod the user is waiting on right now.
+
+    Not gated on ``simulator``: the embedding lives in cocotb's own VPI library,
+    which icarus loads exactly as verilator does.  Scoped to :func:`run_cocotb`
+    alone, so lint, sim, yosys and openroad never touch apt.
+
+    Appends to ``notes`` (the block's ``warnings`` port) only when it changed
+    something or could not.  NEVER raises and never fails the run: a pod with no
+    route to the archives must still get its run and its own diagnosis from the
+    GRAFUX_LIBPYTHON_MISSING marker the runner script prints later.
+    """
+    if should_cancel and should_cancel():
+        return
+    try:
+        _code, out, _err = exec_simple(
+            client, _sh(_LIBPYTHON_PREFLIGHT), timeout=180)
+    except Exception as exc:  # noqa: BLE001 -- a preflight must not fail a run
+        logger.warning("libpython preflight did not complete: %s", exc)
+        notes.append(
+            "Could not check this pod for the shared libpython that cocotb "
+            "needs; the run went ahead without it.")
+        return
+    if "GRAFUX_LIBPYTHON_INSTALLED" in out:
+        notes.append(
+            "This pod's image predates the libpython fix, so the shared "
+            "libpython cocotb needs was installed before the run -- that is "
+            "the extra start-up time. Recreate the pod on a current image to "
+            "stop paying it."
+        )
+    elif "GRAFUX_LIBPYTHON_UNAVAILABLE" in out:
+        notes.append(
+            "This pod's image is missing the shared libpython that cocotb "
+            "needs and it could not be installed. If the run below did not "
+            "simulate, that is why."
+        )
+    # GRAFUX_LIBPYTHON_PRESENT is the steady state on a current image: nothing
+    # happened, and saying so on the warnings port would be noise.
+
+
 def _resolve_liberty(client, pdk: str, override: str = "") -> str:
     """
     Find the standard-cell liberty file for the platform inside the container.
@@ -1585,6 +1710,10 @@ def run_cocotb(
         extra_flags=req.verilator_flags or "",
     )
 
+    # Up front, before anything is staged: the point is that THIS run works, not
+    # that it comes back with a good explanation of why it did not.
+    _ensure_libpython(client, notes, should_cancel)
+
     sftp = client.open_sftp()
     try:
         _write_file(sftp, f"{WORK_DIR}/{source}", req.rtl or "")
@@ -1640,6 +1769,16 @@ def run_cocotb(
 
     build_failed = "GRAFUX_BUILD_FAILED" in out or "GRAFUX_BUILD_FAILED" in err
 
+    # A pod whose image lacks the shared libpython builds the design perfectly
+    # and then fails in cocotb's runner, so without this the user is handed a
+    # clean Verilator log and a ValueError about their design's environment.
+    # Checked in both streams and in both spellings: the generated script prints
+    # the marker, and an older script in a long-lived pod only shows cocotb's own
+    # message.
+    joined = out + err
+    libpython_missing = ("GRAFUX_LIBPYTHON_MISSING" in joined
+                         or "Unable to find libpython" in joined)
+
     # results.xml is the verdict, NOT the exit code — see parse_cocotb_results.
     _rc, xml_text, _re = exec_simple(
         client, _sh(f"cat {WORK_DIR}/{COCOTB_RESULTS_XML} 2>/dev/null"), timeout=60)
@@ -1667,6 +1806,17 @@ def run_cocotb(
         on_stage("coverage", "done" if ccode == 0 else "failed")
 
     failures = summarize_failures(results)
+    if libpython_missing:
+        env_hint = (
+            "The design built, but the simulator could not start: cocotb embeds "
+            "CPython in the simulator and needs the shared libpython, which is "
+            "missing from this pod's image. This is an image problem, not a "
+            "problem with the design or the testbench. Fix it by pinning a "
+            "verify image built after the libpython fix (EDA/models.py "
+            "DEFAULT_VERIFY_IMAGE), or, on a pod that is already up, by running "
+            "`apt-get install -y libpython3.10`."
+        )
+        failures = env_hint if not failures else f"{env_hint}\n\n{failures}"
     if build_failed:
         hint = (
             "The design did not build, so no test ran. The build log is above."

@@ -81,7 +81,7 @@ EDA_KINDS = ("verilator", "yosys", "openroad")
 # other is a bug report nobody can reproduce.
 DEFAULT_VERIFY_IMAGE = os.environ.get(
     "EDA_VERIFY_IMAGE",
-    "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902",
+    "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903",
 )
 
 

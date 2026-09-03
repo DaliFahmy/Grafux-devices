@@ -21,9 +21,9 @@
 # provide direct public-IP networking" error.  start.sh is shared verbatim.
 #
 # Build and push (PIN THE TAG; see EDA/models.py DEFAULT_VERIFY_IMAGE):
-#   docker build -t ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902 \
+#   docker build -t ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903 \
 #       -f EDA/docker/Dockerfile.verify EDA/docker
-#   docker push  ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902
+#   docker push  ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903
 #
 # The pushed GHCR package must be PUBLIC: RunPod pulls anonymously, and a private
 # package fails the pull silently -- the pod comes up with no image and times out
@@ -32,10 +32,13 @@
 # Verify before shipping a new tag:
 #   docker run --rm <img> bash -lc 'command -v verilator iverilog lcov sshd; \
 #     verilator --version; \
-#     /opt/cocotb-venv/bin/python -c "import cocotb, cocotb_tools.runner; print(cocotb.__version__)"'
+#     /opt/cocotb-venv/bin/python -c "import cocotb, cocotb_tools.runner; print(cocotb.__version__)"; \
+#     /opt/cocotb-venv/bin/python -c "import find_libpython; print(find_libpython.find_libpython())"'
 # Expect Verilator 5.050 and cocotb 2.0.x, and cocotb_tools.runner must import --
 # that module is where get_runner lives in cocotb 2.x, and the generated
-# run_cocotb.py fails inside the pod if it is missing.
+# run_cocotb.py fails inside the pod if it is missing.  find_libpython must print
+# a PATH and not None: that is the exact call cocotb's runner makes before it
+# starts the simulator, and None there is a run that builds and then fails.
 #
 # Local development (no RunPod account, no spend) -- what EDA_LOCAL_SSH=1 talks to:
 #   ssh-keygen -t rsa -b 2048 -f /tmp/eda_key -N ''
@@ -81,10 +84,22 @@ FROM ubuntu:22.04
 # simulation time. iverilog is the escape hatch for designs Verilator refuses;
 # lcov is only for genhtml (the coverage summary is parsed from the .info file
 # that verilator_coverage writes on its own, so lcov's absence never fails a run).
+#
+# libpython3.10 / libpython3.10-dev are NOT redundant with python3, and leaving
+# them out is a silent trap: cocotb's VPI shim EMBEDS CPython inside the
+# simulator binary, so it needs the SHARED library. Ubuntu links /usr/bin/python3
+# statically and ships libpython3.10.so.1.0 in a separate package, so without
+# these a design VERILATES AND COMPILES CLEANLY and only then dies in cocotb's
+# runner with "Unable to find libpython" -- a failure that reads like a broken
+# testbench rather than a missing package. The -dev package is what supplies the
+# unversioned libpython3.10.so symlink that cocotb's find_libpython matches on;
+# the runtime package alone leaves that to the fallback resolver in EDA/flow.py.
+# The 3.10 in these names is Ubuntu 22.04's python: it moves with the FROM above.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         openssh-server rsync ca-certificates \
         g++ make perl python3 python3-venv \
+        libpython3.10 libpython3.10-dev \
         zlib1g libfl2 iverilog lcov \
  && mkdir -p /var/run/sshd /root/.ssh \
  && chmod 700 /root/.ssh \

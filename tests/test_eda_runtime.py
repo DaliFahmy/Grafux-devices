@@ -292,10 +292,10 @@ def fake_clock_pod(monkeypatch):
 # anonymous pull — a missing tag and a private package produce the same text.
 IMAGE_AUTH_REASON = (
     "IMAGE_AUTH_ERROR:Error response from daemon: Head "
-    '"https://ghcr.io/v2/dalifahmy/grafux-verify/manifests/v5050-cocotb20-20260902"'
+    '"https://ghcr.io/v2/dalifahmy/grafux-verify/manifests/v5050-cocotb20-20260903"'
     ": denied"
 )
-VERIFY_IMAGE = "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902"
+VERIFY_IMAGE = "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903"
 
 
 def test_cpu_pod_body_uses_flavor_family_and_vcpu_count(captured_body):

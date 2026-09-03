@@ -209,6 +209,28 @@ def test_runner_script_survives_a_failing_test_without_exiting_nonzero():
     assert "GRAFUX_TESTS_FAILED" in script
 
 
+def test_runner_script_resolves_libpython_before_the_simulation():
+    """
+    cocotb EMBEDS CPython in the simulator, so it needs the SHARED libpython and
+    dies with "Unable to find libpython" without it -- AFTER a clean build, which
+    is what makes it read like a design problem. The image installs the library;
+    the script resolves it anyway, because a pod pinned to an older image is
+    otherwise unusable for reasons the log does not explain.
+    """
+    script = _script()
+    assert "def resolve_libpython():" in script
+    # os.environ, not extra_env alone: the runner copies os.environ over its own
+    # env dict, so the extra_env half is the version-dependent one.
+    assert 'os.environ["LIBPYTHON_LOC"] = LIBPYTHON' in script
+    assert 'ENV["LIBPYTHON_LOC"] = LIBPYTHON' in script
+    assert script.index("resolve_libpython()") < script.index("runner.test(")
+
+
+def test_runner_script_names_a_missing_libpython_as_a_marker():
+    """run_cocotb keys off this to say "image", not "your testbench"."""
+    assert "GRAFUX_LIBPYTHON_MISSING" in _script()
+
+
 def test_runner_script_announces_its_stages():
     script = _script()
     assert 'print("GRAFUX_STAGE build", flush=True)' in script
@@ -436,6 +458,8 @@ def pod(monkeypatch):
         "files": {}, "commands": [], "stages": [],
         "run": (0, "", ""),          # exit code, stdout, stderr of run_cocotb.py
         "results_xml": "", "coverage_info": "", "coverage_rc": 0,
+        # The steady state on a current image: the library is already there.
+        "libpython": "GRAFUX_LIBPYTHON_PRESENT",
     }
 
     def write_file(_sftp, path, content):
@@ -458,6 +482,8 @@ def pod(monkeypatch):
             return 0, state["results_xml"], ""
         if "coverage.info" in command:
             return 0, state["coverage_info"], ""
+        if "GRAFUX_LIBPYTHON" in command:
+            return 0, state["libpython"], ""
         return 0, "", ""
 
     monkeypatch.setattr(flow, "_write_file", write_file)
@@ -520,6 +546,118 @@ def test_run_cocotb_reports_a_build_failure_before_any_test_ran(pod):
     outputs = _run(pod)["outputs"]
     assert outputs["passed"] == "false"
     assert "did not build" in outputs["failures"]
+
+
+def test_run_cocotb_blames_the_image_when_libpython_is_missing(pod):
+    """
+    The design built and Verilator was happy; only the simulator failed to start.
+    Without this the user is handed cocotb's ValueError under a clean build log
+    and reasonably concludes their RTL or testbench is at fault.
+    """
+    pod["run"] = (3, "GRAFUX_STAGE build\nGRAFUX_LIBPYTHON_MISSING\nGRAFUX_STAGE sim\n",
+                  "ValueError: Unable to find libpython")
+    outputs = _run(pod)["outputs"]
+    assert outputs["passed"] == "false"
+    assert "libpython" in outputs["failures"]
+    assert "image problem" in outputs["failures"]
+    assert "libpython" in outputs["errors"]
+
+
+def test_run_cocotb_recognises_cocotbs_own_libpython_message(pod):
+    """A pod running an older run_cocotb.py prints no marker of ours."""
+    pod["run"] = (3, "GRAFUX_STAGE build\nGRAFUX_STAGE sim\n",
+                  "ValueError: Unable to find libpython, please make sure ...")
+    assert "image problem" in _run(pod)["outputs"]["failures"]
+
+
+def test_run_cocotb_does_not_cry_libpython_on_an_ordinary_failure(pod):
+    pod["results_xml"] = fixture("results_fail.xml")
+    assert "libpython" not in _run(pod)["outputs"]["failures"]
+
+
+def test_run_cocotb_heals_the_pod_before_it_runs_anything(pod):
+    """
+    A pod is created once and reused for the life of its block, and the image tag
+    is not part of any reuse key -- so fixing the image does nothing for a pod
+    that is already warm.  The check therefore has to happen on the way IN, while
+    it can still make this run succeed.
+    """
+    _run(pod)
+    preflight = [i for i, c in enumerate(pod["commands"]) if "ldconfig" in c]
+    runner = [i for i, c in enumerate(pod["commands"]) if "run_cocotb.py" in c]
+    assert preflight and runner
+    assert preflight[0] < runner[0]
+
+
+def test_run_cocotb_says_nothing_when_the_pod_already_has_libpython(pod):
+    """
+    This runs on every cocotb invocation, so on a correct image it must be
+    invisible; a warning that fires every time is one nobody reads.
+    """
+    pod["results_xml"] = fixture("results_pass.xml")
+    pod["coverage_info"] = fixture("coverage.info")
+    outputs = _run(pod)["outputs"]
+    assert "libpython" not in outputs["warnings"]
+    assert outputs["passed"] == "true"
+
+
+def test_run_cocotb_says_so_when_it_installed_libpython_itself(pod):
+    """
+    The install costs the user half a minute they did not ask for; the run should
+    still pass, and the warnings port should explain where the time went.
+    """
+    pod["libpython"] = "GRAFUX_LIBPYTHON_INSTALLED"
+    pod["results_xml"] = fixture("results_pass.xml")
+    pod["coverage_info"] = fixture("coverage.info")
+    outcome = _run(pod)
+    assert "libpython" in outcome["outputs"]["warnings"]
+    assert outcome["_status"] == "ok"
+
+
+def test_run_cocotb_runs_anyway_when_libpython_cannot_be_installed(pod):
+    """
+    An offline pod must still get its run and its own diagnosis from the runner
+    script's marker, rather than being failed here on a guess.
+    """
+    pod["libpython"] = "GRAFUX_LIBPYTHON_UNAVAILABLE"
+    pod["results_xml"] = fixture("results_pass.xml")
+    pod["coverage_info"] = fixture("coverage.info")
+    outcome = _run(pod)
+    assert "libpython" in outcome["outputs"]["warnings"]
+    assert any("run_cocotb.py" in c for c in pod["commands"])
+
+
+def test_run_cocotb_survives_a_pod_that_does_not_answer_the_preflight(pod, monkeypatch):
+    """A preflight that raises must not take the run down with it."""
+    real = flow.exec_simple
+
+    def flaky(client, command, **kw):
+        if "GRAFUX_LIBPYTHON" in command:
+            raise OSError("socket closed")
+        return real(client, command, **kw)
+
+    monkeypatch.setattr(flow, "exec_simple", flaky)
+    outputs = _run(pod)["outputs"]
+    assert "libpython" in outputs["warnings"]
+    assert any("run_cocotb.py" in c for c in pod["commands"])
+
+
+def test_lint_never_touches_apt(pod):
+    """
+    The preflight is scoped to the cocotb path on purpose: a lint run has no
+    business installing packages on someone's pod.
+    """
+    class _LintReq(_Req):
+        """Lint reads two fields the cocotb path never looks at."""
+
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.defines = ""
+            self.include_dirs = ""
+
+    flow.run_verilator(_FakeClient(), _LintReq(mode="lint", testbench=""),
+                       on_stage=lambda *a: None)
+    assert not any("ldconfig" in c for c in pod["commands"])
 
 
 def test_run_cocotb_writes_the_design_testbench_and_runner_into_the_pod(pod):

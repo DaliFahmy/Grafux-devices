@@ -100,7 +100,7 @@ services:
       # that on every iteration. Same rules as above: PIN THE TAG, and the GHCR
       # package must be PUBLIC or RunPod's anonymous pull fails silently.
       - key: EDA_VERIFY_IMAGE
-        value: "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260902"
+        value: "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903"
       # Default process design kit / OpenROAD platform. sky130hd is the standard
       # open-source target and what every public ORFS example uses.
       - key: EDA_DEFAULT_PDK

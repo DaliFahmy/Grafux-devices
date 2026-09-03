@@ -26,7 +26,7 @@ on:
           render.yaml EDA_VERIFY_IMAGE, or the devices server asks RunPod for an
           image that was never published.
         required: true
-        default: "v5050-cocotb20-20260902"
+        default: "v5050-cocotb20-20260903"
       push_image:
         description: "Push to GHCR (uncheck to build + smoke-test only)"
         type: boolean
@@ -84,12 +84,20 @@ jobs:
             command -v verilator iverilog lcov sshd
             verilator --version
             /opt/cocotb-venv/bin/python -c "import cocotb, cocotb_tools.runner; print(\"cocotb\", cocotb.__version__)"
+            /opt/cocotb-venv/bin/python -c "import find_libpython; print(\"libpython\", find_libpython.find_libpython() or \"NONE\")"
           ')
           echo "$out"
           echo "$out" | grep -q "Verilator 5.050" \
             || { echo "::error::expected Verilator 5.050"; exit 1; }
           echo "$out" | grep -qE "^cocotb 2\.0\." \
             || { echo "::error::expected cocotb 2.0.x with cocotb_tools.runner importable"; exit 1; }
+          # Importing cocotb is NOT enough, and believing it was is how a broken
+          # image shipped: cocotb embeds CPython inside the simulator, so it needs
+          # the shared libpython. Without it a design verilates and compiles
+          # cleanly and only then dies with "Unable to find libpython". This is
+          # the exact lookup cocotb's runner makes; NONE means the image is broken.
+          echo "$out" | grep -qE "^libpython /" \
+            || { echo "::error::no shared libpython in the image; cocotb cannot start a simulation"; exit 1; }
 
       - name: Push
         if: ${{ inputs.push_image }}
