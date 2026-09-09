@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A realistic cocotb 2.x report: the <failure> elements carry a MESSAGE ATTRIBUTE
+  *and* a body. results_fail.xml next door has attributes only, which is why it
+  cannot exercise the parser's three old data losses (the body being discarded
+  because the attribute wins, a second diagnostic child being dropped by `break`,
+  and <system-out>/<system-err> never being read at all).
+
+  The traceback line numbers point at REAL lines of tests/fixtures/eda/test_sync_fifo.py
+  (line 76 is `assert int(dut.full.value) == 1`), so a test can assert that the
+  quoted source line is the right one.
+
+  Hand-written against the cocotb 2.0 JUnit shape. Worth replacing wholesale with
+  a report captured from a real run the first time one is available.
+-->
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1234"/>
+    <testcase name="test_reset_values" classname="test_sync_fifo" file="test_sync_fifo.py" time="0.01"/>
+    <testcase name="test_full_asserts_at_depth" classname="test_sync_fifo" file="test_sync_fifo.py" time="0.03">
+      <failure type="AssertionError" message="full must assert after 8 writes (spec 5: full iff count == 8), got 0 with count=8">Traceback (most recent call last):
+  File "/opt/cocotb-venv/lib/python3.10/site-packages/cocotb/_decorators.py", line 121, in _execute
+    await self._func(*self._args, **self._kwargs)
+  File "/workspace/grafux/test_sync_fifo.py", line 76, in test_full_asserts_at_depth
+    assert int(dut.full.value) == 1, (
+AssertionError: full must assert after 8 writes (spec 5: full iff count == 8), got 0 with count=8
+</failure>
+      <system-out>140.00ns INFO     cocotb.sync_fifo    write 8 accepted, count=8
+</system-out>
+      <system-err>145.00ns ERROR    cocotb.regression   test_full_asserts_at_depth failed
+</system-err>
+    </testcase>
+    <testcase name="test_count_must_not_exceed_depth" classname="test_sync_fifo" file="test_sync_fifo.py" time="0.04">
+      <failure type="AssertionError" message="count reached 9 on write 9: the FIFO accepted a write while full">Traceback (most recent call last):
+  File "/workspace/grafux/test_sync_fifo.py", line 100, in test_count_must_not_exceed_depth
+    assert count &lt;= DEPTH, (
+AssertionError: count reached 9 on write 9: the FIFO accepted a write while full
+</failure>
+      <error type="RuntimeError" message="teardown after a failed test could not drain the FIFO">RuntimeError: teardown after a failed test could not drain the FIFO
+</error>
+    </testcase>
+  </testsuite>
+</testsuites>

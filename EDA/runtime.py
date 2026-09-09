@@ -527,7 +527,12 @@ def _run_job(eda_id: str, req, kind: str) -> None:
         }
     except Exception as exc:  # noqa: BLE001 — surface as a result, never a dead thread.
         logger.warning("eda run failed for %s: %s", eda_id, exc)
-        err = _describe_exception(exc)
+        # The `errors` port otherwise reads as a statement about the design. This
+        # failure is the machine, the network or the pod -- there IS no source
+        # location for it -- so it says so before the exception text rather than
+        # letting an SSH timeout look like a verification result.
+        err = ("Grafux could not complete the run (this is not a design error):\n"
+               + _describe_exception(exc))
         result = {
             "eda_id": eda_id, "kind": kind, "status": "error",
             "stage": record.stage, "done": True,

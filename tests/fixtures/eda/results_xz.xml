@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A signal still holding X when the test read it. The DEEPEST frame is inside
+  cocotb's own handle.py, and the actionable one is the test_sync_fifo.py frame
+  ABOVE it (line 73), which is exactly what locate_python_failure's `prefer`
+  argument exists to pick. Reporting cocotb/handle.py here would read as "the bug
+  is in cocotb" and send the user to a file they cannot edit.
+-->
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <testcase name="test_full_asserts_at_depth" classname="test_sync_fifo" file="test_sync_fifo.py" time="0.02">
+      <failure type="ValueError" message="Value 'xxxxxxxx' is not resolvable to an integer">Traceback (most recent call last):
+  File "/workspace/grafux/test_sync_fifo.py", line 73, in test_full_asserts_at_depth
+    assert int(dut.count.value) == DEPTH, (
+  File "/opt/cocotb-venv/lib/python3.10/site-packages/cocotb/handle.py", line 402, in __int__
+    return self._resolve()
+ValueError: Value 'xxxxxxxx' is not resolvable to an integer
+</failure>
+    </testcase>
+  </testsuite>
+</testsuites>

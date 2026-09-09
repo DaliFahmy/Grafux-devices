@@ -14,6 +14,7 @@ The fixtures under ``tests/fixtures/eda`` are shared with the end-to-end script.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import sys
 
@@ -394,11 +395,21 @@ def test_summarize_failures_caps_total_length():
     assert text.endswith("(truncated)")
 
 
-def test_summarize_failures_collapses_multiline_assertion_messages():
+def test_summarize_failures_preserves_the_shape_of_a_multiline_message():
+    """
+    The message's own line breaks are the diagnosis, not noise.
+
+    This used to be flattened by ``" ".join(msg.split())``, which is exactly what
+    turned an expected-vs-got block, or a small traceback, into an unreadable
+    ribbon.  Both lines must survive, each on its own line.
+    """
     results = {"total": 1, "failed": 1, "passed": 0, "skipped": 0, "tests": [
         {"name": "test_a", "status": "failed", "message": "line one\n  line two\n"},
     ]}
-    assert "line one line two" in flow.summarize_failures(results)
+    text = flow.summarize_failures(results)
+    assert "line one" in text
+    assert "line two" in text
+    assert "line one line two" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +469,10 @@ def pod(monkeypatch):
         "files": {}, "commands": [], "stages": [],
         "run": (0, "", ""),          # exit code, stdout, stderr of run_cocotb.py
         "results_xml": "", "coverage_info": "", "coverage_rc": 0,
+        # The full log the generated runner tees to disk. Empty is the STALE POD
+        # case -- a warm pod still running a run_cocotb.py that predates the tee
+        # -- and the runner must fall back to the 400-line stdout tail there.
+        "cocotb_log": "",
         # The steady state on a current image: the library is already there.
         "libpython": "GRAFUX_LIBPYTHON_PRESENT",
     }
@@ -482,6 +497,8 @@ def pod(monkeypatch):
             return 0, state["results_xml"], ""
         if "coverage.info" in command:
             return 0, state["coverage_info"], ""
+        if "cocotb.log" in command:
+            return 0, state["cocotb_log"], ""
         if "GRAFUX_LIBPYTHON" in command:
             return 0, state["libpython"], ""
         return 0, "", ""
@@ -491,6 +508,11 @@ def pod(monkeypatch):
     monkeypatch.setattr(flow, "exec_simple", exec_simple)
     return state
 
+
+
+def _by_name(results, name):
+    """One testcase out of a parsed report, by its test name."""
+    return next(t for t in results["tests"] if t["name"] == name)
 
 def _run(pod, req=None):
     return flow.run_cocotb(
@@ -522,7 +544,10 @@ def test_run_cocotb_fails_a_run_whose_tests_failed_despite_exit_code_zero(pod):
     assert outcome["outputs"]["passed"] == "false"
     assert outcome["_status"] == "error"
     assert "test_full_asserts_at_depth" in outcome["outputs"]["failures"]
-    assert "test_full_asserts_at_depth" in outcome["outputs"]["errors"]
+    # `errors` is WHERE the run broke. This run did not break -- it built clean
+    # and produced a verdict -- so it has no error location at all, and naming a
+    # failing test here would just duplicate `failures`.
+    assert outcome["outputs"]["errors"] == ""
 
 
 def test_run_cocotb_fails_a_run_that_declared_no_tests(pod):
@@ -764,3 +789,356 @@ def test_run_verilator_hands_a_python_testbench_to_the_cocotb_runner(pod):
         on_stage=lambda *a: None)["outputs"]
     assert outputs["passed"] == "true"
     assert "results" in outputs          # only the cocotb path produces this
+
+
+# ---------------------------------------------------------------------------
+# Failure detail: WHY a test failed
+#
+# The old parser kept one whitespace-collapsed line per failure, and that line
+# was simultaneously the `failures` port, the `errors` port, the block tooltip
+# and the whole input to the RTL fix prompt. These tests pin the evidence that
+# used to be thrown away on the floor of parse_cocotb_results.
+# ---------------------------------------------------------------------------
+
+def test_parse_keeps_the_failure_body_the_message_attribute_used_to_hide():
+    """
+    `child.get("message") or child.text` let the ATTRIBUTE win, and cocotb always
+    sets it -- so the traceback in the element body was discarded on every real
+    report.
+    """
+    results = flow.parse_cocotb_results(fixture("results_fail_detail.xml"))
+    failed = _by_name(results, "test_full_asserts_at_depth")
+    assert failed["type"] == "AssertionError"
+    assert "Traceback (most recent call last):" in failed["detail"]
+    assert "test_sync_fifo.py" in failed["detail"]
+
+
+def test_parse_keeps_message_byte_identical_to_the_old_contract():
+    """
+    `message` is the compatibility anchor: saved results.txt files hold it, the
+    app's VerificationResults::parse reads it, and four tests assert on it. The
+    attribute still wins and the body must not leak into it.
+    """
+    results = flow.parse_cocotb_results(fixture("results_fail_detail.xml"))
+    failed = _by_name(results, "test_full_asserts_at_depth")
+    assert failed["message"] == (
+        "full must assert after 8 writes (spec 5: full iff count == 8), "
+        "got 0 with count=8")
+    assert "Traceback" not in failed["message"]
+
+
+def test_parse_keeps_a_second_diagnostic_child_and_the_captured_streams():
+    """The old loop `break`ed after the first, and never looked at system-out."""
+    results = flow.parse_cocotb_results(fixture("results_fail_detail.xml"))
+    second = _by_name(results, "test_count_must_not_exceed_depth")
+    assert second["extra"][0]["type"] == "RuntimeError"
+    first = _by_name(results, "test_full_asserts_at_depth")
+    assert "write 8 accepted" in first["stdout"]
+    assert "test_full_asserts_at_depth failed" in first["stderr"]
+
+
+def test_parse_does_not_pay_for_detail_on_passing_tests():
+    """They are the bulk of a large run and carry nothing worth keeping."""
+    results = flow.parse_cocotb_results(fixture("results_fail_detail.xml"))
+    passing = _by_name(results, "test_reset_values")
+    assert passing["status"] == "passed"
+    for key in ("detail", "stdout", "stderr", "extra"):
+        assert key not in passing
+
+
+def test_locate_python_failure_prefers_the_users_file_over_cocotbs_own():
+    """
+    The DEEPEST frame is inside cocotb. Reporting it reads as "the bug is in
+    cocotb" and sends the user to a file they cannot edit; the actionable frame
+    is the last one in their own testbench.
+    """
+    results = flow.parse_cocotb_results(fixture("results_xz.xml"))
+    detail = results["tests"][0]["detail"]
+    deepest = flow.locate_python_failure(detail)
+    assert deepest["file"] == "handle.py"
+    chosen = flow.locate_python_failure(detail, prefer="test_sync_fifo.py")
+    assert chosen["file"] == "test_sync_fifo.py"
+    assert chosen["line"] == 73
+
+
+def test_quote_source_line_never_guesses():
+    source = "one\ntwo\nthree\n"
+    assert "1 | one" in flow.quote_source_line(source, 1)
+    assert "3 | three" in flow.quote_source_line(source, 3)
+    assert flow.quote_source_line(source, 4) == ""
+    assert flow.quote_source_line(source, 0) == ""
+    assert flow.quote_source_line("", 1) == ""
+
+
+def test_quote_source_line_puts_the_caret_under_the_column():
+    quoted = flow.quote_source_line("abcdef", 1, col=3)
+    caret = quoted.splitlines()[-1]
+    body = quoted.splitlines()[0]
+    assert caret.index("^") == body.index("abcdef") + 2
+
+
+@pytest.mark.parametrize("name,hint_id", [
+    ("results_xz.xml", "xz_in_comparison"),
+    ("results_timeout.xml", "sim_timeout"),
+    ("results_attr.xml", "no_such_signal"),
+    ("results_fail_detail.xml", "assert_mismatch"),
+])
+def test_each_cocotb_rule_fires_on_its_own_fixture(name, hint_id):
+    """
+    Asserted on the ID, not the prose, so the wording can be improved without
+    rewriting a test -- the same reason _ORFS_HINTS entries are matched by marker.
+    """
+    results = flow.parse_cocotb_results(fixture(name))
+    flow.enrich_failures(results, testbench=fixture("test_sync_fifo.py"),
+                         rtl=fixture("sync_fifo_good.v"), top="sync_fifo",
+                         stem="sync_fifo")
+    failing = [t for t in results["tests"] if t["status"] == "failed"]
+    assert failing[0]["hint_id"] == hint_id
+    assert failing[0]["hint"]
+
+
+def test_the_missing_signal_rule_names_the_closest_real_port():
+    results = flow.parse_cocotb_results(fixture("results_attr.xml"))
+    flow.enrich_failures(results, testbench=fixture("test_sync_fifo.py"),
+                         rtl=fixture("sync_fifo_good.v"), top="sync_fifo",
+                         stem="sync_fifo")
+    hint = results["tests"][0]["hint"]
+    assert "dut.fulll" in hint
+    assert "Did you mean `full`?" in hint
+
+
+def test_the_missing_signal_rule_stays_silent_when_the_ports_are_unknown():
+    """
+    module_ports() returning [] means "could not tell", never "portless". Listing
+    an empty port list would be a confident lie about the user's design.
+    """
+    results = flow.parse_cocotb_results(fixture("results_attr.xml"))
+    flow.enrich_failures(results, testbench=fixture("test_sync_fifo.py"),
+                         rtl="", top="", stem="sync_fifo")
+    hint = results["tests"][0]["hint"]
+    assert "declares:" not in hint
+    assert "Did you mean" not in hint
+
+
+def test_an_unrecognised_failure_still_gets_where_and_why():
+    """("", "") from the rule table is a normal answer, not a hole in the report."""
+    results = {"total": 1, "failed": 1, "passed": 0, "skipped": 0, "tests": [{
+        "name": "test_a", "status": "failed", "type": "ZeroDivisionError",
+        "message": "division by zero",
+        "detail": 'Traceback (most recent call last):\n'
+                  '  File "/w/test_sync_fifo.py", line 73, in test_a\n'
+                  '    x = 1 / 0\n'
+                  'ZeroDivisionError: division by zero\n',
+    }]}
+    text = flow.summarize_failures(results, testbench=fixture("test_sync_fifo.py"),
+                                   stem="sync_fifo")
+    assert "FAILED test_a" in text
+    assert "test_sync_fifo.py:73" in text
+    # Not an assertion, and raised in the user's own file: a testbench bug.
+    assert results["tests"][0]["hint_id"] == "test_raised_exception"
+
+
+def test_summarize_failures_shows_why_where_and_the_cause_for_each_test():
+    results = flow.parse_cocotb_results(fixture("results_fail_detail.xml"))
+    text = flow.summarize_failures(
+        results, testbench=fixture("test_sync_fifo.py"),
+        rtl=fixture("sync_fifo_good.v"), top="sync_fifo", stem="sync_fifo",
+        log_slices=flow.slice_cocotb_log(fixture("cocotb_run.log")))
+    assert text.startswith("2 of 3 cocotb tests failed.")
+    assert text.count("FAILED ") == 2
+    for section in ("WHY", "WHERE", "LIKELY CAUSE", "LAST LINES BEFORE THE FAILURE"):
+        assert section in text
+    # The location, and the line the RTL fix prompt needs to see.
+    assert "test_sync_fifo.py:76" in text
+    assert "assert int(dut.full.value) == 1" in text
+    assert "failed at 145.00 ns" in text
+
+
+def test_summarize_failures_degrades_section_by_section_before_dropping_tests():
+    """
+    A blind text[:max_chars] would keep full evidence for the first tests and cut
+    the last ones off mid-sentence. The log excerpt is the first thing to go.
+    """
+    results = flow.parse_cocotb_results(fixture("results_fail_detail.xml"))
+    kwargs = dict(testbench=fixture("test_sync_fifo.py"),
+                  rtl=fixture("sync_fifo_good.v"), top="sync_fifo",
+                  stem="sync_fifo",
+                  log_slices=flow.slice_cocotb_log(fixture("cocotb_run.log")))
+    full = flow.summarize_failures(results, **kwargs)
+    squeezed = flow.summarize_failures(results, max_chars=len(full) - 400, **kwargs)
+    assert "LAST LINES BEFORE THE FAILURE" not in squeezed
+    # Both tests survive: what was dropped is evidence, not the answer.
+    assert squeezed.count("FAILED ") == 2
+
+
+def test_slice_cocotb_log_keys_each_test_by_name():
+    slices = flow.slice_cocotb_log(fixture("cocotb_run.log"))
+    assert set(slices) == {"test_reset_values", "test_full_asserts_at_depth",
+                           "test_count_must_not_exceed_depth"}
+    assert "write 8 accepted" in slices["test_full_asserts_at_depth"]
+    # Sliced to the NEXT test's banner, so a test owns what it printed last.
+    assert "write 9 accepted" not in slices["test_full_asserts_at_depth"]
+
+
+def test_slice_cocotb_log_degrades_to_nothing_on_an_unfamiliar_format():
+    """A cocotb that words its banner a third way must yield {}, never a guess."""
+    assert flow.slice_cocotb_log("some log with no regression banner at all") == {}
+    assert flow.slice_cocotb_log("") == {}
+
+
+# ---------------------------------------------------------------------------
+# Error locations: WHERE the error is
+# ---------------------------------------------------------------------------
+
+def test_verilator_diagnostics_are_located_quoted_and_explained():
+    text = flow.explain_verilator_diagnostics(
+        fixture("verilator_errors.txt"),
+        sources={"broken_fifo.v": fixture("verilator_broken.v")})
+    assert text.startswith("3 Verilator errors.")
+    assert "broken_fifo.v:21:30" in text
+    assert "sub_block u0 (.clk(clk), .rstn(rst_n));" in text   # the quoted line
+    assert "Pin not found: 'rstn'" in text                     # Verilator's own words
+    assert "does not declare" in text                          # what to change
+    # A parse failure has no message code at all, so it is matched on its text.
+    assert "ONE LINE AFTER" in text
+
+
+def test_verilator_warnings_are_shown_only_when_nothing_errored():
+    """In lint mode the warnings ARE the product; in a build failure they are noise."""
+    src = {"broken_fifo.v": fixture("verilator_broken.v")}
+    both = flow.explain_verilator_diagnostics(fixture("verilator_errors.txt"), sources=src)
+    assert "WIDTHEXPAND" not in both
+    warning_only = "\n".join(
+        line for line in fixture("verilator_errors.txt").splitlines()
+        if not line.startswith("%Error"))
+    assert "WIDTHEXPAND" in flow.explain_verilator_diagnostics(warning_only, sources=src)
+
+
+def test_verilator_errors_are_found_inside_a_python_build_traceback():
+    """
+    cocotb's runner.build() wraps Verilator's stderr in a SystemExit traceback.
+    Anchoring the regex on %Error rather than on line position is what makes that
+    work with no separate code path.
+    """
+    text = flow.explain_verilator_diagnostics(
+        fixture("verilator_build_traceback.txt"),
+        sources={"sync_fifo.v": fixture("sync_fifo_good.v")})
+    assert "sync_fifo.v:12:5" in text
+    assert "PINMISSING" in text
+
+
+def test_the_summary_line_survives_when_it_is_all_there_is():
+    """Dropping "Exiting due to N error(s)" unconditionally would empty the port."""
+    text = flow.explain_verilator_diagnostics("%Error: Exiting due to 1 error(s)")
+    assert "Exiting due to 1 error" in text
+
+
+def test_quoting_a_source_line_costs_no_pod_round_trip(monkeypatch):
+    """
+    The whole reason `errors` is free: req.rtl is already in hand server-side.
+    """
+    def explode(*_a, **_kw):  # pragma: no cover - the point is that it never runs
+        raise AssertionError("explain_verilator_diagnostics must not touch the pod")
+    monkeypatch.setattr(flow, "exec_simple", explode)
+    monkeypatch.setattr(flow, "exec_stream", explode)
+    text = flow.explain_verilator_diagnostics(
+        fixture("verilator_errors.txt"),
+        sources={"broken_fifo.v": fixture("verilator_broken.v")})
+    assert "assign level = count;" in text
+
+
+def test_a_traceback_in_grafuxs_own_runner_is_not_blamed_on_the_testbench():
+    """run_cocotb.py is generated by Grafux; the user has never seen it."""
+    trace = ('Traceback (most recent call last):\n'
+             '  File "/workspace/grafux/run_cocotb.py", line 88, in <module>\n'
+             '    runner.build()\n'
+             'RuntimeError: boom\n')
+    text = flow.locate_python_error(trace, test_file="test_sync_fifo.py")
+    assert "generated cocotb runner, not your testbench" in text
+
+
+def test_error_locations_is_empty_when_nothing_broke():
+    """
+    The decision that makes the port mean something: a clean build whose tests
+    merely failed has no error LOCATION, so it says nothing at all.
+    """
+    assert flow.error_locations() == ""
+    assert flow.error_locations(verilator_stderr="all fine here") == ""
+
+
+def test_the_results_port_keeps_the_derived_fields_and_drops_the_raw_bulk(pod):
+    """
+    A traceback plus two captured streams is up to 8000 characters per failing
+    test, and every one of them is already rendered into `failures` in the form a
+    person reads. Serialising them here too would put tens of kilobytes of
+    duplicate text in a port whose readers want a name, a status and one line of
+    why -- and would guarantee the review's head cap cuts this JSON mid-document.
+    The originals are still reachable: results.xml comes back as an artifact.
+    """
+    pod["run"] = (0, "GRAFUX_STAGE build\nGRAFUX_STAGE sim\n", "")
+    pod["results_xml"] = fixture("results_fail_detail.xml")
+    pod["cocotb_log"] = fixture("cocotb_run.log")
+    outcome = _run(pod, _Req(testbench=fixture("test_sync_fifo.py")))
+
+    results = json.loads(outcome["outputs"]["results"])
+    failing = _by_name(results, "test_full_asserts_at_depth")
+    # What the app's verdict panel reads.
+    assert failing["why"]
+    assert failing["where"]["file"] == "test_sync_fifo.py"
+    assert failing["where"]["line"] == 76
+    assert failing["message"]                       # the compatibility anchor
+    # What only the enrichers needed.
+    for gone in ("detail", "stdout", "stderr", "extra", "log_excerpt"):
+        assert gone not in failing, gone
+    assert "text" not in failing["where"]
+    # But the parser itself still keeps them -- this is a serialisation rule, not
+    # a parsing one, or the enrichers would have nothing to read.
+    parsed = flow.parse_cocotb_results(fixture("results_fail_detail.xml"))
+    assert "detail" in _by_name(parsed, "test_full_asserts_at_depth")
+
+
+def test_run_cocotb_puts_locations_on_errors_and_the_story_on_failures(pod):
+    pod["run"] = (0, "GRAFUX_STAGE build\nGRAFUX_STAGE sim\n", "")
+    pod["results_xml"] = fixture("results_fail_detail.xml")
+    pod["cocotb_log"] = fixture("cocotb_run.log")
+    outcome = _run(pod, _Req(testbench=fixture("test_sync_fifo.py")))
+    failures = outcome["outputs"]["failures"]
+    assert "WHY" in failures and "WHERE" in failures
+    assert "test_sync_fifo.py:76" in failures
+    assert outcome["outputs"]["errors"] == ""
+
+
+def test_run_cocotb_locates_a_build_failure_in_the_rtl(pod):
+    pod["run"] = (2, fixture("verilator_build_traceback.txt"), "")
+    pod["results_xml"] = ""
+    outcome = _run(pod, _Req(rtl=fixture("sync_fifo_good.v")))
+    errors = outcome["outputs"]["errors"]
+    assert "did not build" in errors            # why there is no test verdict
+    assert "sync_fifo.v:12:5" in errors         # and exactly where
+    assert "PINMISSING" in errors
+
+
+def test_run_cocotb_falls_back_to_the_stdout_tail_on_a_stale_pod(pod):
+    """
+    A pod is reused for the life of its block and the image tag is not part of
+    the reuse key, so a warm pod is still running a run_cocotb.py that predates
+    the tee and writes no cocotb.log at all.
+    """
+    pod["run"] = (0, fixture("cocotb_run.log"), "")
+    pod["results_xml"] = fixture("results_fail_detail.xml")
+    pod["cocotb_log"] = ""                      # the stale pod
+    outcome = _run(pod, _Req(testbench=fixture("test_sync_fifo.py")))
+    assert "LAST LINES BEFORE THE FAILURE" in outcome["outputs"]["failures"]
+
+
+def test_the_generated_runner_tees_both_streams_without_merging_them():
+    """
+    Merging stderr into stdout would empty `err` in the parent, and `err` decides
+    build_failed, libpython_missing and what lands on `warnings`.
+    """
+    script = flow.build_cocotb_runner_script(
+        top="sync_fifo", sources=["sync_fifo.v"], test_module="test_sync_fifo")
+    assert "GRAFUX_TEE" in script
+    assert script.count("subprocess.PIPE") == 2
+    assert "subprocess.STDOUT" not in script
+    ast.parse(script)

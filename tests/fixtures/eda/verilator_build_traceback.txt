@@ -1,0 +1,17 @@
+GRAFUX_COCOTB_RUNNER cocotb_tools.runner
+GRAFUX_LIBPYTHON /usr/lib/x86_64-linux-gnu/libpython3.10.so
+GRAFUX_STAGE build
+INFO: Running command verilator -cc --exe --build --timing --public-flat-rw -Wno-fatal sync_fifo.v in directory sim_build
+%Error-PINMISSING: sync_fifo.v:12:5: Cell has missing pin: 'rst_n'
+   12 |     sync_fifo u0 (.clk(clk), .full(full));
+      |     ^~~~~~~~~
+%Error: Exiting due to 1 error(s)
+Traceback (most recent call last):
+  File "/workspace/grafux/run_cocotb.py", line 88, in <module>
+    runner.build(verilog_sources=SOURCES, hdl_toplevel=TOP,
+  File "/opt/cocotb-venv/lib/python3.10/site-packages/cocotb_tools/runner.py", line 312, in build
+    self._execute(cmds, cwd=self.build_dir)
+  File "/opt/cocotb-venv/lib/python3.10/site-packages/cocotb_tools/runner.py", line 244, in _execute
+    raise SystemExit(f"Process {cmd[0]} terminated with error {process.returncode}")
+SystemExit: Process verilator terminated with error 1
+GRAFUX_BUILD_FAILED

@@ -163,9 +163,41 @@ def run_case(client: httpx.Client, base: str, *, name: str, rtl_file: str,
         check(outputs.get("passed") == "false",
               f"{name}: the buggy design PASSED — the testbench cannot tell the "
               f"good FIFO from the broken one, which makes it worthless")
-        check(must_name in (outputs.get("failures") or ""),
-              f"{name}: expected '{must_name}' among the failures, got:\n"
-              f"{outputs.get('failures')}")
+        failures = outputs.get("failures") or ""
+        check(must_name in failures,
+              f"{name}: expected '{must_name}' among the failures, got:\n{failures}")
+
+        # The point of the failure detail: a user must be able to see WHY without
+        # opening a log. These four assertions are the only place the whole chain
+        # -- results.xml body -> traceback frame -> quoted testbench line -- is
+        # proven against a REAL cocotb report rather than a fixture.
+        check("WHY" in failures and "WHERE" in failures,
+              f"{name}: the failure detail lost its sections:\n{failures[:600]}")
+        check("test_sync_fifo.py:" in failures,
+              f"{name}: no source location in the failure detail — the traceback "
+              f"frame or the `prefer` rule is wrong:\n{failures[:600]}")
+        check("assert " in failures,
+              f"{name}: the offending source line was not quoted; check that "
+              f"req.testbench reached quote_source_line:\n{failures[:600]}")
+
+        # `errors` is WHERE the run broke. This run built cleanly and produced a
+        # verdict, so it did not break: naming a failing test here would just
+        # duplicate `failures`.
+        check((outputs.get("errors") or "") == "",
+              f"{name}: expected an empty errors port on a clean build whose "
+              f"tests merely failed, got: {outputs.get('errors')!r}")
+
+        # The tee wrapper actually wrote the log, and it came back. This is the
+        # ONE assertion that cannot be made offline: everything else about the
+        # tee is provable with a subprocess, but that it survives an SSH exec and
+        # the artifact globs is only knowable here.
+        check(any(a.endswith("cocotb.log") for a in artifacts),
+              f"{name}: cocotb.log did not come back — either the runner script "
+              f"is stale on a reused pod, or the tee did not write it "
+              f"(artifacts: {artifacts})")
+        check("LAST LINES BEFORE THE FAILURE" in failures,
+              f"{name}: the per-test log excerpt is missing — slice_cocotb_log "
+              f"did not recognise this cocotb's regression banner")
 
     client.delete(f"{base}/verilator/{eda_id}", timeout=60.0)
     return timings

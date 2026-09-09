@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- A test that awaited something the design never asserted. -->
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <testcase name="test_push_pop_roundtrip" classname="test_sync_fifo" file="test_sync_fifo.py" time="5.00">
+      <failure type="SimTimeoutError" message="timeout occurred after 1000 ns waiting for RisingEdge(empty)">Traceback (most recent call last):
+  File "/workspace/grafux/test_sync_fifo.py", line 55, in test_push_pop_roundtrip
+    await with_timeout(RisingEdge(dut.empty), 1000, "ns")
+cocotb.triggers.SimTimeoutError: timeout occurred after 1000 ns waiting for RisingEdge(empty)
+</failure>
+    </testcase>
+  </testsuite>
+</testsuites>

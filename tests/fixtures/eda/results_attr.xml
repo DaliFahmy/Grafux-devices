@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The testbench misspelled a signal: `fulll` for `full`. A TYPO on purpose, so
+  the difflib suggestion in the no_such_signal rule is actually exercised. A
+  name with no near match would silently take the same code path with the
+  suggestion clause empty and prove nothing.
+-->
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <testcase name="test_full_asserts_at_depth" classname="test_sync_fifo" file="test_sync_fifo.py" time="0.01">
+      <failure type="AttributeError" message="'HierarchyObject' object has no attribute 'fulll'">Traceback (most recent call last):
+  File "/workspace/grafux/test_sync_fifo.py", line 76, in test_full_asserts_at_depth
+    assert int(dut.fulll.value) == 1
+AttributeError: 'HierarchyObject' object has no attribute 'fulll'
+</failure>
+    </testcase>
+  </testsuite>
+</testsuites>

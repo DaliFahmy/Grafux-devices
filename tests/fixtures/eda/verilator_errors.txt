@@ -1,0 +1,14 @@
+%Warning-WIDTHEXPAND: broken_fifo.v:18:23: Operator ASSIGNW expects 8 bits on the Assign RHS, but Assign RHS's CONST '4'h0' generates 4 bits.
+                                        : ... note: In instance 'broken_fifo'
+   18 |     assign data_out = 4'h0;
+      |                       ^
+%Error-PINNOTFOUND: broken_fifo.v:21:30: Pin not found: 'rstn'
+   21 |     sub_block u0 (.clk(clk), .rstn(rst_n));
+      |                              ^~~~
+%Error-WIDTHTRUNC: broken_fifo.v:24:20: Operator ASSIGNW expects 3 bits on the Assign RHS, but Assign RHS's VARREF 'count' generates 4 bits.
+   24 |     assign level = count;
+      |                    ^
+%Error: broken_fifo.v:29:5: syntax error, unexpected end, expecting ';'
+   29 |     end
+      |     ^~~
+%Error: Exiting due to 3 error(s)

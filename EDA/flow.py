@@ -22,6 +22,7 @@ downloadable — which is usually exactly what the user needs to see.
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 import logging
 import os
@@ -480,6 +481,10 @@ COCOTB_BUILD_DIR = "sim_build"
 COCOTB_RESULTS_XML = "results.xml"
 COCOTB_COVERAGE_DAT = f"{COCOTB_BUILD_DIR}/coverage.dat"
 COCOTB_COVERAGE_INFO = "coverage.info"
+COCOTB_LOG = "cocotb.log"
+# `tail -c` on the way back IS the size bound: a runaway log cannot blow up
+# the run result, and the tail is the half that explains the outcome.
+COCOTB_LOG_MAX_BYTES = 512 * 1024
 
 # A testbench arrives as a lump of text on a port, with nothing to say what
 # language it is written in.  Classifying it is what lets `mode=sim` — the default
@@ -657,6 +662,52 @@ def build_cocotb_runner_script(
 import os
 import sys
 import traceback
+
+# Everything this run prints has to survive to be PARSED afterwards, and the SSH
+# reader upstream keeps only the last 400 lines of each stream. So the script
+# re-executes itself once and mirrors both streams into cocotb.log, which is
+# fetched back whole.
+#
+# Why not `python3 run_cocotb.py | tee cocotb.log` in the shell: a pipeline's
+# exit code is the LAST command's, so the caller would read tee's success and a
+# failing build would look clean. Why not stderr=STDOUT: the caller reads `err`
+# separately to decide build_failed, libpython_missing and what lands on
+# `warnings`, and merging the streams would silently empty all three.
+GRAFUX_LOG_FILE = os.path.abspath("cocotb.log")
+if os.environ.get("GRAFUX_TEE") != "1":
+    import subprocess
+    import threading
+
+    child_env = dict(os.environ)
+    child_env["GRAFUX_TEE"] = "1"
+    log_handle = open(GRAFUX_LOG_FILE, "wb")
+    log_lock = threading.Lock()
+    child = subprocess.Popen([sys.executable, os.path.abspath(__file__)],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             env=child_env)
+
+    def grafux_pump(source, sink):
+        # Line at a time, flushed every line: the parent is streaming these to a
+        # live UI, and a 4 KB buffer would make every GRAFUX_STAGE marker late.
+        for chunk in iter(source.readline, b""):
+            sink.buffer.write(chunk)
+            sink.flush()
+            with log_lock:
+                log_handle.write(chunk)
+                log_handle.flush()
+        source.close()
+
+    pumps = [threading.Thread(target=grafux_pump, args=(child.stdout, sys.stdout)),
+             threading.Thread(target=grafux_pump, args=(child.stderr, sys.stderr))]
+    for pump in pumps:
+        pump.daemon = True
+        pump.start()
+    grafux_code = child.wait()
+    for pump in pumps:
+        pump.join(timeout=30)
+    log_handle.close()
+    sys.exit(grafux_code)
+
 
 # cocotb moved its runner from `cocotb.runner` (1.x) to `cocotb_tools.runner`
 # (2.x). Trying both, and saying which one answered, turns a version mismatch
@@ -1219,6 +1270,685 @@ def synth_produced_nothing(stage_log: str, top: str = "") -> str:
     return "\n\n".join(parts)
 
 
+# ── Locating and explaining a failure ───────────────────────────────────────
+#
+# Everything from here to `summarize_failures` answers the two questions a red
+# verilator block used to leave unanswered: WHY did this test fail, and WHERE is
+# the error.  The evidence was always present and was simply being discarded —
+# cocotb writes the assertion's traceback into the BODY of the <failure> element
+# while the parser kept only the one-line `message` attribute, and Verilator
+# prints `%Error-CODE: file:line:col:` which nothing ever read.
+#
+# The shape deliberately mirrors _ORFS_HINTS / explain_orfs_failure above: tuple
+# rule tables, searched most-specific-field first, returning "" when nothing
+# matches.  "" is never a failure of this code — an unrecognised failure still
+# shows its assertion, its location and its quoted source line, which is already
+# far more than the collapsed one-liner it replaces.
+
+
+def quote_source_line(source: str, line: int, *, col: int = 0,
+                      context: int = 1) -> str:
+    """
+    The offending source line, numbered, with the lines before it and a caret.
+
+    The point of this function is that it costs NOTHING.  ``req.rtl``,
+    ``req.testbench`` and ``req.sva`` are already in hand server-side — they were
+    written into the pod moments earlier — so pointing at ``counter.v:12:5`` and
+    showing the line needs no extra round trip to the machine.
+
+    Returns "" for a line number outside the file rather than guessing.  A
+    diagnostic that quotes the WRONG line is worse than one that quotes none: it
+    sends the reader to a line that is fine and makes them doubt the tool.
+    """
+    if not source or line <= 0:
+        return ""
+    lines = source.splitlines()
+    if line > len(lines):
+        return ""
+    first = max(1, line - max(0, context))
+    width = len(str(line))
+    out: List[str] = []
+    for number in range(first, line + 1):
+        out.append(f"  {str(number).rjust(width)} | {lines[number - 1].rstrip()}")
+    if col > 0:
+        # 1-based, counted in characters — Verilator's own convention.
+        out.append("  " + " " * width + " | " + " " * (col - 1) + "^")
+    return "\n".join(out)
+
+
+# A Python traceback frame, the exception line that closes a traceback, and the
+# assertion source cocotb echoes into the failure body.
+_PY_FRAME_RE = re.compile(
+    r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+), in (?P<func>\S+)\s*$',
+    re.MULTILINE)
+_PY_EXC_RE = re.compile(
+    r'^(?P<type>[A-Za-z_][\w.]*(?:Error|Exception|Failure))'
+    r'(?::\s*(?P<msg>.*))?$', re.MULTILINE)
+_ASSERT_SRC_RE = re.compile(r'^\s*(assert\b.*)$', re.MULTILINE)
+
+# cocotb's reduced log format puts the simulation time first on every line.
+# Anchored at line start so a stray "10ns" inside an assertion message is never
+# mistaken for the time the test died at.
+_COCOTB_LOG_TIME_RE = re.compile(
+    r'^\s*(?P<t>\d+(?:\.\d+)?)\s*(?P<u>[fpnum]?s)\s+\w+', re.MULTILINE)
+
+_ATTR_NAME_RE = re.compile(r"has no attribute '(?P<sig>[^']+)'")
+_EXPECTED_GOT_RE = re.compile(
+    r'expected[\s:=]+(?P<exp>.+?)[,;]?\s+(?:but\s+)?(?:got|was|actual)[\s:=]+(?P<act>\S+)',
+    re.IGNORECASE)
+_GOT_EXPECTED_RE = re.compile(
+    r'got[\s:=]+(?P<act>\S+).{0,60}?expected[\s:=]+(?P<exp>\S+)',
+    re.IGNORECASE | re.DOTALL)
+_ASSERT_EQ_RE = re.compile(
+    r'assert\s+(?P<act>.+?)\s*==\s*(?P<exp>[^,]+?)\s*(?:,|$)')
+
+# Grafux's own generated runner.  A traceback that stops here is not the user's
+# bug and must never be reported as though it were their testbench.
+_RUNNER_FILENAME = "run_cocotb.py"
+
+
+def locate_python_failure(detail: str, *, prefer: str = "") -> Dict[str, Any]:
+    """
+    The frame in a cocotb traceback that the USER can act on.
+
+    ``prefer`` is the whole point of this function.  The DEEPEST frame in a
+    cocotb traceback is almost always inside cocotb's own scheduler or somewhere
+    under site-packages, and pointing a user there is worse than pointing
+    nowhere — it reads as "the bug is in cocotb".  The actionable frame is the
+    LAST one in their own test file, so callers pass ``prefer="test_fifo.py"``
+    and the deepest frame is used only when the traceback never enters it.
+
+    Returns {} when there is no traceback at all.  Never raises: this runs over
+    text a user's testbench produced.
+    """
+    frames = [
+        {"file": os.path.basename(m.group("file")),
+         "path": m.group("file"),
+         "line": int(m.group("line")),
+         "func": m.group("func")}
+        for m in _PY_FRAME_RE.finditer(detail or "")
+    ]
+    if not frames:
+        return {}
+    chosen = frames[-1]
+    wanted = os.path.basename((prefer or "").strip())
+    if wanted:
+        owned = [f for f in frames if f["file"] == wanted]
+        if owned:
+            chosen = owned[-1]
+    out = dict(chosen)
+    out["frames"] = frames
+    return out
+
+
+def _exception_line(text: str) -> Tuple[str, str]:
+    """The (type, message) of the LAST exception named in a traceback."""
+    matches = list(_PY_EXC_RE.finditer(text or ""))
+    if not matches:
+        return "", ""
+    last = matches[-1]
+    return last.group("type") or "", (last.group("msg") or "").strip()
+
+
+def _first_line(text: str, limit: int = 200) -> str:
+    """One line, for a field a UI paints on a single row."""
+    stripped = str(text or "").strip()
+    if not stripped:
+        return ""
+    line = " ".join(stripped.splitlines()[0].split())
+    return line[:limit].rstrip() if len(line) > limit else line
+
+
+def extract_failure_facts(test: Dict[str, Any], *, testbench: str = "",
+                          test_file: str = "",
+                          log_slice: str = "") -> Dict[str, Any]:
+    """
+    Turn one parsed testcase into the facts its failure block is printed from.
+
+    Everything here is best-effort and ADDITIVE: a field that could not be
+    extracted is simply absent and the caller prints what it has.  That is what
+    lets the format degrade to "name + message" — exactly what the old one-liner
+    gave — on a failure shape nothing here recognises, instead of degrading to an
+    exception inside the run.
+    """
+    facts: Dict[str, Any] = {}
+    detail = str(test.get("detail") or "")
+    message = str(test.get("message") or "")
+    ftype = str(test.get("type") or "")
+
+    where = locate_python_failure(detail, prefer=test_file)
+    if where:
+        quoted = ""
+        if test_file and where.get("file") == os.path.basename(test_file):
+            quoted = quote_source_line(testbench, int(where.get("line") or 0))
+        facts["where"] = {
+            "file": where.get("file", ""),
+            "line": int(where.get("line") or 0),
+            "func": where.get("func", ""),
+            "text": quoted,
+        }
+
+    # The simulation time the test died at, read off the LAST log line of its own
+    # slice.  Wall-clock `time` is already on the testcase; sim time is the one a
+    # hardware engineer reasons with.
+    if log_slice:
+        times = _COCOTB_LOG_TIME_RE.findall(log_slice)
+        if times:
+            facts["sim_time"] = f"{times[-1][0]} {times[-1][1]}"
+
+    if not ftype:
+        ftype = _exception_line(detail)[0]
+    if ftype:
+        facts["type"] = ftype
+
+    # The assertion: the quoted source line when it is one, else the last
+    # `assert ...` echoed into the traceback body.
+    assertion = ""
+    quoted_text = (facts.get("where") or {}).get("text") or ""
+    for row in quoted_text.splitlines():
+        body = row.split("|", 1)[-1].strip()
+        if body.startswith("assert "):
+            assertion = body
+    if not assertion:
+        found = _ASSERT_SRC_RE.findall(detail)
+        if found:
+            assertion = " ".join(found[-1].split())
+    if assertion:
+        facts["assertion"] = assertion
+
+    blob = f"{message}\n{detail}"
+    for pattern in (_EXPECTED_GOT_RE, _GOT_EXPECTED_RE):
+        match = pattern.search(blob)
+        if match:
+            facts["expected"] = match.group("exp").strip().strip(".,")
+            facts["actual"] = match.group("act").strip().strip(".,")
+            break
+    else:
+        match = _ASSERT_EQ_RE.search(assertion)
+        if match:
+            # `assert dut.q.value == 4` states the EXPECTATION.  The actual value
+            # is only known if the message carried it, so it is left ABSENT
+            # rather than invented — a wrong "got" is worse than no "got".
+            facts["expected"] = match.group("exp").strip()
+
+    why = _first_line(message) or _first_line(detail)
+    if ftype and not why.startswith(ftype):
+        why = f"{ftype}: {why}" if why else ftype
+    if facts.get("expected") and facts.get("actual"):
+        why = f"{why} (expected {facts['expected']}, got {facts['actual']})"
+    if why:
+        facts["why"] = why[:240].rstrip()
+    return facts
+
+
+# ── Why a cocotb test failed ────────────────────────────────────────────────
+#
+# (id, markers, template).  The id is what the tests assert on, so the prose can
+# be improved without touching a single test.  Markers are lowercase substrings;
+# any one matching is enough.  ORDER IS SIGNIFICANT — most specific first, and
+# `assert_mismatch` must stay last of the family or it swallows the rules above
+# it, since cocotb reports nearly every failure as an AssertionError.
+_COCOTB_HINTS: Tuple[Tuple[str, Tuple[str, ...], str], ...] = (
+    ("no_such_signal", ("has no attribute",),
+     "The testbench referenced `dut.{signal}`, which the elaborated design does "
+     "not have.{suggest} cocotb resolves names against the design hierarchy, so "
+     "this is a NAME mismatch rather than a design bug: check the spelling "
+     "against the module's port list{ports}, and remember that a signal declared "
+     "inside a generate block or an unnamed always block is not reachable as "
+     "`dut.<name>`."),
+    ("xz_in_comparison",
+     ("is not resolvable", "unresolvable", "contains 'x'", "contains x",
+      "contains 'z'", "non-resolvable"),
+     "A signal in the comparison still holds X or Z, so it could not be resolved "
+     "to a number. Either it is never driven, or the test sampled it before "
+     "reset finished. Drive it from reset, await a clock edge after deasserting "
+     "reset, and where partially-unknown bits are legitimate at that point, test "
+     "`.value.is_resolvable` or compare `.value.binstr` instead."),
+    ("unresolvable_binary",
+     ("invalid literal for int", "cannot convert", "non-numeric",
+      "could not be converted"),
+     "The test called `int(...)` or read `.integer` on a value that still "
+     "contains X or Z, which raises instead of returning a number. Same root "
+     "cause as an unresolved comparison: drive the signal, or read "
+     "`.value.binstr` and assert on the string when unknown bits are expected."),
+    ("sim_timeout",
+     ("simtimeouterror", "timeouterror", "timed out", "timeout occurred"),
+     "The test waited for something that never happened. Usual causes, most "
+     "likely first:\n"
+     "  - The clock was never started — `cocotb.start_soon(Clock(dut.{clk}, 10, "
+     "units='ns').start())` must run before the first `await RisingEdge`.\n"
+     "  - The design never asserts the signal the test awaits, so the handshake "
+     "never completes. Check the logic that drives it.\n"
+     "  - The timeout is simply shorter than the design's real latency."),
+    ("assert_mismatch", ("assertionerror",),
+     "{verdict}{at_time}. Check the logic driving the signal named in the "
+     "assertion. If the value looks one cycle late or early, the test is "
+     "probably sampling on the same delta as the write -- `await "
+     "RisingEdge(clk)` then `await ReadOnly()` before reading, or sample on the "
+     "opposite edge."),
+)
+
+# Run-level problems: not a property of any one test, so they are keyed by id and
+# looked up directly rather than matched.  `libpython_missing` and `build_failed`
+# were inline in run_cocotb before this table existed; their wording is preserved
+# VERBATIM because existing tests match on it.
+_RUN_HINTS: Dict[str, str] = {
+    "libpython_missing":
+        "The design built, but the simulator could not start: cocotb embeds "
+        "CPython in the simulator and needs the shared libpython, which is "
+        "missing from this pod's image. This is an image problem, not a "
+        "problem with the design or the testbench. Fix it by pinning a "
+        "verify image built after the libpython fix (EDA/models.py "
+        "DEFAULT_VERIFY_IMAGE), or, on a pod that is already up, by running "
+        "`apt-get install -y libpython3.10`.",
+    "build_failed":
+        "The design did not build, so no test ran. The build log is above.",
+    "build_failed_sva":
+        "  The `sva` port was wired in and is compiled alongside the "
+        "design — unbind it to rule the assertions out as the cause.",
+    "no_tests":
+        "cocotb collected no tests from `test_{stem}.py`. Check that at least one "
+        "function is decorated `@cocotb.test()` — WITH the parentheses, since the "
+        "bare decorator collects nothing — and that the file imports cleanly: an "
+        "ImportError at module scope makes the module contribute zero tests "
+        "without failing the run.",
+    "test_raised_exception":
+        "{type} was raised inside {file}, not by an assertion. This is a bug in "
+        "the TESTBENCH, not necessarily in the design: fix the test first and "
+        "re-run before drawing any conclusion about the RTL.",
+}
+
+
+def _clock_name(ports: Sequence[str]) -> str:
+    """The port most likely to be the clock, for use in an example line."""
+    for candidate in ("clk", "clock", "i_clk", "clk_i"):
+        if candidate in ports:
+            return candidate
+    for port in ports:
+        if "clk" in port.lower() or "clock" in port.lower():
+            return port
+    return "clk"
+
+
+def explain_cocotb_failure(test: Dict[str, Any], *, top: str = "",
+                           ports: Sequence[str] = (), stem: str = "",
+                           facts: Optional[Dict[str, Any]] = None
+                           ) -> Tuple[str, str]:
+    """
+    (text, id): the plain-language cause of one failing test and what to do.
+
+    Searched most-specific field first — the failure's `type` attribute, then its
+    `message`, then the traceback body — for exactly the reason
+    ``explain_orfs_failure`` searches ERROR lines before the whole log: the first
+    match should describe what actually failed, not something incidental further
+    down the traceback.
+
+    ("", "") is a normal answer, not a miss to be worked around.  The caller
+    still prints WHY, WHERE and the quoted source line for that test.
+    """
+    facts = facts or {}
+    ftype = str(test.get("type") or facts.get("type") or "")
+    message = str(test.get("message") or "")
+    detail = str(test.get("detail") or "")
+
+    hint_id = ""
+    template = ""
+    for haystack in (ftype.lower(), message.lower(), detail.lower()):
+        if not haystack:
+            continue
+        for candidate_id, markers, text in _COCOTB_HINTS:
+            if any(marker in haystack for marker in markers):
+                hint_id, template = candidate_id, text
+                break
+        if hint_id:
+            break
+
+    # A non-assertion exception raised in the user's OWN test file is a testbench
+    # bug, and saying so is more useful than any rule above.  Checked after the
+    # table so a recognised cause (a timeout, an X in a comparison) still wins.
+    if not hint_id and ftype and ftype != "AssertionError":
+        where = facts.get("where") or {}
+        if where.get("file") and where["file"] != _RUNNER_FILENAME:
+            return (_RUN_HINTS["test_raised_exception"].format(
+                type=ftype, file=where["file"]), "test_raised_exception")
+
+    if not hint_id:
+        return "", ""
+
+    signal = ""
+    match = _ATTR_NAME_RE.search(f"{message}\n{detail}")
+    if match:
+        signal = match.group("sig")
+    suggest = ""
+    if signal and ports:
+        close = difflib.get_close_matches(signal, list(ports), n=1, cutoff=0.6)
+        if close:
+            suggest = f"  Did you mean `{close[0]}`?"
+    # module_ports() returning [] means "could not tell", NEVER "portless" — so
+    # the port-list clause is dropped entirely rather than claiming a design has
+    # no ports.  See module_ports' own docstring.
+    port_clause = ""
+    if ports:
+        shown = ", ".join(list(ports)[:12])
+        port_clause = f" ({top or 'the top module'} declares: {shown})"
+
+    at_time = f" at {facts['sim_time']}" if facts.get("sim_time") else ""
+    expected, actual = facts.get("expected"), facts.get("actual")
+    if expected and actual:
+        verdict = f"The design produced {actual} where the test required {expected}"
+    elif expected:
+        # The actual value was never recoverable from the report. Saying "the
+        # design produced something else" would imply this text knows a value it
+        # is declining to print.
+        verdict = f"The assertion required {expected} and the design did not meet it"
+    else:
+        verdict = "An assertion in the test did not hold"
+
+    return template.format(
+        signal=signal or "<signal>",
+        suggest=suggest,
+        ports=port_clause,
+        clk=_clock_name(ports),
+        expected=expected or "a different value",
+        actual=actual or "something else",
+        verdict=verdict,
+        at_time=at_time,
+    ), hint_id
+
+
+# ── Where a Verilator error is ──────────────────────────────────────────────
+
+# Anchored on `%Error`/`%Warning` rather than on line position, and MULTILINE.
+# That is precisely what lets the same regex find Verilator's diagnostics when
+# they arrive WRAPPED INSIDE a Python traceback out of cocotb's `runner.build()`,
+# with no separate code path for that case.
+_VERILATOR_DIAG_RE = re.compile(
+    r"^%(?P<sev>Error|Warning)(?:-(?P<code>[A-Z0-9_]+))?:\s*"
+    r"(?:(?P<file>[^\s:][^:]*):(?P<line>\d+):(?:(?P<col>\d+):)?\s*)?"
+    r"(?P<msg>.*)$", re.MULTILINE)
+
+# What each Verilator message code MEANS, in terms of this block's ports.
+# Verilator's own text says what it found; these say what to change.
+_VERILATOR_HINTS: Dict[str, str] = {
+    "DECLFILENAME":
+        "Grafux writes the RTL to `<top>.v`, so this almost always means the "
+        "`top` port names a different module than the one the RTL declares. "
+        "Set `top` to the module name in the source.",
+    "PINMISSING":
+        "The instantiation leaves out a port the module declares. Connect it "
+        "explicitly, or give the port a default in its declaration.",
+    "PINNOTFOUND":
+        "The instantiation connects a port the module does not declare — a "
+        "typo, or an instance of an older version of the module.",
+    "WIDTH":
+        "The two sides are different widths, so bits are silently zero-extended "
+        "or dropped. Size the literal (`8'd0`) or fix the declaration.",
+    "WIDTHEXPAND":
+        "The right-hand side is narrower than the left and is being "
+        "zero-extended. Harmless when intended; size the literal to say so.",
+    "WIDTHTRUNC":
+        "The right-hand side is WIDER than the left, so the top bits are "
+        "discarded. This is the width bug that usually matters — widen the "
+        "target or slice deliberately.",
+    "MULTIDRIVEN":
+        "The signal is assigned from more than one always block. In synthesis "
+        "that is a short; drive it from exactly one block.",
+    "LATCH":
+        "An incomplete assignment inferred a latch. Give every branch of the "
+        "if/case an assignment, or add a default before the branches.",
+    "COMBDLY":
+        "A non-blocking assignment (`<=`) in a combinational block. Use "
+        "blocking (`=`) in `always_comb`, non-blocking in `always_ff`.",
+    "BLKSEQ":
+        "A blocking assignment (`=`) in a sequential block. Use non-blocking "
+        "(`<=`) in `always_ff`, or simulation and synthesis will disagree.",
+    "IMPLICIT":
+        "A signal is used without being declared, so Verilator created a 1-bit "
+        "wire for it. Usually a typo; declare it with its real width.",
+    "MODDUP":
+        "Two modules with the same name were compiled. When the `sva` port is "
+        "wired in it is compiled alongside the design — check it does not "
+        "redeclare the module it is meant to bind to.",
+    "SYNTAX":
+        "The location is where the parser gave up, which is often ONE LINE "
+        "AFTER the real mistake — a missing `;`, `end` or `endmodule` on the "
+        "line above.",
+    "CASEINCOMPLETE":
+        "The case statement does not cover every value. Add a `default:` arm.",
+    "UNDRIVEN":
+        "The signal is read but never assigned, so it stays X. Drive it, or "
+        "delete it if it is dead.",
+    "SELRANGE":
+        "A bit select is outside the signal's declared range, which yields X. "
+        "Check the index expression against the declared width.",
+    "TIMESCALEMOD":
+        "Some modules declare a timescale and others do not. Add a `timescale "
+        "to every file, or pass none at all.",
+    "MISSINGFILE":
+        "A source file named on the command line does not exist in the pod. "
+        "Check the `files` port: every entry must be one of the uploaded "
+        "inputs, not a path from your own machine.",
+    "STMTDLY":
+        "A delay (`#`) in a statement. Delays are not synthesizable; drive "
+        "timing from the clock instead.",
+}
+
+# Some diagnostics carry no message code at all -- a parse failure is reported as
+# a bare `%Error:` -- so the code table alone would never explain the single most
+# common first error a user hits. These match on the message text instead.
+_VERILATOR_TEXT_HINTS: Tuple[Tuple[str, str], ...] = (
+    ("syntax error", "SYNTAX"),
+    ("cannot find file", "MISSINGFILE"),
+    ("cannot open", "MISSINGFILE"),
+)
+
+_MAX_DIAGS = 12
+_ERRORS_MAX_CHARS = 8000
+
+# `%Error: Exiting due to 3 error(s)` carries no location and repeats a count the
+# header already gives.  Noise, once a located diagnostic exists.
+_VERILATOR_NOISE = ("exiting due to",)
+
+
+def explain_verilator_diagnostics(text: str, *,
+                                  sources: Optional[Dict[str, str]] = None,
+                                  max_diags: int = _MAX_DIAGS,
+                                  max_chars: int = _ERRORS_MAX_CHARS) -> str:
+    """
+    Verilator's diagnostics, located, quoted and explained; "" when there are none.
+
+    This is the whole content of the `errors` port for every non-cocotb failure.
+    Errors win over warnings when both are present, but in LINT mode the warnings
+    ARE the product, so they are rendered whenever no error exists.
+    """
+    sources = sources or {}
+    errors: List[Any] = []
+    warnings: List[Any] = []
+    for match in _VERILATOR_DIAG_RE.finditer(text or ""):
+        (errors if match.group("sev") == "Error" else warnings).append(match)
+    chosen = errors or warnings
+    if not chosen:
+        return ""
+
+    # Drop the un-located summary lines, but only once something located exists —
+    # on a failure whose ONLY output is "Exiting due to 1 error(s)", that line is
+    # all the user has and dropping it would empty the port.
+    if any(m.group("file") and m.group("line") for m in chosen):
+        chosen = [m for m in chosen
+                  if m.group("file")
+                  or not any(n in (m.group("msg") or "").lower()
+                             for n in _VERILATOR_NOISE)]
+
+    seen = set()
+    blocks: List[str] = []
+    for match in chosen:
+        key = (match.group("code"), match.group("file"),
+               match.group("line"), (match.group("msg") or "").strip())
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(blocks) >= max_diags:
+            continue
+
+        code = match.group("code") or ""
+        label = f"%{match.group('sev')}" + (f"-{code}" if code else "")
+        name = match.group("file") or ""
+        line = int(match.group("line") or 0)
+        col = int(match.group("col") or 0)
+
+        part: List[str] = []
+        if name and col:
+            part.append(f"{name}:{line}:{col}  {label}")
+        elif name:
+            part.append(f"{name}:{line}  {label}")
+        else:
+            part.append(label)
+        quoted = quote_source_line(sources.get(name, ""), line, col=col)
+        if quoted:
+            part.append(quoted)
+        message = (match.group("msg") or "").strip()
+        if message:
+            part.append(f"  {message}")
+        hint = _VERILATOR_HINTS.get(code, "")
+        if not hint:
+            lowered = message.lower()
+            for marker, mapped in _VERILATOR_TEXT_HINTS:
+                if marker in lowered:
+                    hint = _VERILATOR_HINTS.get(mapped, "")
+                    break
+        if hint:
+            part.append(f"  -> {hint}")
+        blocks.append("\n".join(part))
+
+    if not blocks:
+        return ""
+    noun = "error" if errors else "warning"
+    header = f"{len(seen)} Verilator {noun}{'' if len(seen) == 1 else 's'}."
+    if len(seen) > len(blocks):
+        header += f"  (showing the first {len(blocks)})"
+    out = header + "\n\n" + "\n\n".join(blocks)
+    if len(out) > max_chars:
+        out = out[:max_chars].rstrip() + "\n... (truncated)"
+    return out
+
+
+def locate_python_error(traceback_text: str, *,
+                        sources: Optional[Dict[str, str]] = None,
+                        test_file: str = "") -> str:
+    """
+    Where a Python error in the testbench is, quoted; "" when there is no traceback.
+
+    A traceback that never leaves ``run_cocotb.py`` is Grafux's OWN generated
+    runner failing (see build_cocotb_runner_script), not the user's testbench.
+    Saying so is the difference between a user debugging their design and a user
+    debugging a file they have never seen and cannot edit.
+    """
+    sources = sources or {}
+    where = locate_python_failure(traceback_text, prefer=test_file)
+    if not where:
+        return ""
+    ftype, message = _exception_line(traceback_text)
+
+    if where.get("file") == _RUNNER_FILENAME:
+        head = (f"{_RUNNER_FILENAME}:{where['line']}  in {where['func']}\n"
+                "  This is Grafux's generated cocotb runner, not your testbench — "
+                "the run failed before it reached your tests.")
+        return f"{head}\n  {ftype}: {message}".rstrip() if ftype else head
+
+    part = [f"{where['file']}:{where['line']}  in {where['func']}"]
+    quoted = quote_source_line(sources.get(where["file"], ""), int(where["line"]))
+    if quoted:
+        part.append(quoted)
+    if ftype:
+        part.append(f"  {ftype}: {message}".rstrip())
+    return "\n".join(part)
+
+
+def error_locations(*, verilator_stderr: str = "", python_traceback: str = "",
+                    sources: Optional[Dict[str, str]] = None,
+                    test_file: str = "", fallback: str = "") -> str:
+    """
+    The `errors` port: WHERE the run broke, and nothing else.
+
+    One assembler with five call sites, so the "locations only" contract cannot
+    drift between the lint path, the C++ sim path, the cocotb build path and the
+    two failure paths.
+
+    Returns "" when nothing was located AND there is no fallback — which is the
+    decision that makes this port mean something: a run whose build was clean and
+    whose tests merely failed has no error LOCATION, so it says nothing at all
+    and `failures` carries the story.  The block's red/green comes from `status`
+    and `passed`, never from this port, so an empty `errors` cannot make a failing
+    run look clean.
+    """
+    sources = sources or {}
+    located = explain_verilator_diagnostics(verilator_stderr, sources=sources)
+    if not located and python_traceback:
+        located = locate_python_error(python_traceback, sources=sources,
+                                      test_file=test_file)
+    parts = [p for p in ((fallback or "").strip(), located) if p]
+    return "\n\n".join(parts).strip()
+
+
+# ── Per-test slices of the cocotb log ───────────────────────────────────────
+
+# cocotb's regression manager brackets every test in the log.  Both spellings are
+# matched because 1.x and 2.x word the banner differently, and a version that
+# words it a third way yields {} — the failure blocks then simply carry no log
+# excerpt.  Degrade, never guess.
+_COCOTB_TEST_START_RE = re.compile(
+    r"^\s*[\d.]+\s*[fpnum]?s\s+INFO\s+cocotb\.regression\s+"
+    r"(?:running\s+(?P<a>\w+)|Running\s+test\s+\d+/\d+:\s*(?P<b>\w+))",
+    re.MULTILINE | re.IGNORECASE)
+
+_LOG_TAIL_LINES = 25
+
+
+def slice_cocotb_log(log_text: str, *,
+                     tail_lines: int = _LOG_TAIL_LINES) -> Dict[str, str]:
+    """
+    {test name: the last lines of its own log}, for attaching to a failure block.
+
+    Sliced start-of-test to start-of-NEXT-test rather than to the passed/failed
+    banner, because anything a test printed after its assertion — a teardown
+    dump, a scoreboard summary — belongs to that test and is often the line that
+    explains it.
+    """
+    text = log_text or ""
+    starts = list(_COCOTB_TEST_START_RE.finditer(text))
+    if not starts:
+        return {}
+    out: Dict[str, str] = {}
+    for index, match in enumerate(starts):
+        name = match.group("a") or match.group("b") or ""
+        if not name:
+            continue
+        end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+        body = text[match.start():end].rstrip().splitlines()
+        out[name] = "\n".join(body[-tail_lines:] if tail_lines > 0 else body)
+    return out
+
+
+# How much of a failure's evidence is kept per test.  All three are TAIL caps:
+# a traceback's meaning is its last lines, and so is a captured stdout's.
+_MAX_DETAIL_CHARS = 4000
+_MAX_STREAM_CHARS = 2000
+# Only this many FAILING tests carry their full evidence.  A regression with 300
+# failures is one bug reported 300 times; the first twenty carry the diagnosis and
+# the rest still carry their name, status and message.  Matches summarize_failures'
+# default max_tests, so a test that gets a block always has evidence to fill it.
+_MAX_DETAIL_TESTS = 20
+
+
+def _tail_cap(text: str, limit: int) -> str:
+    """Keep the LAST ``limit`` characters, and say so."""
+    value = (text or "").strip()
+    if limit <= 0 or len(value) <= limit:
+        return value
+    return (f"...[truncated, {len(value) - limit} earlier characters]\n"
+            + value[-limit:])
+
+
 def parse_cocotb_results(xml_text: str) -> Dict[str, Any]:
     """
     Turn cocotb's JUnit ``results.xml`` into a structured summary.
@@ -1231,6 +1961,15 @@ def parse_cocotb_results(xml_text: str) -> Dict[str, Any]:
 
     Never raises.  A missing or truncated report is itself a result the block has
     to show, so bad input comes back as an empty summary carrying ``error``.
+
+    **``message`` is a compatibility anchor and must stay byte-identical.**  It
+    is what saved ``results.txt`` files hold, what the app's
+    ``VerificationResults::parse`` reads, and what four tests assert on.  The
+    richer fields below are ADDITIVE, and are filled only for FAILING tests:
+    ``detail`` carries the ``<failure>`` element's BODY (the traceback), which
+    the attribute-wins rule for ``message`` throws away on every real cocotb
+    report; ``extra`` carries any second failure child; ``stdout``/``stderr``
+    carry ``<system-out>``/``<system-err>``, which nothing ever looked at.
     """
     summary: Dict[str, Any] = {
         "total": 0, "passed": 0, "failed": 0, "skipped": 0, "tests": [],
@@ -1245,9 +1984,13 @@ def parse_cocotb_results(xml_text: str) -> Dict[str, Any]:
         summary["error"] = f"results.xml could not be parsed: {exc}"
         return summary
 
+    detailed = 0
     for case in root.iter("testcase"):
         status = "passed"
         message = ""
+        # Verbatim from the original: the FIRST failure/error child wins and
+        # stops the walk, and its `message` attribute beats its body.  Anything
+        # "cleaner" here changes the compatibility anchor.
         for child in case:
             tag = (child.tag or "").lower()
             if tag in ("failure", "error"):
@@ -1263,13 +2006,50 @@ def parse_cocotb_results(xml_text: str) -> Dict[str, Any]:
             elapsed = float(case.get("time") or 0.0)
         except ValueError:
             elapsed = 0.0
-        summary["tests"].append({
+        entry: Dict[str, Any] = {
             "name": (case.get("name") or "").strip(),
             "classname": (case.get("classname") or "").strip(),
             "status": status,
             "time": elapsed,
             "message": message,
-        })
+        }
+
+        # Everything below is for failing tests only.  Passing and skipped tests
+        # are the bulk of a large run and carry no evidence worth keeping.
+        if status == "failed" and detailed < _MAX_DETAIL_TESTS:
+            detailed += 1
+            diagnostics = [c for c in case
+                           if (c.tag or "").lower() in ("failure", "error")]
+            if diagnostics:
+                first = diagnostics[0]
+                entry["detail_kind"] = (first.tag or "").lower()
+                ftype = (first.get("type") or "").strip()
+                if ftype:
+                    entry["type"] = ftype
+                body = _tail_cap(first.text or "", _MAX_DETAIL_CHARS)
+                if body:
+                    entry["detail"] = body
+                extra = []
+                for child in diagnostics[1:]:
+                    extra.append({
+                        "kind": (child.tag or "").lower(),
+                        "type": (child.get("type") or "").strip(),
+                        "message": (child.get("message") or "").strip(),
+                        "detail": _tail_cap(child.text or "", _MAX_STREAM_CHARS),
+                    })
+                if extra:
+                    entry["extra"] = extra
+            source = (case.get("file") or "").strip()
+            if source:
+                entry["file"] = os.path.basename(source)
+            for tag, key in (("system-out", "stdout"), ("system-err", "stderr")):
+                node = case.find(tag)
+                if node is not None:
+                    captured = _tail_cap(node.text or "", _MAX_STREAM_CHARS)
+                    if captured:
+                        entry[key] = captured
+
+        summary["tests"].append(entry)
         summary["total"] += 1
         summary[status] += 1
 
@@ -1309,21 +2089,230 @@ def parse_lcov_summary(info_text: str) -> Dict[str, Any]:
     return out
 
 
+def enrich_failures(results: Dict[str, Any], *, testbench: str = "", rtl: str = "",
+                    top: str = "", stem: str = "",
+                    log_slices: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    """
+    Add the derived WHY/WHERE/cause fields to every failing test, in place.
+
+    Idempotent, so both ``run_cocotb`` (which wants them inside the ``results``
+    JSON, where the app's verdict panel reads them) and ``summarize_failures``
+    (which may be handed a raw parse) can call it without paying twice or
+    disagreeing about what a test's cause is.
+
+    Never raises: it runs over text a user's testbench produced, and a run that
+    already has its verdict must not be lost to a regex.
+    """
+    tests = results.get("tests") or []
+    if not tests:
+        return results
+    slices = log_slices or {}
+    test_file = f"test_{stem}.py" if stem else ""
+    ports: Sequence[str] = ()
+    if rtl and top:
+        try:
+            ports = module_ports(rtl, top)
+        except Exception:  # pragma: no cover - module_ports is defensive already
+            ports = ()
+
+    for test in tests:
+        if test.get("status") != "failed" or "hint_id" in test:
+            continue
+        try:
+            facts = extract_failure_facts(
+                test, testbench=testbench, test_file=test_file,
+                log_slice=slices.get(test.get("name") or "", ""))
+            hint, hint_id = explain_cocotb_failure(
+                test, top=top, ports=ports, stem=stem, facts=facts)
+        except Exception:
+            logger.debug("failure enrichment failed for %s", test.get("name"),
+                         exc_info=True)
+            facts, hint, hint_id = {}, "", ""
+        test.update(facts)
+        test["hint"] = hint
+        test["hint_id"] = hint_id
+    return results
+
+
+# One failing test's block is built from these sections, in this order.  The
+# order is the reading order a person actually uses: what went wrong, where, why,
+# and only then the log around it.
+_FAILURE_RULE = "-" * 60
+_WHY_MAX_CHARS = 1500
+
+
+def _indent(text: str, prefix: str = "  ") -> str:
+    return "\n".join(prefix + line if line.strip() else ""
+                     for line in (text or "").splitlines())
+
+
+# A literal a reader can compare against, as opposed to the name of one.
+_VALUE_RE = re.compile(r"^[-+]?(?:\d+'[bodhBODH][0-9a-fA-FxXzZ_?]+|0[xXbBoO][0-9a-fA-F_]+"
+                       r"|\d[\d_]*(?:\.\d+)?|True|False|None)$")
+
+
+def _looks_like_a_value(text: Any) -> bool:
+    return bool(text) and bool(_VALUE_RE.match(str(text).strip()))
+
+
+def _failure_header(test: Dict[str, Any]) -> str:
+    """``FAILED <name>`` plus when it died.  The literal token is load-bearing."""
+    name = test.get("name") or "(unnamed test)"
+    when: List[str] = []
+    if test.get("sim_time"):
+        when.append(f"failed at {test['sim_time']}")
+    try:
+        elapsed = float(test.get("time") or 0.0)
+    except (TypeError, ValueError):
+        elapsed = 0.0
+    if elapsed:
+        when.append(f"{elapsed:g} s")
+    suffix = f"        ({', '.join(when)})" if when else ""
+    return f"FAILED {name}{suffix}"
+
+
+def _render_failure(test: Dict[str, Any], *, level: int, hint_text: str,
+                    log_excerpt: str = "") -> str:
+    """
+    One failing test, at a given level of detail.
+
+    ``level`` 0 is everything; 1 drops the log excerpt; 2 also drops the source
+    quote.  Degrading section by section keeps the ANSWER (what failed, and why)
+    on the page when a run has too many failures to show in full — a blind
+    ``text[:max_chars]`` would instead cut the last tests off mid-sentence and
+    keep evidence for the first ones nobody needed twice.
+    """
+    parts: List[str] = [_FAILURE_RULE, _failure_header(test)]
+
+    why: List[str] = []
+    message = str(test.get("message") or "").strip()
+    if not message:
+        message = str(test.get("why") or "").strip()
+    if len(message) > _WHY_MAX_CHARS:
+        message = (message[:_WHY_MAX_CHARS].rstrip()
+                   + f"\n...[truncated, {len(message) - _WHY_MAX_CHARS} more characters]")
+    if message:
+        why.append(message)
+    if test.get("expected") and test.get("actual"):
+        why.append(f"expected: {test['expected']}")
+        why.append(f"got:      {test['actual']}")
+    elif _looks_like_a_value(test.get("expected")):
+        # Only when the expectation is a VALUE. `assert count == DEPTH` yields
+        # the identifier "DEPTH", and echoing that back tells the reader nothing
+        # they did not just read on the quoted source line above.
+        why.append(f"the test required: {test['expected']}")
+    if why:
+        parts.append("")
+        parts.append("WHY")
+        parts.append(_indent("\n".join(why)))
+
+    where = test.get("where") or {}
+    if where.get("file") and where.get("line"):
+        parts.append("")
+        parts.append("WHERE")
+        location = f"{where['file']}:{where['line']}"
+        if where.get("func"):
+            location += f"  in {where['func']}"
+        rows = [location]
+        if level < 2 and where.get("text"):
+            rows.append(where["text"])
+        parts.append(_indent("\n".join(rows)))
+
+    if hint_text:
+        parts.append("")
+        parts.append("LIKELY CAUSE")
+        parts.append(_indent(hint_text))
+
+    if level < 1 and log_excerpt:
+        parts.append("")
+        parts.append("LAST LINES BEFORE THE FAILURE")
+        parts.append(_indent(log_excerpt))
+
+    return "\n".join(parts)
+
+
+def _assemble_failures(failed: List[Dict[str, Any]], *, shown: int, total: int,
+                       level: int, dedupe_hints: bool,
+                       log_slices: Optional[Dict[str, str]] = None) -> str:
+    """Header plus one block per shown test, plus the "and N more" line."""
+    header = f"{len(failed)} of {total} cocotb tests failed."
+    out: List[str] = [header]
+    seen_hints: Dict[str, str] = {}
+    for index, test in enumerate(failed[:shown]):
+        hint = str(test.get("hint") or "")
+        hint_id = str(test.get("hint_id") or "")
+        if hint and dedupe_hints:
+            if hint_id and hint_id in seen_hints:
+                hint = f"(same cause as {seen_hints[hint_id]})"
+            elif index >= 3:
+                hint = ""
+            elif hint_id:
+                seen_hints[hint_id] = test.get("name") or "the test above"
+        out.append("")
+        out.append(_render_failure(
+            test, level=level, hint_text=hint,
+            log_excerpt=(log_slices or {}).get(test.get("name") or "", "")))
+    if len(failed) > shown:
+        out.append("")
+        out.append(f"... and {len(failed) - shown} more failing tests.")
+    return "\n".join(out)
+
+
+# Fields that exist only so the enrichers can read them.  They are the bulk of a
+# parsed report -- a traceback plus two captured streams is up to 8000 characters
+# per failing test -- and every one of them has already been rendered into
+# `failures` in the form a person reads, so serialising them onto the `results`
+# port would put ~80 KB of duplicate text in a file whose remaining readers want
+# name, status and one line of why.  It would also guarantee that the review's
+# head cap cuts `results` mid-JSON.  The originals stay available: results.xml
+# comes back as an artifact.
+_RAW_EVIDENCE_FIELDS = ("detail", "stdout", "stderr", "extra", "log_excerpt")
+
+
+def slim_results(results: Dict[str, Any]) -> Dict[str, Any]:
+    """A copy of ``results`` without the raw evidence, for the port."""
+    out = dict(results)
+    tests = []
+    for test in results.get("tests") or []:
+        slim = {k: v for k, v in test.items() if k not in _RAW_EVIDENCE_FIELDS}
+        # The quoted source block is the same two lines `failures` already prints
+        # under WHERE, and nothing reads it from here -- the app's verdict panel
+        # wants only the file and the line.
+        where = slim.get("where")
+        if isinstance(where, dict) and "text" in where:
+            slim["where"] = {k: v for k, v in where.items() if k != "text"}
+        tests.append(slim)
+    out["tests"] = tests
+    return out
+
+
 def summarize_failures(
     results: Dict[str, Any],
     *,
-    max_tests: int = 10,
-    max_chars: int = 4000,
+    max_tests: int = 20,
+    max_chars: int = 20000,
+    testbench: str = "",
+    rtl: str = "",
+    top: str = "",
+    stem: str = "",
+    log_slices: Optional[Dict[str, str]] = None,
 ) -> str:
     """
-    The feedback payload: what failed, named, with the assertion message.
+    The feedback payload: what failed, WHY, WHERE, and what to try.
 
     This text is what a human reads on the ``failures`` port AND what gets wired
-    into the code block's ``feedback`` port to drive an RTL repair, so it names the
-    test and quotes its assertion rather than dumping a log — the fix prompt has to
-    be able to tell which behaviour was wrong.
+    into the design block's ``feedback`` port to drive an RTL repair, so it names
+    the test, quotes its assertion, points at the line that raised it and says
+    what usually causes that — the fix prompt has to be able to tell which
+    behaviour was wrong, and a user has to be able to act without opening a log.
 
-    Returns "" when nothing failed, so an empty ``failures`` port means "clean".
+    Returns "" when nothing failed, so an empty ``failures`` port still means
+    "clean".  That is the verify loop's stop condition and must not change.
+
+    When it does not fit, it degrades SECTION BY SECTION — log excerpt, then
+    source quote, then repeated causes, then the number of tests — and only cuts
+    mid-text as a last resort.  Losing the newest evidence uniformly beats losing
+    the last test entirely.
     """
     if not results:
         return ""
@@ -1334,22 +2323,28 @@ def summarize_failures(
     if not failed:
         return str(results.get("error") or "")
 
-    total = int(results.get("total", 0) or 0)
-    header = f"{len(failed)} of {total} cocotb tests failed."
-    parts = [header, ""]
-    for test in failed[:max_tests]:
-        name = test.get("name") or "(unnamed test)"
-        parts.append(f"FAILED {name}")
-        message = " ".join(str(test.get("message", "")).split())
-        if message:
-            parts.append(f"  {message}")
-    if len(failed) > max_tests:
-        parts.append(f"... and {len(failed) - max_tests} more failing tests.")
+    enrich_failures(results, testbench=testbench, rtl=rtl, top=top, stem=stem,
+                    log_slices=log_slices)
 
-    text = "\n".join(parts)
-    if len(text) > max_chars:
-        text = text[:max_chars].rstrip() + "\n... (truncated)"
-    return text
+    total = int(results.get("total", 0) or 0)
+    shown = min(max_tests, len(failed))
+
+    # Section-by-section, then test-by-test.
+    for level, dedupe in ((0, False), (1, False), (2, False), (2, True)):
+        text = _assemble_failures(failed, shown=shown, total=total,
+                                  level=level, dedupe_hints=dedupe,
+                                  log_slices=log_slices)
+        if len(text) <= max_chars:
+            return text
+    while shown > 1:
+        shown -= 1
+        text = _assemble_failures(failed, shown=shown, total=total,
+                                  level=2, dedupe_hints=True,
+                                  log_slices=log_slices)
+        if len(text) <= max_chars:
+            return text
+
+    return text[:max_chars].rstrip() + "\n... (truncated)"
 
 
 def globs_for(kind: str, *, work_dir: str = WORK_DIR, platform: str = "",
@@ -1580,6 +2575,9 @@ def run_verilator(
         trace=trace,
         extra_flags=req.verilator_flags,
     )
+    # The sources as the pod sees them.  Held here so a diagnostic can quote the
+    # offending line without a second trip to the machine -- see quote_source_line.
+    sources_map = {source: req.rtl or "", "tb.cpp": tb}
     code, out, err = exec_stream(
         client, _sh(f"cd {WORK_DIR} && {build_cmd}"),
         timeout=min(int(req.timeout or 900), 1800),
@@ -1594,10 +2592,17 @@ def run_verilator(
     if code != 0:
         outputs["status"] = "error"
         outputs["passed"] = "false"
-        outputs["errors"] = err.strip() or out.strip() or (
-            "Verilator was cancelled" if code == -1 else
-            "Verilator exceeded its timeout" if code == -2 else
-            f"Verilator exited with code {code}"
+        # `lint` above still carries the raw stderr verbatim; this port now
+        # carries only WHERE the errors are.  The fallback covers a failure
+        # Verilator did not put a %Error on -- a cancel, a timeout, a crash.
+        outputs["errors"] = error_locations(
+            verilator_stderr=err or out, sources=sources_map,
+            fallback=(
+                "Verilator was cancelled" if code == -1 else
+                "Verilator exceeded its timeout" if code == -2 else
+                "" if _VERILATOR_DIAG_RE.search(err or out or "")
+                else f"Verilator exited with code {code}"
+            ),
         )
         outputs["warnings"] = ""
         outputs["sim_output"] = ""
@@ -1634,8 +2639,12 @@ def run_verilator(
     passed = code == 0
     outputs["passed"] = "true" if passed else "false"
     outputs["status"] = "ok" if passed else "error"
-    outputs["errors"] = "" if passed else (
-        err.strip() or f"Simulation exited with code {code}"
+    # A $fatal prints `%Error: file:line: ...`, which the same parser locates.
+    # When it does not, the exit code is all there is to say.
+    outputs["errors"] = "" if passed else error_locations(
+        verilator_stderr=err, sources=sources_map,
+        fallback=("" if _VERILATOR_DIAG_RE.search(err or "")
+                  else f"Simulation exited with code {code}"),
     )
     if err.strip() and passed:
         outputs["warnings"] = (outputs.get("warnings", "") + "\n" + err.strip()).strip()
@@ -1724,6 +2733,13 @@ def run_cocotb(
     finally:
         sftp.close()
 
+    # The sources exactly as the pod sees them, so a %Error or a traceback frame
+    # can be quoted at its line without a second trip to the machine.
+    sources_map = {source: req.rtl or "",
+                   f"{test_module}.py": req.testbench or ""}
+    if sva:
+        sources_map["sva.sv"] = sva
+
     outputs: Dict[str, str] = {"top": top, "rtl": req.rtl or "", "lint": ""}
     log_parts: List[str] = [f"$ cat run_cocotb.py\n{script}"]
 
@@ -1785,6 +2801,21 @@ def run_cocotb(
     results = parse_cocotb_results(xml_text)
     passed = results["failed"] == 0 and results["total"] > 0 and not build_failed
 
+    # The FULL log, fetched the way results.xml is, because exec_stream only ever
+    # kept the last 400 lines of each stream -- the lines that explain an early
+    # failure in a long run are gone before anything can parse them.
+    #
+    # A pod is created once per block and REUSED for its lifetime, and the image
+    # tag is not part of the reuse key, so a warm pod is still running the
+    # run_cocotb.py it was handed on its first run -- which may predate the tee
+    # and write no log at all. Falling back to the 400-line tail keeps those pods
+    # working with less detail rather than with none.
+    _lc, log_text, _le = exec_simple(
+        client,
+        _sh(f"tail -c {COCOTB_LOG_MAX_BYTES} {WORK_DIR}/{COCOTB_LOG} 2>/dev/null"),
+        timeout=120)
+    log_slices = slice_cocotb_log(log_text) or slice_cocotb_log(out)
+
     coverage_summary: Dict[str, Any] = {}
     if coverage and results["total"] and not build_failed:
         on_stage("coverage", "running")
@@ -1805,31 +2836,39 @@ def run_cocotb(
         # reported as failed because verilator_coverage had nothing to chew on.
         on_stage("coverage", "done" if ccode == 0 else "failed")
 
-    failures = summarize_failures(results)
+    failures = summarize_failures(
+        results, testbench=req.testbench or "", rtl=req.rtl or "", top=top,
+        stem=stem, log_slices=log_slices)
+
+    # Run-level problems, prepended: they explain why the per-test story below is
+    # thin or absent. The wording moved to _RUN_HINTS unchanged, so that one
+    # table is the only place these sentences exist.
+    run_problem = ""
     if libpython_missing:
-        env_hint = (
-            "The design built, but the simulator could not start: cocotb embeds "
-            "CPython in the simulator and needs the shared libpython, which is "
-            "missing from this pod's image. This is an image problem, not a "
-            "problem with the design or the testbench. Fix it by pinning a "
-            "verify image built after the libpython fix (EDA/models.py "
-            "DEFAULT_VERIFY_IMAGE), or, on a pod that is already up, by running "
-            "`apt-get install -y libpython3.10`."
-        )
-        failures = env_hint if not failures else f"{env_hint}\n\n{failures}"
-    if build_failed:
-        hint = (
-            "The design did not build, so no test ran. The build log is above."
-        )
+        run_problem = _RUN_HINTS["libpython_missing"]
+    elif build_failed:
+        run_problem = _RUN_HINTS["build_failed"]
         if sva:
-            hint += (
-                "  The `sva` port was wired in and is compiled alongside the "
-                "design — unbind it to rule the assertions out as the cause."
-            )
-        failures = hint if not failures else f"{hint}\n\n{failures}"
+            run_problem += _RUN_HINTS["build_failed_sva"]
+    elif "declared no tests" in str(results.get("error", "")):
+        # summarize_failures returned the terse parser sentence; replace it with
+        # the one that says what to actually check.
+        run_problem = _RUN_HINTS["no_tests"].format(stem=stem)
+        failures = ""
+    if run_problem:
+        failures = run_problem if not failures else f"{run_problem}\n\n{failures}"
+
+    # What the `errors` port says when nothing could be LOCATED. It speaks only
+    # when the run actually broke: a run that produced a verdict -- tests ran and
+    # some failed -- did not break, so this stays empty and `failures` carries the
+    # whole story. Without the total>0 guard every ordinary failing run would end
+    # up with "the cocotb run exited with code 0" on a port meant for locations.
+    cocotb_fallback = run_problem or str(results.get("error", ""))
+    if not cocotb_fallback and not passed and int(results.get("total") or 0) == 0:
+        cocotb_fallback = f"The cocotb run exited with code {code}"
 
     outputs.update({
-        "results": json.dumps(results, ensure_ascii=False),
+        "results": json.dumps(slim_results(results), ensure_ascii=False),
         "failures": failures,
         "coverage": (json.dumps(coverage_summary, ensure_ascii=False)
                      if coverage_summary else ""),
@@ -1839,9 +2878,14 @@ def run_cocotb(
         "warnings": "\n".join(notes + ([err.strip()] if err.strip() and passed else [])),
         "passed": "true" if passed else "false",
         "status": "ok" if passed else "error",
-        "errors": "" if passed else (
-            failures or str(results.get("error", ""))
-            or err.strip() or f"The cocotb run exited with code {code}"
+        # WHERE the run broke, and nothing else. A clean build whose tests merely
+        # failed has no error LOCATION, so this stays empty and `failures` carries
+        # the story. The block's red/green comes from `status`/`passed`, never
+        # from here, so an empty `errors` cannot make a failing run look clean.
+        "errors": "" if passed else error_locations(
+            verilator_stderr=joined, python_traceback=joined,
+            sources=sources_map, test_file=f"{test_module}.py",
+            fallback=cocotb_fallback,
         ),
         "log": "\n".join(log_parts),
     })
