@@ -140,6 +140,24 @@ def test_an_openram_block_gets_the_memory_compiler_image():
     assert spec.container_disk_gb == 30
 
 
+def test_openram_pdks_lists_technologies_not_orfs_platforms(client):
+    """
+    /pdks is the shared route, but an OpenRAM technology is not an ORFS
+    platform. Answering "sky130hd" here would offer the block a name its
+    compiler has never heard of.
+    """
+    body = client.get("/openram/pdks").json()
+    assert body["default"] == "scn4m_subm"
+    assert "scn4m_subm" in body["pdks"]
+    assert not any(p.startswith("sky130hd") for p in body["pdks"])
+
+
+@pytest.mark.parametrize("kind", ["verilator", "yosys", "openroad"])
+def test_the_other_kinds_keep_the_orfs_platform_list(client, kind):
+    """The per-kind override must not leak into the shared default."""
+    assert client.get(f"/{kind}/pdks").json()["default"] == "sky130hd"
+
+
 def test_every_kind_has_an_image_and_a_disk():
     """A kind added without an entry must still get the full image, not None."""
     for kind in EDA_KINDS:
@@ -174,8 +192,10 @@ def test_pdks_endpoint_is_not_captured_by_the_id_route(client, kind):
     resp = client.get(f"/{kind}/pdks")
     assert resp.status_code == 200
     body = resp.json()
-    assert body["default"] == "sky130hd"
-    assert "sky130hd" in body["pdks"]
+    # What this test is about is ROUTE ORDERING, so it asserts only that a real
+    # list came back. The values are per-kind -- openram answers with OpenRAM
+    # technologies, not ORFS platforms -- and are pinned by their own tests.
+    assert body["pdks"] and body["default"] in body["pdks"]
 
 
 @pytest.mark.parametrize("kind", EDA_KINDS)

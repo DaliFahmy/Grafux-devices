@@ -27,7 +27,7 @@ thread — provisioning's blocking poll never stalls the event loop.  Note that
 # That is the one endpoint the whole client polling flow depends on.
 
 import logging
-from typing import Any, Callable, Dict, Type
+from typing import Any, Callable, Dict, Optional, Sequence, Type
 
 from fastapi import APIRouter, HTTPException
 
@@ -88,8 +88,19 @@ def make_router(
     kind: str,
     run_request_model: Type,
     start_job: Callable[[str, Any], Dict[str, Any]],
+    *,
+    pdk_choices: Optional[Sequence[str]] = None,
+    default_pdk: Optional[str] = None,
 ) -> APIRouter:
-    """Build the REST router for one EDA block type."""
+    """
+    Build the REST router for one EDA block type.
+
+    ``pdk_choices``/``default_pdk`` override what ``GET /{kind}/pdks`` answers.
+    They exist for openram, whose technologies are OpenRAM's own and have
+    nothing to do with the ORFS platforms the other three share -- an openram
+    block offered "sky130hd" would be offered a name its compiler has never
+    heard of.
+    """
     router = APIRouter(prefix=f"/{kind}", tags=[kind])
 
     @router.post("/create", response_model=CreateEdaResponse)
@@ -126,8 +137,11 @@ def make_router(
 
     @router.get("/pdks", response_model=EdaPdksResponse)
     def list_pdks() -> EdaPdksResponse:
-        """The process design kits the EDA image ships."""
-        return EdaPdksResponse(pdks=list(PDK_CHOICES), default=DEFAULT_PDK)
+        """The process design kits (or technologies) this kind's image ships."""
+        return EdaPdksResponse(
+            pdks=list(pdk_choices if pdk_choices is not None else PDK_CHOICES),
+            default=default_pdk if default_pdk is not None else DEFAULT_PDK,
+        )
 
     @router.get("", response_model=list[EdaSummary])
     def list_all() -> list[EdaSummary]:
