@@ -1,0 +1,16 @@
+grafux_smoke.gds
+grafux_smoke.html
+functional_stim.sp
+grafux_smoke.sp
+sram.sp
+trimmed.sp
+grafux_smoke.lvs.sp
+delay_meas.sp
+functional_meas.sp
+grafux_smoke_TT_5p0V_25C.lib
+grafux_smoke.lef
+grafux_smoke.log
+delay_stim.sp
+datasheet.info
+grafux_smoke.v
+grafux_smoke.py

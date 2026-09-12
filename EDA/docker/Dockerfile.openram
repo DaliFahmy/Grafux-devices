@@ -52,6 +52,16 @@ FROM ubuntu:22.04
 
 # python3-dev and build-essential are not optional: several of OpenRAM's
 # requirements build native extensions at pip time.
+#
+# `curl` is deliberately ABSENT, and that is load-bearing rather than an
+# oversight.  Every run starts by executing OpenRAM's own install_conda.sh, which
+# tries to fetch a ~100 MB miniconda and build a second environment; with no curl
+# it fails in a few harmless lines and the compiler carries on with the venv
+# below.  Verified on the first real compile (CI run 34683094775): a 2x16
+# scn4m_subm macro completes in 16.9 s, every view written, with that script
+# failing noisily first.  Adding curl would make it SUCCEED -- downloading
+# miniconda on every cold pod for an environment nothing here uses.  The noise
+# lands on the block's `log` port; it is not an error.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         openssh-server rsync ca-certificates git \

@@ -9,6 +9,7 @@ the image's CI smoke test compiles the output of `build_openram_config`, an
 option OpenRAM stops accepting fails the image build rather than a user's run.
 """
 
+import io
 import json
 import os
 import sys
@@ -21,6 +22,22 @@ if _DEVICES_DIR not in sys.path:
 
 from EDA import flow  # noqa: E402
 from EDA.models import OpenRamRunRequest  # noqa: E402
+
+FIXTURES = os.path.join(os.path.dirname(__file__), "fixtures", "eda")
+
+
+def real_listing():
+    """
+    The output directory of a REAL 2x16 scn4m_subm compile, in `ls -S` order.
+
+    Captured from the image's CI smoke test (OpenRAM v1.2.48) rather than
+    written by hand, because the thing this data proves -- that a real run
+    leaves eight .sp files and a corner-suffixed .lib -- is precisely what a
+    hand-written fixture would have got wrong.
+    """
+    with io.open(os.path.join(FIXTURES, "openram_listing.txt"),
+                 encoding="utf-8") as handle:
+        return handle.read().splitlines()
 
 
 def _req(**kw):
@@ -218,6 +235,46 @@ def test_a_multi_corner_run_takes_the_first_listed_lib():
     assert found["lib"] == "m_TT_3p3V_25C.lib"
 
 
+def test_the_real_output_directory_resolves_every_port():
+    """
+    The authoritative case, from a real compile. Its shape is the reason the
+    classifier prefers the macro's own name over the largest file.
+    """
+    found = flow.classify_openram_outputs(real_listing(), "grafux_smoke")
+    assert found["gds"] == "grafux_smoke.gds"
+    assert found["lef"] == "grafux_smoke.lef"
+    assert found["verilog_model"] == "grafux_smoke.v"
+    assert found["datasheet"] == "grafux_smoke.html"
+    assert found["config"] == "grafux_smoke.py"
+    # The Liberty carries the corner, so only a PREFIX match can find it.
+    assert found["lib"] == "grafux_smoke_TT_5p0V_25C.lib"
+
+
+def test_the_spice_port_gets_the_netlist_not_a_test_stimulus():
+    """
+    The bug the CI smoke test caught. A 2x16 macro writes EIGHT .sp files and
+    `functional_stim.sp` is LARGER than the netlist, so picking by size alone
+    put a test stimulus on the port a circuit tool would read.
+    """
+    names = real_listing()
+    assert len([n for n in names if n.endswith(".sp")]) == 8
+    found = flow.classify_openram_outputs(names, "grafux_smoke")
+    assert found["spice"] == "grafux_smoke.sp"
+    # ...and not the near-miss that also starts with the macro name.
+    assert found["spice"] != "grafux_smoke.lvs.sp"
+
+
+def test_without_a_macro_name_it_still_answers_by_size():
+    """
+    The fallback must keep working: a warm pod running an older runner, or any
+    caller that cannot supply the name, still gets a usable classification
+    rather than nothing.
+    """
+    found = flow.classify_openram_outputs(real_listing())
+    assert found["gds"] == "grafux_smoke.gds"
+    assert found["spice"].endswith(".sp")
+
+
 def test_a_missing_view_is_simply_absent_rather_than_empty_or_raising():
     found = flow.classify_openram_outputs(["m.sp", "m.v"])
     assert "gds" not in found
@@ -295,11 +352,21 @@ def pod(monkeypatch):
         "stages": [],
         "run": (0, "Total area: 1234.5 um^2", ""),
         # What `ls -S -1` reports, and what those files contain.
-        "listing": ("m.gds\nm_TT_3p3V_25C.lib\nm.lef\nm.v\nm.sp\nm.html\n"
-                    "m.py\nm.log\n"),
+        # Named after the macro run_openram will derive for an 8x64 scn4m_subm
+        # block, so the name-preferring passes in classify_openram_outputs are
+        # exercised rather than bypassed.
+        "listing": ("sram_8x64_scn4m_subm.gds\n"
+                    "functional_stim.sp\n"
+                    "sram_8x64_scn4m_subm.sp\n"
+                    "sram_8x64_scn4m_subm_TT_5p0V_25C.lib\n"
+                    "sram_8x64_scn4m_subm.lef\n"
+                    "sram_8x64_scn4m_subm.v\n"
+                    "sram_8x64_scn4m_subm.html\n"
+                    "sram_8x64_scn4m_subm.py\n"
+                    "sram_8x64_scn4m_subm.log\n"),
         "pod_files": {
-            "m.v": "module m(); endmodule\n",
-            "m.py": "word_size = 8\nnum_words = 64\nnum_banks = 1\n",
+            "sram_8x64_scn4m_subm.v": "module m(); endmodule\n",
+            "sram_8x64_scn4m_subm.py": "word_size = 8\nnum_words = 64\nnum_banks = 1\n",
         },
     }
 
@@ -345,11 +412,11 @@ def test_the_config_port_reports_what_openram_actually_ran(pod):
     port is in both the input and the output list.
     """
     out = _run(pod)["outputs"]
-    assert out["config"] == pod["pod_files"]["m.py"]
+    assert out["config"] == pod["pod_files"]["sram_8x64_scn4m_subm.py"]
 
 
 def test_the_generated_config_falls_back_when_openram_wrote_no_copy(pod):
-    pod["listing"] = "m.gds\nm.v\n"
+    pod["listing"] = "sram_8x64_scn4m_subm.gds\n"
     out = _run(pod)["outputs"]
     assert "tech_name" in out["config"]
 
@@ -394,7 +461,7 @@ def test_a_clean_exit_that_produced_no_macro_is_still_an_error(pod):
     "The tool said fine and built nothing" must not read as success -- OpenRAM
     can exit 0 on a partial run.
     """
-    pod["listing"] = "m.log\n"
+    pod["listing"] = "sram_8x64_scn4m_subm.log\n"
     out = _run(pod)["outputs"]
     assert out["status"] == "error"
     assert "without producing a macro" in out["errors"]
@@ -402,7 +469,8 @@ def test_a_clean_exit_that_produced_no_macro_is_still_an_error(pod):
 
 def test_netlist_only_is_green_without_a_gds(pod):
     """It is the documented way to ask for exactly that."""
-    pod["listing"] = "m.sp\nm.v\nm.log\n"
+    pod["listing"] = ("sram_8x64_scn4m_subm.sp\nsram_8x64_scn4m_subm.v\n"
+                      "sram_8x64_scn4m_subm.log\n")
     out = _run(pod, _req(word_size="8", num_words="64", netlist_only="1"))["outputs"]
     assert out["status"] == "ok"
 

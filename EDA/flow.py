@@ -1173,28 +1173,54 @@ _OPENRAM_EXT_PORTS = (
 )
 
 
-def classify_openram_outputs(names: Sequence[str]) -> Dict[str, str]:
+def classify_openram_outputs(names: Sequence[str],
+                             output_name: str = "") -> Dict[str, str]:
     """
     Map an output directory listing onto the block's ports, by extension.
 
-    ``names`` is expected in ``ls -S`` order (largest first), so the first match
-    for an extension is the substantive one -- which is what disambiguates a
-    multi-corner run that wrote several ``.lib`` files, and why the caller must
-    not sort the listing itself.
+    Three passes per extension, in this order, and the order is the whole point:
+
+    1. the file named exactly ``<output_name><ext>``;
+    2. any file whose name starts with ``<output_name>``;
+    3. the first remaining match in ``ls -S`` (largest-first) order.
+
+    Pass 1 exists because a real run's output directory is NOT one file per
+    extension.  A 2x16 scn4m_subm macro writes EIGHT ``.sp`` files -- the SRAM
+    netlist plus ``functional_stim.sp``, ``sram.sp``, ``trimmed.sp``,
+    ``delay_meas.sp`` and friends -- and the stimulus files are LARGER than the
+    netlist, so size alone picks a test stimulus for the ``spice`` port.  This
+    was found by the image's CI smoke test against a real compile, which is
+    exactly what that step is for; the listing is captured in
+    tests/fixtures/eda/openram_listing.txt so it cannot regress.
+
+    Pass 2 catches the Liberty file, which is the opposite case: OpenRAM encodes
+    the corner into its name (``<output_name>_TT_5p0V_25C.lib``), so an exact
+    match never hits and a prefix match is the most specific rule available.
+
+    Pass 3 is the fallback for anything OpenRAM did not name after the macro.
+    It keeps ``ls -S`` order load-bearing, so the caller must not sort the
+    listing itself.
 
     Unknown extensions are simply absent from the result; they still reach the
     user through the artifact download.
     """
-    found: Dict[str, str] = {}
+    cleaned: List[str] = []
     for raw in names:
         name = (raw or "").strip()
-        if not name or name.endswith("/"):
+        if name and not name.endswith("/"):
+            cleaned.append(name)
+
+    stem = (output_name or "").strip()
+    found: Dict[str, str] = {}
+    for ext, port in _OPENRAM_EXT_PORTS:
+        if port in found:
             continue
-        lower = name.lower()
-        for ext, port in _OPENRAM_EXT_PORTS:
-            if lower.endswith(ext) and port not in found:
-                found[port] = name
-                break
+        matches = [n for n in cleaned if n.lower().endswith(ext)]
+        if not matches:
+            continue
+        exact = [n for n in matches if stem and n == stem + ext]
+        prefixed = [n for n in matches if stem and n.startswith(stem)]
+        found[port] = (exact or prefixed or matches)[0]
     return found
 
 
@@ -3342,7 +3368,7 @@ def run_openram(
     _code, listing, _err = exec_simple(
         client, _sh("ls -S -1 {0} 2>/dev/null".format(shlex.quote(out_dir))),
         timeout=60)
-    found = classify_openram_outputs((listing or "").splitlines())
+    found = classify_openram_outputs((listing or "").splitlines(), name)
 
     verilog, verilog_big = ("", False)
     if found.get("verilog_model"):
