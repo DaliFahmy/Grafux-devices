@@ -9,8 +9,8 @@ are sent to ``POST /{kind}/{id}/run`` (Run).
 
 Every field is optional so a partially-wired block still works.
 
-Port -> field mapping (shared config, all three kinds)
------------------------------------------------------
+Port -> field mapping (shared config, every kind)
+-------------------------------------------------
 instance_type -> EdaSpec.instance_type   (RunPod CPU flavor id, or a GPU type id)
 image         -> EdaSpec.image           (EDA image: yosys + openroad + verilator + PDK)
 pdk           -> EdaSpec.pdk             ("sky130hd" | "sky130hs" | "asap7" | "nangate45")
@@ -56,6 +56,11 @@ DEFAULT_PDK = os.environ.get("EDA_DEFAULT_PDK", "sky130hd")
 # creation dialog by ``GET /{kind}/pdks``.
 PDK_CHOICES = ["sky130hd", "sky130hs", "asap7", "nangate45", "ihp-sg13g2"]
 
+# The OpenRAM technologies the openram image ships.  scn4m_subm and freepdk45
+# live inside the OpenRAM repository itself; sky130 needs a PDK fetched at image
+# build time, so it only appears here once an image that carries it is pinned.
+OPENRAM_TECH_CHOICES = ["scn4m_subm", "freepdk45"]
+
 # EDA tools are CPU-bound — synthesis and place-and-route never touch a GPU — so
 # the default pod is a RunPod CPU instance, which is far cheaper than renting an
 # idle GPU.  ``EDA_COMPUTE_TYPE=GPU`` falls back to the gpu block's proven code
@@ -68,7 +73,7 @@ DEFAULT_INSTANCE = os.environ.get("EDA_DEFAULT_INSTANCE", "cpu3c-8")
 ORFS_STAGES = ("synth", "floorplan", "place", "cts", "route", "final")
 
 # The kinds this package serves, one per Grafux block type.
-EDA_KINDS = ("verilator", "yosys", "openroad")
+EDA_KINDS = ("verilator", "yosys", "openroad", "openram")
 
 # The light verification image: Verilator + cocotb + iverilog, no PDK and no
 # OpenROAD.  It exists because pod placement and image pull dominate a simulation
@@ -85,19 +90,69 @@ DEFAULT_VERIFY_IMAGE = os.environ.get(
 )
 
 
+# The MEMORY-COMPILER image: OpenRAM plus a Python runtime, and nothing else.
+#
+# WHY A THIRD IMAGE.  OpenRAM shares nothing with the other two toolchains -- it
+# is a pure-Python compiler that writes GDS itself, so it needs neither the
+# OpenROAD stack of ../Dockerfile nor the Verilator/cocotb stack of
+# Dockerfile.verify.  Its own defaults do the rest of the work: check_lvsdrc is
+# already False and analytical_delay already True upstream, so magic, netgen,
+# ngspice and klayout are NOT required for the default path and the image stays
+# small.  Turning the `check_drc` port on needs an image that carries them.
+#
+# The default technology, scn4m_subm, ships INSIDE the OpenRAM repository's
+# technology/ directory, so the image is self-contained.  sky130 is the opposite:
+# it needs `make sky130-pdk` (which fetches a full PDK) plus `make sky130-install`,
+# which is why Dockerfile.openram gates it behind a build ARG rather than paying
+# for it on every pull.
+#
+# PIN THE TAG, for the same reason DEFAULT_VERIFY_IMAGE is pinned.
+DEFAULT_OPENRAM_IMAGE = os.environ.get(
+    "EDA_OPENRAM_IMAGE",
+    "ghcr.io/dalifahmy/grafux-openram:v1_2_2-scn4m-20260911",
+)
+
+# The technology a run compiles for when the block's `tech_name` port is empty.
+# scn4m_subm because it needs no external PDK: a freshly dropped block Runs.
+DEFAULT_OPENRAM_TECH = os.environ.get("EDA_OPENRAM_TECH", "scn4m_subm")
+
+# The image each kind gets when the block left its `image` port empty.  A dict
+# rather than a chain of conditionals because every entry is the same kind of
+# statement, and a missing kind must fall back to the full EDA image rather than
+# to whichever branch happened to be last.
+_KIND_IMAGES = {
+    "verilator": lambda: DEFAULT_VERIFY_IMAGE,
+    "openram": lambda: DEFAULT_OPENRAM_IMAGE,
+}
+
+# Container disk in GB per kind.  ORFS carries a PDK and gigabytes of tooling;
+# the verify image is a simulator; OpenRAM sits in between because it writes GDS
+# and its outputs are kept for the artifact download.
+_KIND_DISKS = {
+    "verilator": 20,
+    "openram": 30,
+}
+
+
 def image_for_kind(kind: str) -> str:
     """
     The default image for an EDA kind.
 
     Only synthesis and place-and-route need the PDK and the OpenROAD toolchain;
-    verilator needs a simulator and cocotb, which is a tenth of the size.
+    verilator needs a simulator and cocotb, and openram needs neither -- each is
+    a fraction of the size of the full EDA image, which is the fallback.
+
+    The lambdas matter: the values are module-level names that the environment
+    may have overridden, and a dict of plain strings would freeze whatever they
+    happened to be at import time of this dict rather than of the module.
     """
-    return DEFAULT_VERIFY_IMAGE if (kind or "") == "verilator" else DEFAULT_IMAGE
+    factory = _KIND_IMAGES.get(kind or "")
+    return factory() if factory else DEFAULT_IMAGE
 
 
 def disk_for_kind(kind: str) -> int:
-    """Container disk in GB for an EDA kind -- the verify image needs far less."""
-    return 20 if (kind or "") == "verilator" else 60
+    """Container disk in GB for an EDA kind -- only ORFS needs the full 60."""
+    return _KIND_DISKS.get(kind or "", 60)
 
 
 class EdaSpec(BaseModel):
@@ -105,7 +160,7 @@ class EdaSpec(BaseModel):
 
     kind: str = Field(
         "yosys",
-        description="Which tool this block runs: 'verilator' | 'yosys' | 'openroad'.",
+        description="Which tool this block runs: 'verilator' | 'yosys' | 'openroad' | 'openram'.",
     )
     image: str = Field(
         DEFAULT_IMAGE,
@@ -249,6 +304,73 @@ class OpenRoadRunRequest(_RunBase):
     from_stage: str = Field("synth", description="First ORFS stage to run.")
     to_stage: str = Field("final", description="Last ORFS stage to run.")
     extra_config: str = Field("", description="Raw extra lines appended to the ORFS config.mk.")
+
+
+class OpenRamRunRequest(_RunBase):
+    """
+    Live inputs for an OpenRAM memory-compiler run.
+
+    Every field is a STRING, including the ones that are obviously numbers,
+    because they arrive from text ports: an unwired port is empty, and an ``int``
+    field would turn that into 0 -- a zero-word SRAM -- instead of "use the
+    default". The same reason OpenRoadRunRequest keeps clock_period and
+    core_utilization as strings.
+
+    The names are OpenRAM's own config variables one-for-one, so the block face
+    reads like the compiler's documentation and there is no translation table to
+    get wrong. ``config`` is listed FIRST because it overrides every parameter
+    below it, and a port that silently invalidates a dozen others must not be
+    buried among them.
+
+    Compile time grows steeply with ``num_words``: a 16-word scn4m_subm macro is
+    seconds, a few thousand words is many minutes, and a large multi-bank macro
+    with DRC on runs for hours on a pod that bills the whole time.
+    """
+
+    config: str = Field(
+        "",
+        description=(
+            "A complete OpenRAM config file. When non-empty it WINS OUTRIGHT and "
+            "every parameter below is ignored -- the run says so on `warnings` -- "
+            "except that output_path and output_name are still forced, because "
+            "the server has to know where to read the results back from."
+        ),
+    )
+    word_size: str = Field("", description="Bits per word. The compiler's default applies when empty.")
+    num_words: str = Field("", description="Words in the array. Compile time grows steeply with this.")
+    num_banks: str = Field("", description="Banks (1, 2 or 4). The aspect-ratio knob.")
+    num_rw_ports: str = Field("", description="Read/write ports. A second one roughly doubles bitcell area.")
+    num_r_ports: str = Field("", description="Read-only ports.")
+    num_w_ports: str = Field("", description="Write-only ports.")
+    write_size: str = Field("", description="Write granularity in bits, for byte writes. Empty = whole word.")
+    tech_name: str = Field(
+        "",
+        description=(
+            "Technology in OPENRAM_TECH: 'scn4m_subm' (ships inside OpenRAM, "
+            "needs no external PDK, the default) or another the image carries."
+        ),
+    )
+    output_name: str = Field(
+        "",
+        description="Macro/module name and the base name of every output file. Derived from the parameters when empty.",
+    )
+    process_corners: str = Field("", description="Comma-separated corners to characterize, e.g. 'TT' or 'TT,SS,FF'.")
+    supply_voltages: str = Field("", description="Comma-separated supply voltages. Empty uses the technology's nominal.")
+    temperatures: str = Field("", description="Comma-separated temperatures in C, e.g. '25'.")
+    check_lvsdrc: str = Field(
+        "0",
+        description=(
+            "'1' to run DRC and LVS. Off by default, as upstream is: they need "
+            "magic and netgen in the image and can take longer than the compile "
+            "itself, and a correct GDS lost to a checker nobody asked for reads "
+            "as a compiler failure."
+        ),
+    )
+    netlist_only: str = Field(
+        "0",
+        description="'1' to skip layout: no GDS and no LEF, much faster. The iteration mode.",
+    )
+    extra_config: str = Field("", description="Raw extra lines appended verbatim to the generated config.")
 
 
 class CreateEdaResponse(BaseModel):

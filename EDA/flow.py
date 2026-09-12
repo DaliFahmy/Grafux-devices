@@ -31,7 +31,7 @@ import shlex
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .models import ORFS_STAGES
+from .models import DEFAULT_OPENRAM_TECH, ORFS_STAGES
 from .pod_client import WORK_DIR, _EDA_ENV, exec_simple, exec_stream
 
 logger = logging.getLogger("eda.flow")
@@ -962,6 +962,292 @@ def _ns_to_ps(period_ns: str) -> str:
         return str(int(round(float(period_ns) * 1000)))
     except (TypeError, ValueError):
         return "10000"
+
+
+
+# ---------------------------------------------------------------------------
+# OpenRAM (memory compiler)
+# ---------------------------------------------------------------------------
+
+# Where a run's generated views land, relative to WORK_DIR.  A directory of its
+# own rather than WORK_DIR itself because ``classify_openram_outputs`` reads the
+# whole listing and classifies by extension -- a stray ``.v`` staged through the
+# ``files`` port would otherwise be mistaken for the generated model.
+OPENRAM_OUT_DIR = "openram_out"
+
+# The config file written into the pod.  Named, not inlined, because OpenRAM
+# copies it into the output directory as ``<output_name>.py`` and that copy --
+# with every default it filled in -- is what the ``config`` output port reports.
+OPENRAM_CONFIG_FILE = "openram_config.py"
+
+# Roughly the point past which a compile stops being interactive.  Not a hard
+# limit: ``EDA_MAX_RUN_MINUTES`` and the run timeout are, and this only warns.
+OPENRAM_WARN_BITS = 256 * 1024
+# Past this a run is hours, and the pod bills for every one of them.  A run this
+# size is almost always a typo in ``num_words``, so it is refused rather than
+# started -- the one place in this file where a request is turned away before a
+# tool sees it.
+OPENRAM_MAX_BITS = 4 * 1024 * 1024
+
+
+def _int_or(text: str, fallback: int) -> int:
+    """Parse a port value as an int, falling back when it is empty or junk."""
+    try:
+        return int(str(text).strip())
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _py_list(text: str, *, quote: bool) -> str:
+    """
+    Render a comma- or space-separated port value as a Python list literal.
+
+    OpenRAM's corner settings are lists (``process_corners = ["TT"]``), and the
+    ports carry them as plain text, so this is the one translation between the
+    two.  Returns "" for an empty port, which is the signal to omit the
+    assignment entirely and let the technology's own default stand.
+    """
+    tokens = _split_tokens(text)
+    if not tokens:
+        return ""
+    if quote:
+        return "[" + ", ".join(json.dumps(t) for t in tokens) + "]"
+    return "[" + ", ".join(tokens) + "]"
+
+
+def openram_output_name(req, tech: str) -> str:
+    """
+    The macro's module name, and the base name of every file it produces.
+
+    Derived from the geometry when the port is empty so two differently-sized
+    macros in one project never collide on disk.
+    """
+    explicit = (getattr(req, "output_name", "") or "").strip()
+    if explicit:
+        return _safe_filename(explicit)
+    word = _int_or(getattr(req, "word_size", ""), 8)
+    words = _int_or(getattr(req, "num_words", ""), 64)
+    return _safe_filename("sram_{0}x{1}_{2}".format(word, words, tech))
+
+
+def openram_size_warnings(req) -> Tuple[List[str], str]:
+    """
+    Advisory notes about the requested size, and a refusal when it is absurd.
+
+    Returns ``(notes, refusal)``.  A non-empty refusal means do not start the
+    run at all.
+
+    This exists because nothing else in the system bounds the cost: the block
+    face shows two numbers, and the difference between them is the difference
+    between a thirty-second run and a four-hour bill on a rented machine.  The
+    user finding that out from an invoice is the failure this prevents.
+    """
+    word = _int_or(getattr(req, "word_size", ""), 0)
+    words = _int_or(getattr(req, "num_words", ""), 0)
+    banks = _int_or(getattr(req, "num_banks", ""), 1)
+    bits = word * words
+    notes: List[str] = []
+    if bits <= 0:
+        return notes, ""
+    if bits > OPENRAM_MAX_BITS:
+        return notes, (
+            "Refusing to start: {0} x {1} is {2} bits ({3:.1f} Mbit), past the "
+            "{4:.0f} Mbit ceiling this block will attempt. A macro that size "
+            "compiles for hours on a pod that bills the whole time, and is "
+            "almost always a typo in num_words. Reduce num_words, or split the "
+            "memory across several blocks."
+        ).format(word, words, bits, bits / 1024 / 1024,
+                 OPENRAM_MAX_BITS / 1024 / 1024)
+    if bits > OPENRAM_WARN_BITS:
+        notes.append(
+            "This is a {0:.0f} kbit macro ({1} x {2}); expect a long compile. "
+            "More banks (num_banks is {3}) shortens the bitlines and usually "
+            "helps both the run time and the aspect ratio."
+            .format(bits / 1024, word, words, banks)
+        )
+    if words > 0 and (words & (words - 1)) != 0:
+        notes.append(
+            "num_words {0} is not a power of two; OpenRAM rounds the array up, "
+            "so the macro is bigger than the word count suggests.".format(words)
+        )
+    return notes, ""
+
+
+def build_openram_config(req, *, tech: str, output_name: str, out_dir: str) -> str:
+    """
+    Build the OpenRAM configuration file for a run.
+
+    OpenRAM takes no command-line parameters worth the name: every knob is a
+    module-level assignment in a Python file it executes.  So this IS the
+    interface, and it is a pure string builder for exactly that reason -- the
+    image's CI smoke test compiles the output of THIS function, so an option
+    OpenRAM no longer accepts fails the image build rather than a user's pod.
+
+    An empty port omits its assignment rather than writing a guess, so the
+    technology's own default stands.  The exceptions are the three settings
+    below, which are written on every run because leaving them to the default
+    would fail late and expensively:
+
+    * ``check_lvsdrc`` -- DRC and LVS need magic and netgen, which this image
+      does not carry.  Off unless the block asked, in which case the run fails
+      with a message naming the missing tools instead of silently skipping them.
+    * ``analytical_delay`` -- the alternative is a SPICE simulation, and the
+      image ships no simulator.  With it off, characterization dies at the very
+      end, after all the layout work is already paid for.
+    * ``nominal_corner_only`` -- one corner means one ``.lib``, and the ``lib``
+      output port holds one filename.  Only forced when the block did not ask
+      for corners of its own.
+
+    ``output_path`` and ``output_name`` are forced even when the block supplied
+    a whole ``config``: the server has to know where to read the results back
+    from, and a user config pointing elsewhere produces a run whose outputs are
+    invisible.  Note OpenRAM concatenates the two with no separator, so the path
+    MUST end in a slash.
+    """
+    out = out_dir if out_dir.endswith("/") else out_dir + "/"
+    forced = [
+        "# --- forced by Grafux: the server reads the results back from here ---",
+        "output_path = {0}".format(json.dumps(out)),
+        "output_name = {0}".format(json.dumps(output_name)),
+    ]
+
+    override = (getattr(req, "config", "") or "").strip()
+    if override:
+        # The `config` port WINS, entirely.  A half-merge -- our parameters plus
+        # the user's file -- is the worst of both: the block face shows
+        # word_size 8 while the macro comes out 32 wide, and nothing on screen
+        # says which won.
+        return override.rstrip() + "\n\n" + "\n".join(forced) + "\n"
+
+    corners = _py_list(getattr(req, "process_corners", ""), quote=True)
+    volts = _py_list(getattr(req, "supply_voltages", ""), quote=False)
+    temps = _py_list(getattr(req, "temperatures", ""), quote=False)
+    drc = (getattr(req, "check_lvsdrc", "") or "").strip() in ("1", "true", "yes", "on")
+    netlist_only = (getattr(req, "netlist_only", "") or "").strip() in ("1", "true", "yes", "on")
+
+    lines = ["# Generated by Grafux for the openram block. Do not edit in the pod."]
+    for field in ("word_size", "num_words", "num_banks", "num_rw_ports",
+                  "num_r_ports", "num_w_ports", "write_size"):
+        raw = (getattr(req, field, "") or "").strip()
+        if raw:
+            lines.append("{0} = {1}".format(field, _int_or(raw, 0)))
+    lines.append("tech_name = {0}".format(json.dumps(tech)))
+    if corners:
+        lines.append("process_corners = {0}".format(corners))
+    if volts:
+        lines.append("supply_voltages = {0}".format(volts))
+    if temps:
+        lines.append("temperatures = {0}".format(temps))
+    if not corners and not volts and not temps:
+        # One corner means one .lib, and the `lib` port holds one filename.
+        lines.append("nominal_corner_only = True")
+    lines.append("analytical_delay = True   # no SPICE simulator in this image")
+    lines.append("check_lvsdrc = {0}".format(bool(drc)))
+    if netlist_only:
+        lines.append("netlist_only = True   # no layout: no GDS and no LEF")
+    lines.extend(forced)
+
+    extra = (getattr(req, "extra_config", "") or "").strip()
+    if extra:
+        lines.append("")
+        lines.append("# --- extra_config port ---")
+        lines.append(extra)
+    return "\n".join(lines) + "\n"
+
+
+# Extension -> output port.  This is the ONLY place a generated file is matched,
+# and it is matched by EXTENSION rather than by a predicted filename on purpose:
+# OpenRAM encodes the process corner into the Liberty name
+# (``sram_8x64_TT_1p8V_25C.lib``) and its naming has moved between releases, so
+# any filename spelled out here would be a guess that fails on a rented machine.
+# Same reasoning as ``pick_liberty`` above.
+_OPENRAM_EXT_PORTS = (
+    (".gds", "gds"), (".gds.gz", "gds"),
+    (".lef", "lef"),
+    (".lib", "lib"),
+    (".sp", "spice"), (".spice", "spice"),
+    (".v", "verilog_model"),
+    (".html", "datasheet"), (".htm", "datasheet"),
+    (".py", "config"),
+    (".log", "log_file"),
+)
+
+
+def classify_openram_outputs(names: Sequence[str]) -> Dict[str, str]:
+    """
+    Map an output directory listing onto the block's ports, by extension.
+
+    ``names`` is expected in ``ls -S`` order (largest first), so the first match
+    for an extension is the substantive one -- which is what disambiguates a
+    multi-corner run that wrote several ``.lib`` files, and why the caller must
+    not sort the listing itself.
+
+    Unknown extensions are simply absent from the result; they still reach the
+    user through the artifact download.
+    """
+    found: Dict[str, str] = {}
+    for raw in names:
+        name = (raw or "").strip()
+        if not name or name.endswith("/"):
+            continue
+        lower = name.lower()
+        for ext, port in _OPENRAM_EXT_PORTS:
+            if lower.endswith(ext) and port not in found:
+                found[port] = name
+                break
+    return found
+
+
+_OPENRAM_AREA_RE = re.compile(
+    r"(?:total\s+)?area[^0-9\n]*?([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+_OPENRAM_WIDTH_RE = re.compile(
+    r"\bwidth[^0-9\n]*?([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+_OPENRAM_HEIGHT_RE = re.compile(
+    r"\bheight[^0-9\n]*?([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
+
+
+def parse_openram_summary(req, *, tech: str, output_name: str,
+                          log_text: str, found: Dict[str, str]) -> Dict[str, Any]:
+    """
+    The `stats` port: what was built, as JSON.
+
+    Deliberately tolerant -- anything it cannot find is simply absent from the
+    dict rather than reported as zero, because a zero area reads as a broken
+    macro.  It must never raise: the compile has already succeeded by the time
+    this runs, and a summary that throws would turn a good run red.
+    """
+    word = _int_or(getattr(req, "word_size", ""), 0)
+    words = _int_or(getattr(req, "num_words", ""), 0)
+    summary: Dict[str, Any] = {
+        "top": output_name,
+        "tech_name": tech,
+        "views": sorted(k for k in found if k not in ("config", "log_file")),
+    }
+    if word:
+        summary["word_size"] = word
+    if words:
+        summary["num_words"] = words
+    if word and words:
+        summary["total_bits"] = word * words
+    for field in ("num_banks", "num_rw_ports", "num_r_ports", "num_w_ports",
+                  "write_size"):
+        raw = (getattr(req, field, "") or "").strip()
+        if raw:
+            summary[field] = _int_or(raw, 0)
+    corners = _split_tokens(getattr(req, "process_corners", ""))
+    if corners:
+        summary["process_corners"] = corners
+    text = log_text or ""
+    for key, pattern in (("area_um2", _OPENRAM_AREA_RE),
+                         ("width_um", _OPENRAM_WIDTH_RE),
+                         ("height_um", _OPENRAM_HEIGHT_RE)):
+        match = pattern.search(text)
+        if match:
+            try:
+                summary[key] = float(match.group(1))
+            except ValueError:
+                pass
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -2370,6 +2656,17 @@ def globs_for(kind: str, *, work_dir: str = WORK_DIR, platform: str = "",
     if kind == "yosys":
         return [f"{work_dir}/*.v", f"{work_dir}/*.log", f"{work_dir}/*.json",
                 f"{work_dir}/*.txt"]
+    if kind == "openram":
+        # Every generated view, plus the two files that explain the run: the
+        # ``.py`` is the config OpenRAM ACTUALLY used with every default it
+        # filled in -- the single most useful artifact when a macro comes out
+        # wrong -- and the ``.log`` is its own record, which is why nothing here
+        # pipes the compile through ``tee``.
+        out = f"{work_dir}/{OPENRAM_OUT_DIR}"
+        return [f"{out}/*.gds", f"{out}/*.lef", f"{out}/*.lib",
+                f"{out}/*.v", f"{out}/*.sp", f"{out}/*.spice",
+                f"{out}/*.html", f"{out}/*.log", f"{out}/*.py",
+                f"{out}/*.lvs", f"{out}/*.json"]
     results = f"$FLOW_HOME/results/{platform}/{design}/base"
     reports = f"$FLOW_HOME/reports/{platform}/{design}/base"
     return [
@@ -2891,6 +3188,205 @@ def run_cocotb(
     })
     return {"outputs": outputs, "_status": "ok" if passed else "error",
             "_stage": last_stage, "_globs": globs_for("verilator")}
+
+
+# Scoped to run_openram, deliberately NOT folded into _EDA_ENV -- the same
+# reason _COCOTB_ENV above is scoped: prepending a virtualenv to the PATH of
+# every run is the classic way to break yosys and openroad from a distance.
+#
+# The defaults match Dockerfile.openram, but the image's own values win: a user
+# pinning a different OpenRAM build through the `image` port gets that build's
+# paths rather than this file's idea of them.  PYTHONUNBUFFERED is not cosmetic
+# -- without it OpenRAM's phase banners arrive in one lump at exit, so a long
+# compile shows a dead log tail for its whole duration.
+_OPENRAM_ENV = (
+    'export OPENRAM_HOME="${OPENRAM_HOME:-/opt/openram/compiler}"; '
+    'export OPENRAM_TECH="${OPENRAM_TECH:-/opt/openram/technology}"; '
+    'export PYTHONPATH="$OPENRAM_HOME:$PYTHONPATH"; '
+    'export PYTHONUNBUFFERED=1; '
+    'export PATH="/opt/openram-venv/bin:$PATH"; '
+    # How the compiler is invoked.  OpenRAM has moved its entry point between
+    # releases, so the IMAGE owns this: Dockerfile.openram writes it into
+    # /etc/profile.d, which a `bash -lc` login shell sources -- the one channel
+    # by which image-level configuration reaches an SSH exec, since Docker ENV
+    # does not.  The ``:-`` keeps a pre-2026 image working.
+    'export GRAFUX_OPENRAM_CMD='
+    '"${GRAFUX_OPENRAM_CMD:-python3 $OPENRAM_HOME/../sram_compiler.py}"; '
+)
+
+# Unquoted on purpose: the value is several words and must split into a command
+# plus its arguments.  It comes from the image or from this file, never from a
+# port, so there is no untrusted text here.  ``EDA_OPENRAM_CMD`` on the devices
+# server overrides it outright, which is the escape hatch when a pinned image
+# turns out to be wrong and redeploying is faster than rebuilding.
+_OPENRAM_CMD_DEFAULT = "$GRAFUX_OPENRAM_CMD"
+
+
+def _sh_openram(command: str) -> str:
+    """``_sh`` plus OpenRAM's paths and unbuffered Python output."""
+    return _sh(_OPENRAM_ENV + command)
+
+
+def _read_pod_text(client, path: str, limit: Optional[int] = None) -> Tuple[str, bool]:
+    """
+    Read a generated file back for an inline port.
+
+    Returns ``(text, truncated)``.  A file past the limit comes back empty and
+    truncated, so the caller can point the port at the downloaded artifact
+    instead -- the same read-or-attach rule ``run_yosys`` applies to a netlist.
+    A missing file is reported, never raised: it is one port of many.
+
+    ``limit`` resolves NETLIST_INLINE_MAX at CALL time rather than as a default
+    argument: a default is bound at import, so the env-driven constant would
+    freeze at whatever it was when this module first loaded.
+    """
+    if limit is None:
+        limit = NETLIST_INLINE_MAX
+    sftp = client.open_sftp()
+    try:
+        with sftp.open(path, "rb") as handle:
+            data = handle.read(limit + 1)
+    except Exception as exc:  # noqa: BLE001 -- a missing view is reported, not raised
+        logger.warning("could not read back %s: %s", path, exc)
+        return "", False
+    finally:
+        sftp.close()
+    if len(data) > limit:
+        return "", True
+    return data.decode("utf-8", "replace"), False
+
+
+def run_openram(
+    client,
+    req,
+    *,
+    on_stage: Callable[[str, str], None],
+    on_line: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Dict[str, Any]:
+    """Compile an SRAM macro from memory parameters and collect its views."""
+    out_dir = "{0}/{1}".format(WORK_DIR, OPENRAM_OUT_DIR)
+    tech = (getattr(req, "tech_name", "") or "").strip() or DEFAULT_OPENRAM_TECH
+    name = openram_output_name(req, tech)
+
+    def _fail(stage: str, message: str, log_text: str = "") -> Dict[str, Any]:
+        outputs = {
+            "top": name, "tech_name": tech, "status": "error",
+            "errors": message, "warnings": "", "log": log_text,
+            "verilog_model": "", "config": "", "stats": "{}", "reports": "",
+        }
+        return {"outputs": outputs, "_status": "error", "_stage": stage,
+                "_globs": globs_for("openram")}
+
+    # ---- stage 1: config ---------------------------------------------------
+    on_stage("config", "running")
+    notes, refusal = openram_size_warnings(req)
+    if refusal:
+        on_stage("config", "failed")
+        return _fail("config", refusal)
+
+    config_text = build_openram_config(req, tech=tech, output_name=name,
+                                       out_dir=out_dir)
+    if (getattr(req, "config", "") or "").strip():
+        notes.append(
+            "The `config` port was set, so every memory-parameter port was "
+            "ignored and that config was used as written (output_path and "
+            "output_name excepted -- the server reads the results from there)."
+        )
+    if (getattr(req, "check_lvsdrc", "") or "").strip() in ("1", "true", "yes", "on"):
+        notes.append(
+            "check_lvsdrc is on. DRC and LVS need magic and netgen, which the "
+            "default openram image does not carry -- pin an image that does on "
+            "the `image` port, or the run fails at the checking step."
+        )
+    sftp = client.open_sftp()
+    try:
+        _write_file(sftp, "{0}/{1}".format(WORK_DIR, OPENRAM_CONFIG_FILE), config_text)
+    finally:
+        sftp.close()
+    on_stage("config", "done")
+
+    # ---- stage 2: compile --------------------------------------------------
+    on_stage("compile", "running")
+    command = (os.environ.get("EDA_OPENRAM_CMD", "") or "").strip() or _OPENRAM_CMD_DEFAULT
+    # No `| tee`: OpenRAM writes its own <output_name>.log into the output
+    # directory, and a pipeline would hand the run tee's exit status instead of
+    # the compiler's -- the exact trap the run_yosys comment below documents.
+    code, out, err = exec_stream(
+        client,
+        _sh_openram("mkdir -p {0} && cd {1} && {2} {3}".format(
+            shlex.quote(out_dir), shlex.quote(WORK_DIR), command,
+            shlex.quote(OPENRAM_CONFIG_FILE))),
+        timeout=int(getattr(req, "timeout", 0) or 3600),
+        on_line=on_line, should_cancel=should_cancel,
+    )
+    on_stage("compile", "done" if code == 0 else "failed")
+
+    log_text = (out or "").strip()
+    if code != 0:
+        reason = (err or "").strip() or log_text or (
+            "The OpenRAM run was cancelled" if code == -1 else
+            "The OpenRAM run exceeded its timeout" if code == -2 else
+            "OpenRAM exited with code {0}".format(code)
+        )
+        result = _fail("compile", reason, log_text)
+        result["outputs"]["config"] = config_text
+        result["outputs"]["warnings"] = "\n".join(notes)
+        return result
+
+    # ---- stage 3: collect --------------------------------------------------
+    on_stage("collect", "running")
+    # `ls -S` (largest first) is load-bearing: classify_openram_outputs takes the
+    # FIRST match per extension, which is how a multi-corner run's several .lib
+    # files resolve to the substantive one.
+    _code, listing, _err = exec_simple(
+        client, _sh("ls -S -1 {0} 2>/dev/null".format(shlex.quote(out_dir))),
+        timeout=60)
+    found = classify_openram_outputs((listing or "").splitlines())
+
+    verilog, verilog_big = ("", False)
+    if found.get("verilog_model"):
+        verilog, verilog_big = _read_pod_text(
+            client, "{0}/{1}".format(out_dir, found["verilog_model"]))
+    resolved = ""
+    if found.get("config"):
+        resolved, _ = _read_pod_text(
+            client, "{0}/{1}".format(out_dir, found["config"]))
+    if verilog_big:
+        notes.append(
+            "The behavioural model exceeded the inline limit and was attached "
+            "as the artifact {0} instead.".format(found["verilog_model"]))
+
+    # A GDS is the deliverable, so a run that produced none is red even though
+    # the compiler exited 0 -- "the tool said fine and built no macro" must not
+    # read as success.  Unless the block asked for netlist_only, which is the
+    # documented way to ask for exactly that.
+    netlist_only = (getattr(req, "netlist_only", "") or "").strip() in ("1", "true", "yes", "on")
+    produced = bool(found.get("gds")) or (netlist_only and bool(found.get("spice")))
+
+    outputs: Dict[str, str] = {
+        "top": name,
+        "tech_name": tech,
+        "verilog_model": verilog,
+        # The config OpenRAM ACTUALLY ran, with every default it filled in --
+        # the only place the resolved defaults are visible, and the reason this
+        # port is in both the input and the output list.
+        "config": resolved or config_text,
+        "stats": json.dumps(parse_openram_summary(
+            req, tech=tech, output_name=name, log_text=log_text, found=found)),
+        "log": log_text,
+        "reports": "",
+        "status": "ok" if produced else "error",
+        "errors": "" if produced else (
+            "OpenRAM finished without producing a macro. The log above is the "
+            "whole story; the commonest causes are a tech_name the image does "
+            "not carry and a parameter combination the technology cannot build."
+        ),
+        "warnings": "\n".join(n for n in notes if n),
+    }
+    on_stage("collect", "done")
+    return {"outputs": outputs, "_status": outputs["status"], "_stage": "collect",
+            "_globs": globs_for("openram")}
 
 
 def run_yosys(

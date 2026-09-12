@@ -101,6 +101,30 @@ services:
       # package must be PUBLIC or RunPod's anonymous pull fails silently.
       - key: EDA_VERIFY_IMAGE
         value: "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903"
+      # The OPENRAM image, used for the openram kind only: the VLSIDA memory
+      # compiler and nothing else — no OpenROAD, no PDK, no simulator (see
+      # EDA/docker/Dockerfile.openram, which explains what it leaves out and
+      # why none of it is a gap). Same rules as above: PIN THE TAG, and the
+      # GHCR package must be PUBLIC or RunPod's anonymous pull fails silently.
+      # NOTE this value, set HERE in the dashboard, silently overrides the
+      # default in EDA/models.py — render.yaml is only authoritative if the
+      # service is Blueprint-synced, so a stale value here is invisible.
+      - key: EDA_OPENRAM_IMAGE
+        value: "ghcr.io/dalifahmy/grafux-openram:v1_2_2-scn4m-20260911"
+      # Technology an openram block compiles for when its tech_name port is
+      # empty. scn4m_subm ships inside the OpenRAM repository and needs no
+      # external PDK, so a freshly dropped block Runs. sky130 needs an image
+      # built with WITH_SKY130=1 — changing this without changing the image
+      # above gives every run "no such technology".
+      - key: EDA_OPENRAM_TECH
+        value: "scn4m_subm"
+      # How the compiler is invoked. Normally EMPTY: the image supplies it
+      # through /etc/profile.d (an SSH exec does not inherit Docker ENV, but
+      # flow.py runs everything under `bash -lc`, which sources it). Set this
+      # only as the escape hatch when a pinned image's entry point turns out to
+      # be wrong and redeploying is faster than rebuilding.
+      - key: EDA_OPENRAM_CMD
+        value: ""
       # Default process design kit / OpenROAD platform. sky130hd is the standard
       # open-source target and what every public ORFS example uses.
       - key: EDA_DEFAULT_PDK

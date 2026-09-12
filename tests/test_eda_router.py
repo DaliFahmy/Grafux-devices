@@ -20,7 +20,14 @@ sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), ".."
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from EDA.models import DEFAULT_IMAGE, DEFAULT_VERIFY_IMAGE, EDA_KINDS  # noqa: E402
+from EDA.models import (  # noqa: E402
+    DEFAULT_IMAGE,
+    DEFAULT_OPENRAM_IMAGE,
+    DEFAULT_VERIFY_IMAGE,
+    EDA_KINDS,
+    disk_for_kind,
+    image_for_kind,
+)
 from EDA.registry import EdaRecord, registry  # noqa: E402
 from EDA.router_base import _coerce_kind  # noqa: E402
 from EDA.models import EdaSpec  # noqa: E402
@@ -78,7 +85,14 @@ def test_run_body_fields_are_parsed_not_ignored(client, kind):
         "yosys": {"rtl": "module m(); endmodule", "top": "m", "pdk": "sky130hd"},
         "openroad": {"netlist": "module m(); endmodule", "top": "m",
                      "clock_period": "5", "from_stage": "floorplan"},
+        "openram": {"word_size": "8", "num_words": "64",
+                    "tech_name": "scn4m_subm", "num_banks": "1"},
     }
+    # Parametrized over EDA_KINDS, so a kind added without a representative body
+    # fails HERE -- loudly and offline -- rather than by shipping another kind's
+    # fields to a real server, which the shared model would happily accept.
+    assert set(payloads) == set(EDA_KINDS), (
+        "every EDA kind needs a representative run body in this test")
     resp = client.post(f"/{kind}/does-not-exist/run", json=payloads[kind])
     assert resp.status_code == 200, resp.text
     assert resp.json()["kind"] == kind
@@ -113,6 +127,26 @@ def test_a_verilator_block_gets_the_light_verify_image():
     assert spec.kind == "verilator"
     assert spec.image == DEFAULT_VERIFY_IMAGE
     assert spec.container_disk_gb == 20
+
+
+def test_an_openram_block_gets_the_memory_compiler_image():
+    """
+    OpenRAM shares nothing with ORFS but the transport -- no yosys, no openroad,
+    no PDK -- so it pays for neither that image's size nor its pull.
+    """
+    spec = _coerce_kind(EdaSpec(), "openram")
+    assert spec.kind == "openram"
+    assert spec.image == DEFAULT_OPENRAM_IMAGE
+    assert spec.container_disk_gb == 30
+
+
+def test_every_kind_has_an_image_and_a_disk():
+    """A kind added without an entry must still get the full image, not None."""
+    for kind in EDA_KINDS:
+        assert image_for_kind(kind)
+        assert disk_for_kind(kind) > 0
+    assert image_for_kind("not-a-kind") == DEFAULT_IMAGE
+    assert disk_for_kind("not-a-kind") == 60
 
 
 @pytest.mark.parametrize("kind", ["yosys", "openroad"])

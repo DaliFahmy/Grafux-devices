@@ -1,0 +1,204 @@
+# Build and publish the OPENRAM image (the VLSIDA memory compiler) to GHCR.
+#
+# WHY THIS EXISTS AS CI, beyond the reasons build-verify-image.yml gives.  The
+# thing that breaks an openram run is not a missing binary: it is a CONFIG OPTION
+# OpenRAM no longer accepts, or an entry point that moved between releases.
+# Neither is visible from "the tool imports", and both fail on a pod the user is
+# already paying for.
+#
+# So the smoke test below does not hand-write a config.  It generates one with
+# EDA/flow.py's own build_openram_config -- the exact function that runs in
+# production -- compiles it, and asserts the extension set of what comes out.
+# A copy of the config template in this file would pass while the real one
+# failed, which is the failure mode this whole job exists to prevent.  flow.py
+# imports only the standard library plus two dependency-free siblings, so it
+# runs here with no pip install.
+#
+# The output LISTING is the other product of this job.  run_openram classifies
+# what it finds by extension rather than by predicted filename, precisely because
+# OpenRAM encodes the process corner into the Liberty name and its naming has
+# moved between releases.  The listing goes into the job summary so the real
+# filenames are read off a real run rather than guessed.
+#
+# MANUAL STEP AFTER THE FIRST RUN.  GHCR container packages are created PRIVATE
+# on first push even from a public repo, and GitHub exposes no API to change
+# container package visibility.  Flip it once at
+#   https://github.com/users/DaliFahmy/packages/container/grafux-openram/settings
+#   -> Danger Zone -> Change visibility -> Public
+# RunPod pulls ANONYMOUSLY, so a private package fails the pull.  The last step
+# below probes GHCR anonymously and fails the job if it is still private, so this
+# can never be silently forgotten.
+name: Build openram image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Image tag to build. MUST match EDA/models.py DEFAULT_OPENRAM_IMAGE and
+          render.yaml EDA_OPENRAM_IMAGE, or the devices server asks RunPod for an
+          image that was never published.
+        required: true
+        default: "v1_2_2-scn4m-20260911"
+      openram_ref:
+        description: >-
+          OpenRAM git tag or commit to build from. Pin it; a branch name turns a
+          working block into a config-option error at some later date.
+        required: true
+        default: "v1.2.2"
+      with_sky130:
+        description: >-
+          Also install the sky130 PDK (gigabytes, slow). Produces a DIFFERENT
+          image; give it its own tag, e.g. sky130-20260911.
+        type: boolean
+        required: true
+        default: false
+      push_image:
+        description: "Push to GHCR (uncheck to build + smoke-test only)"
+        type: boolean
+        required: true
+        default: true
+
+env:
+  IMAGE: ghcr.io/dalifahmy/grafux-openram
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build and LOAD rather than push: the smoke test has to run against the
+      # real image before anything is published, because a tag that is already
+      # public and broken is worse than one that is missing.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: EDA/docker
+          file: EDA/docker/Dockerfile.openram
+          # RunPod CPU pods are amd64. Building anything else here would produce
+          # an image that pulls fine and then cannot start.
+          platforms: linux/amd64
+          build-args: |
+            OPENRAM_REF=${{ inputs.openram_ref }}
+            WITH_SKY130=${{ inputs.with_sky130 && '1' || '0' }}
+          tags: ${{ env.IMAGE }}:${{ inputs.tag }}
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # NOT a hand-written config.  See the header: this is the whole point of
+      # the job.  Any option OpenRAM has stopped accepting fails the image build
+      # instead of a user's rented pod.
+      - name: Generate the config the RUNNER would generate
+        run: |
+          set -euo pipefail
+          python3 - > /tmp/smoke_config.py <<'PY'
+          from EDA import flow
+          from EDA.models import OpenRamRunRequest
+          req = OpenRamRunRequest(word_size="2", num_words="16", num_banks="1",
+                                  num_rw_ports="1", num_r_ports="0",
+                                  num_w_ports="0", tech_name="scn4m_subm")
+          print(flow.build_openram_config(
+              req, tech="scn4m_subm", output_name="grafux_smoke",
+              out_dir="/tmp/openram_out"), end="")
+          PY
+          echo "--- the config under test ---"
+          cat /tmp/smoke_config.py
+
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          img="${IMAGE}:${{ inputs.tag }}"
+          mkdir -p /tmp/openram_out
+          docker run --rm \
+            -v /tmp/smoke_config.py:/tmp/smoke_config.py:ro \
+            -v /tmp/openram_out:/tmp/openram_out \
+            "$img" bash -lc '
+              set -e
+              command -v sshd python3
+              git -C /opt/openram describe --tags --always
+              echo "--- technologies this image ships ---"
+              ls -1 "$OPENRAM_TECH"
+              echo "--- compiling ---"
+              cd /tmp && $GRAFUX_OPENRAM_CMD /tmp/smoke_config.py
+            ' 2>&1 | tee /tmp/openram_smoke.log
+
+          # THE CONTRACT.  run_openram matches its outputs by EXTENSION from an
+          # on-device listing, so what it needs guaranteed is that each extension
+          # EXISTS -- not that any particular filename does.  This step is what
+          # means no port was ever wired to a guessed name.
+          listing=$(ls -S -1 /tmp/openram_out)
+          {
+            echo '### OpenRAM output listing (the authoritative filenames)'
+            echo ''
+            echo 'run_openram classifies these by extension; the Liberty name is'
+            echo 'the one that carries the process corner and moves between'
+            echo 'releases, which is why nothing in the runner spells it out.'
+            echo ''
+            echo '```'
+            echo "$listing"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "$listing"
+
+          for ext in gds lef lib v sp html py log; do
+            echo "$listing" | grep -qiE "\.${ext}\$" \
+              || { echo "::error::no .${ext} in the OpenRAM output; the port run_openram fills from it would always be empty"; exit 1; }
+          done
+
+      # The phase banners in here are what a future per-stage progress regex must
+      # be written against.  Guessing them from memory is the same mistake as
+      # guessing a filename, so the log is kept rather than described.
+      - name: Upload the compile log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openram-smoke-log
+          path: |
+            /tmp/openram_smoke.log
+            /tmp/smoke_config.py
+
+      - name: Push
+        if: ${{ inputs.push_image }}
+        run: docker push "${IMAGE}:${{ inputs.tag }}"
+
+      # RunPod pulls with no credentials, so "it pushed" is not the same as "it
+      # works". Ask GHCR for an anonymous pull token exactly the way RunPod's
+      # daemon does; DENIED means the package is still private.
+      - name: Verify the package is anonymously pullable
+        if: ${{ inputs.push_image }}
+        run: |
+          set -uo pipefail
+          img="${IMAGE}:${{ inputs.tag }}"
+          body=$(curl -sS "https://ghcr.io/token?scope=repository:dalifahmy/grafux-openram:pull&service=ghcr.io")
+          if echo "$body" | grep -q '"token"'; then
+            echo "### Published: \`$img\` (public, anonymously pullable)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Pushed \`$img\`, but the GHCR package is still PRIVATE"
+            echo ""
+            echo "RunPod pulls anonymously and will fail with \`IMAGE_AUTH_ERROR ... denied\`."
+            echo ""
+            echo "Fix it once, by hand:"
+            echo "https://github.com/users/DaliFahmy/packages/container/grafux-openram/settings"
+            echo "-> Danger Zone -> Change visibility -> Public"
+            echo ""
+            echo "GHCR said: \`$body\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::grafux-openram is not anonymously pullable; make the GHCR package public"
+          exit 1

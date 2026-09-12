@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Optional
 from . import flow, pod_client
 from .models import (
     EdaSpec,
+    OpenRamRunRequest,
     OpenRoadRunRequest,
     VerilatorRunRequest,
     YosysRunRequest,
@@ -494,6 +495,11 @@ def _run_job(eda_id: str, req, kind: str) -> None:
                 client, req, pdk=record.spec.pdk, on_stage=on_stage, on_line=on_line,
                 should_cancel=should_cancel,
             )
+        elif kind == "openram":
+            outcome = flow.run_openram(
+                client, req, on_stage=on_stage, on_line=on_line,
+                should_cancel=should_cancel,
+            )
         else:
             outcome = flow.run_orfs(
                 client, req, pdk=record.spec.pdk, on_stage=on_stage, on_line=on_line,
@@ -583,6 +589,11 @@ def start_yosys_job(eda_id: str, req: YosysRunRequest) -> Dict[str, Any]:
 def start_openroad_job(eda_id: str, req: OpenRoadRunRequest) -> Dict[str, Any]:
     """Start an OpenROAD flow run.  Returns as soon as the job starts."""
     return _start_job(eda_id, req, "openroad")
+
+
+def start_openram_job(eda_id: str, req: OpenRamRunRequest) -> Dict[str, Any]:
+    """Start an OpenRAM memory-compiler run.  Returns as soon as the job starts."""
+    return _start_job(eda_id, req, "openram")
 
 
 # ---------------------------------------------------------------------------
