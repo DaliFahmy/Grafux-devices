@@ -39,13 +39,13 @@ on:
           render.yaml EDA_OPENRAM_IMAGE, or the devices server asks RunPod for an
           image that was never published.
         required: true
-        default: "v1_2_2-scn4m-20260911"
+        default: "v1_2_48-scn4m-20260912"
       openram_ref:
         description: >-
           OpenRAM git tag or commit to build from. Pin it; a branch name turns a
           working block into a config-option error at some later date.
         required: true
-        default: "v1.2.2"
+        default: "v1.2.48"
       with_sky130:
         description: >-
           Also install the sky130 PDK (gigabytes, slow). Produces a DIFFERENT

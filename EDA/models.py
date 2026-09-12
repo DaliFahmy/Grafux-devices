@@ -109,7 +109,7 @@ DEFAULT_VERIFY_IMAGE = os.environ.get(
 # PIN THE TAG, for the same reason DEFAULT_VERIFY_IMAGE is pinned.
 DEFAULT_OPENRAM_IMAGE = os.environ.get(
     "EDA_OPENRAM_IMAGE",
-    "ghcr.io/dalifahmy/grafux-openram:v1_2_2-scn4m-20260911",
+    "ghcr.io/dalifahmy/grafux-openram:v1_2_48-scn4m-20260912",
 )
 
 # The technology a run compiles for when the block's `tech_name` port is empty.

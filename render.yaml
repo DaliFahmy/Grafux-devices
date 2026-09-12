@@ -110,7 +110,7 @@ services:
       # default in EDA/models.py — render.yaml is only authoritative if the
       # service is Blueprint-synced, so a stale value here is invisible.
       - key: EDA_OPENRAM_IMAGE
-        value: "ghcr.io/dalifahmy/grafux-openram:v1_2_2-scn4m-20260911"
+        value: "ghcr.io/dalifahmy/grafux-openram:v1_2_48-scn4m-20260912"
       # Technology an openram block compiles for when its tech_name port is
       # empty. scn4m_subm ships inside the OpenRAM repository and needs no
       # external PDK, so a freshly dropped block Runs. sky130 needs an image

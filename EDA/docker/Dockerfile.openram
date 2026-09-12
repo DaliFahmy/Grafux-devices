@@ -25,9 +25,9 @@
 # start.sh is shared verbatim with the other two.
 #
 # Build and push (PIN THE TAG; see EDA/models.py DEFAULT_OPENRAM_IMAGE):
-#   docker build -t ghcr.io/dalifahmy/grafux-openram:v1_2_2-scn4m-20260911 \
+#   docker build -t ghcr.io/dalifahmy/grafux-openram:v1_2_48-scn4m-20260912 \
 #       -f EDA/docker/Dockerfile.openram EDA/docker
-#   docker push  ghcr.io/dalifahmy/grafux-openram:v1_2_2-scn4m-20260911
+#   docker push  ghcr.io/dalifahmy/grafux-openram:v1_2_48-scn4m-20260912
 #
 # The pushed GHCR package must be PUBLIC: RunPod pulls anonymously, and a private
 # package fails the pull with the same misleading error as a missing sshd.
@@ -66,7 +66,7 @@ RUN apt-get update \
 # point and renamed config options across releases, so an unpinned checkout turns
 # a working block into a config-option error on a pod the user is already paying
 # for.  The same lesson DEFAULT_IMAGE and the gpu block's CUDA pin both record.
-ARG OPENRAM_REF=v1.2.2
+ARG OPENRAM_REF=v1.2.48
 RUN git clone --depth 1 --branch "${OPENRAM_REF}" \
         https://github.com/VLSIDA/OpenRAM.git /opt/openram
 
