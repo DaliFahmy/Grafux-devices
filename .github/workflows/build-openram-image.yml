@@ -10,9 +10,10 @@
 # EDA/flow.py's own build_openram_config -- the exact function that runs in
 # production -- compiles it, and asserts the extension set of what comes out.
 # A copy of the config template in this file would pass while the real one
-# failed, which is the failure mode this whole job exists to prevent.  flow.py
-# imports only the standard library plus two dependency-free siblings, so it
-# runs here with no pip install.
+# failed, which is the failure mode this whole job exists to prevent.  Importing
+# it needs pydantic (EDA/flow.py imports EDA/models.py, which defines the request
+# models), and nothing else -- so the step below installs exactly that one
+# package rather than the server's whole requirements.txt.
 #
 # The output LISTING is the other product of this job.  run_openram classifies
 # what it finds by extension rather than by predicted filename, precisely because
@@ -106,6 +107,9 @@ jobs:
       - name: Generate the config the RUNNER would generate
         run: |
           set -euo pipefail
+          # EDA/flow.py -> EDA/models.py -> pydantic. Only the request models
+          # need it; the config writer itself is pure.
+          python3 -m pip install --quiet --disable-pip-version-check pydantic
           python3 - > /tmp/smoke_config.py <<'PY'
           from EDA import flow
           from EDA.models import OpenRamRunRequest
