@@ -1,0 +1,30 @@
+Warning: m=xx on .subckt line will override multiplier m hierarchy!
+
+
+Note: Compatibility modes selected: hs a
+
+
+Circuit: gf180 inverter dc
+
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using KLU as Direct Linear Solver
+
+No. of Data Rows : 1
+
+  Measurements for DC Analysis
+
+
+ASCII raw file "sim.raw"
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using KLU as Direct Linear Solver
+
+No. of Data Rows : 331
+
+  Measurements for DC Analysis
+
+vm                  =   1.53199e+00
+
+ASCII raw file "sim.raw"
+ngspice-47 done

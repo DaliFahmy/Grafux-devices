@@ -1,0 +1,19 @@
+Note: v1: has no value, DC 0 assumed
+
+Note: Compatibility modes selected: hs a
+
+
+Circuit: rc ac
+
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using KLU as Direct Linear Solver
+
+No. of Data Rows : 61
+
+  Measurements for AC Analysis
+
+f3db                =   1.58780e+02
+
+ASCII raw file "sim.raw"
+ngspice-47 done

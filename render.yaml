@@ -140,6 +140,17 @@ services:
       # Escape hatch for the compiler invocation, like EDA_OPENRAM_CMD.
       - key: EDA_OPENGCRAM_CMD
         value: ""
+      # The NGSPICE image, used for the analogue_simulator kind only: ngspice
+      # built from source plus the sky130A and gf180mcuD SPICE models (see
+      # EDA/docker/Dockerfile.ngspice). The tag names the ngspice release and the
+      # open_pdks commit, because a changed model is a changed answer. PIN THE
+      # TAG, PUBLIC package, and this dashboard value silently overrides
+      # EDA/models.py.
+      - key: EDA_NGSPICE_IMAGE
+        value: "ghcr.io/dalifahmy/grafux-ngspice:ng47-pdk1689ac3-20260913"
+      # Escape hatch for the simulator invocation, like EDA_OPENRAM_CMD.
+      - key: EDA_NGSPICE_CMD
+        value: ""
       # Default process design kit / OpenROAD platform. sky130hd is the standard
       # open-source target and what every public ORFS example uses.
       - key: EDA_DEFAULT_PDK

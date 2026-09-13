@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from . import flow, pod_client
 from .models import (
+    AnalogueSimRunRequest,
     EdaSpec,
     OpenGcRamRunRequest,
     OpenRamRunRequest,
@@ -506,6 +507,11 @@ def _run_job(eda_id: str, req, kind: str) -> None:
                 client, req, on_stage=on_stage, on_line=on_line,
                 should_cancel=should_cancel,
             )
+        elif kind == "analogue_simulator":
+            outcome = flow.run_analogue_simulator(
+                client, req, on_stage=on_stage, on_line=on_line,
+                should_cancel=should_cancel,
+            )
         else:
             outcome = flow.run_orfs(
                 client, req, pdk=record.spec.pdk, on_stage=on_stage, on_line=on_line,
@@ -732,3 +738,8 @@ def cancel_eda(eda_id: str) -> bool:
 def terminate_eda(eda_id: str) -> bool:
     """Terminate a pod (stopping billing) and remove it.  Returns False if unknown."""
     return cancel_eda(eda_id)
+
+
+def start_analogue_simulator_job(eda_id: str, req: AnalogueSimRunRequest) -> Dict[str, Any]:
+    """Start an ngspice simulation.  Returns as soon as the job starts."""
+    return _start_job(eda_id, req, "analogue_simulator")

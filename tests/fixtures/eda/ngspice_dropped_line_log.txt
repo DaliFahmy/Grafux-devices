@@ -1,0 +1,25 @@
+
+Warning: 'r1 in' is not a valid resistor instance line, ignored!
+
+
+Note: Compatibility modes selected: hs a
+
+
+Circuit: syntax
+
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using KLU as Direct Linear Solver
+
+Initial Transient Solution
+--------------------------
+
+Node                                   Voltage
+----                                   -------
+in                                           1
+v1#branch                                    0
+
+
+No. of Data Rows : 1008
+ASCII raw file "sim.raw"
+ngspice-47 done

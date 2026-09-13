@@ -1,0 +1,122 @@
+# The Grafux NGSPICE image: the analogue circuit simulator plus the open PDKs'
+# device models, reachable over SSH.  Serves the "analogue_simulator" block.
+#
+# WHY A SIXTH IMAGE.  ngspice shares nothing with the other toolchains: it is a
+# single C program that needs no OpenROAD, no Verilator and no OpenRAM, and the
+# images that carry those are gigabytes.  A transistor-level simulation that
+# takes seconds should not pay for pulling a place-and-route stack.
+#
+# WHY ngspice IS BUILT FROM SOURCE.  Ubuntu 22.04's apt ngspice is version 36,
+# which predates the `ngbehavior=hsa` compatibility mode the sky130 models are
+# written for -- a sky130 deck on it dies parsing the model library.  The release
+# is pinned by version AND checksum.
+#
+# WHAT THE PDKs CARRY.  SPICE models only: `libs.tech/ngspice` (the corner
+# libraries a deck `.lib`s) and, for sky130, `libs.ref/sky130_fd_pr/spice` (the
+# device files those corners `.include` by relative path -- without it every
+# corner fails to load).  No layout, no standard cells, no klayout/magic data:
+# the full releases are gigabytes, the model subset is ~55 MB.  Both come from
+# the same open_pdks commit, fetched from fossi-foundation/ciel-releases.
+#
+# Same sshd contract as every other EDA image: RunPod injects PUBLIC_KEY but adds
+# no sshd, and a pod with nothing on port 22 fails provisioning with a misleading
+# "does not provide direct public-IP networking" error.  start.sh is shared.
+#
+# Build and push (PIN THE TAG; see EDA/models.py DEFAULT_NGSPICE_IMAGE):
+#   docker build -t ghcr.io/dalifahmy/grafux-ngspice:ng47-pdk1689ac3-20260913 \
+#       -f EDA/docker/Dockerfile.ngspice EDA/docker
+# ...or, better, .github/workflows/build-ngspice-image.yml, whose smoke test runs
+# real sky130 and gf180 simulations.  The GHCR package must be PUBLIC.
+#
+# Local development (no RunPod account, no spend) -- what EDA_LOCAL_SSH=1 talks to:
+#   ssh-keygen -t rsa -b 2048 -f /tmp/eda_key -N ''
+#   docker run -d --name grafux-ngspice -p 2222:22 \
+#       -e PUBLIC_KEY="$(cat /tmp/eda_key.pub)" <img>
+#   EDA_LOCAL_SSH=1 EDA_LOCAL_KEY=/tmp/eda_key uvicorn device.app:app
+
+# ---------------------------------------------------------------------------
+# Stage 1: build ngspice and fetch the model subsets.
+# ---------------------------------------------------------------------------
+FROM ubuntu:22.04 AS build
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential bison flex libfftw3-dev ca-certificates curl zstd \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG NGSPICE_VERSION=47
+# sha256 of ngspice-47.tar.gz as downloaded 2026-09-13.  Building another version
+# needs its own value; pass NGSPICE_SHA256= (empty) to skip the check deliberately.
+ARG NGSPICE_SHA256=894e649651f1838a14095e5a5439e7d3aa63e87ede14d283173fda4fcdef675f
+RUN curl -fsSL -o /tmp/ngspice.tar.gz \
+        "https://downloads.sourceforge.net/project/ngspice/ng-spice-rework/${NGSPICE_VERSION}/ngspice-${NGSPICE_VERSION}.tar.gz" \
+ && if [ -n "${NGSPICE_SHA256}" ]; then echo "${NGSPICE_SHA256}  /tmp/ngspice.tar.gz" | sha256sum -c -; fi \
+ && mkdir -p /tmp/ngspice && tar -xzf /tmp/ngspice.tar.gz -C /tmp/ngspice --strip-components=1 \
+ && cd /tmp/ngspice \
+ # --with-readline=no / --with-x=no: the block only ever runs `ngspice -b`, and
+ # both would add runtime libraries the image then has to carry.  OpenMP is what
+ # makes `num_threads` in .spiceinit do anything for BSIM4 model evaluation.
+ && ./configure --prefix=/usr/local --with-x=no --with-readline=no \
+        --enable-openmp --enable-cider --enable-xspice --disable-debug \
+ && make -j"$(nproc)" \
+ && make install
+
+# PIN THIS.  One open_pdks commit for both PDKs, so a sky130 run and a gf180 run
+# from the same image were modelled from the same upstream state.
+ARG PDK_HASH=1689ac3f2dc763876eaf967227c7dfe831b031ae
+RUN mkdir -p /opt/pdks && cd /tmp \
+ && base="https://github.com/fossi-foundation/ciel-releases/releases/download" \
+ && curl -fsSL -o sky_common.tar.zst "${base}/sky130-${PDK_HASH}/common.tar.zst" \
+ && curl -fsSL -o sky_pr.tar.zst     "${base}/sky130-${PDK_HASH}/sky130_fd_pr.tar.zst" \
+ && curl -fsSL -o gf_common.tar.zst  "${base}/gf180mcu-${PDK_HASH}/common.tar.zst" \
+ && curl -fsSL -o gf_pr.tar.zst      "${base}/gf180mcu-${PDK_HASH}/gf180mcu_fd_pr.tar.zst" \
+ && tar --zstd -xf sky_common.tar.zst -C /opt/pdks sky130A/libs.tech/ngspice \
+ && tar --zstd -xf sky_pr.tar.zst     -C /opt/pdks sky130A/libs.ref/sky130_fd_pr/spice \
+ && tar --zstd -xf gf_common.tar.zst  -C /opt/pdks gf180mcuD/libs.tech/ngspice \
+ && tar --zstd -xf gf_pr.tar.zst      -C /opt/pdks gf180mcuD/libs.ref/gf180mcu_fd_pr \
+ && echo "${PDK_HASH}" > /opt/pdks/OPEN_PDKS_COMMIT \
+ && rm -f /tmp/*.tar.zst \
+ && test -f /opt/pdks/sky130A/libs.tech/ngspice/sky130.lib.spice \
+ && test -f /opt/pdks/gf180mcuD/libs.tech/ngspice/sm141064.ngspice \
+ && test -f /opt/pdks/gf180mcuD/libs.tech/ngspice/design.ngspice
+
+# ---------------------------------------------------------------------------
+# Stage 2: the runtime.  No compiler, no curl.
+# ---------------------------------------------------------------------------
+FROM ubuntu:22.04
+
+# python3 is not for ngspice: run_analogue_simulator uploads EDA/ngspice.py and
+# runs it ON THE POD to turn the rawfile into waveforms, so a million-point
+# transient is decimated where it lives instead of crossing SSH.  It is
+# stdlib-only on purpose -- no venv, no pip.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        openssh-server ca-certificates python3 libgomp1 libfftw3-double3 \
+ && mkdir -p /var/run/sshd /root/.ssh \
+ && chmod 700 /root/.ssh \
+ && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+ && sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local /usr/local
+COPY --from=build /opt/pdks /opt/pdks
+
+# Where a real run finds everything: an SSH exec does not inherit Docker ENV, but
+# EDA/flow.py runs everything under `bash -lc`, which sources profile.d.
+# _NGSPICE_ENV supplies the same values with `:-` defaults; the ENV below serves
+# `docker run ... bash -lc` smoke tests.  Keep all three in step.
+RUN printf '%s\n' \
+      'export PDK_ROOT=/opt/pdks' \
+      'export GRAFUX_NGSPICE_CMD=/usr/local/bin/ngspice' \
+      > /etc/profile.d/ngspice.sh \
+ && chmod 0644 /etc/profile.d/ngspice.sh \
+ && /usr/local/bin/ngspice -v
+
+ENV PDK_ROOT=/opt/pdks \
+    GRAFUX_NGSPICE_CMD=/usr/local/bin/ngspice
+
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+EXPOSE 22
+CMD ["/start.sh"]

@@ -1,0 +1,16 @@
+Warning: m=xx on .subckt line will override multiplier m hierarchy!
+
+Error: unknown subckt: xm1 vdd vdd 0 0 sky130_fd_pr__nfet_99v9 w=1 l=0.15
+    in line no. 5 from file deck.sp
+    Simulation interrupted due to error!
+
+Error: incomplete or empty netlist
+       or no ".plot", ".print", or ".fourier" lines in batch mode;
+no simulations run!
+
+Note: Compatibility modes selected: hs a
+
+
+Circuit: bad
+
+option SCALE: Scale is set to 1e-06 for instance and model parameters

@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from EDA.models import (  # noqa: E402
     DEFAULT_IMAGE,
+    DEFAULT_NGSPICE_IMAGE,
     DEFAULT_OPENGCRAM_IMAGE,
     DEFAULT_OPENRAM_IMAGE,
     DEFAULT_VERIFY_IMAGE,
@@ -90,6 +91,8 @@ def test_run_body_fields_are_parsed_not_ignored(client, kind):
                     "tech_name": "scn4m_subm", "num_banks": "1"},
         "opengcram": {"word_size": "8", "num_words": "32", "gc_type": "OS",
                       "vddio": "1.2", "tech_archive": "C:/tech/tsmcN40.tar.gz"},
+        "analogue_simulator": {"netlist": "RC\nR1 a 0 1k\n.op\n", "pdk": "sky130A",
+                               "corner": "tt", "meas_statements": "", "max_points": "500"},
     }
     # Parametrized over EDA_KINDS, so a kind added without a representative body
     # fails HERE -- loudly and offline -- rather than by shipping another kind's
@@ -150,6 +153,20 @@ def test_an_opengcram_block_gets_the_gain_cell_compiler_image():
     assert spec.image == DEFAULT_OPENGCRAM_IMAGE
     assert spec.image != DEFAULT_OPENRAM_IMAGE
     assert spec.container_disk_gb == 30
+
+
+def test_an_analogue_simulator_block_gets_the_ngspice_image():
+    """ngspice needs none of the other toolchains; it must not pull the ORFS image."""
+    spec = _coerce_kind(EdaSpec(), "analogue_simulator")
+    assert spec.kind == "analogue_simulator"
+    assert spec.image == DEFAULT_NGSPICE_IMAGE
+    assert spec.container_disk_gb == 20
+
+
+def test_analogue_simulator_pdks_lists_the_model_sets(client):
+    body = client.get("/analogue_simulator/pdks").json()
+    assert body["default"] == "sky130A"
+    assert body["pdks"] == ["sky130A", "gf180mcuD", "none"]
 
 
 def test_opengcram_pdks_lists_gain_cell_technology_names(client):

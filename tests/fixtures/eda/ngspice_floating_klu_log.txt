@@ -1,0 +1,56 @@
+Warning: singular matrix:  check node x
+
+Note: Starting dynamic gmin stepping
+Warning: Dynamic gmin stepping failed
+Note: Starting true gmin stepping
+Warning: singular matrix:  check node x
+
+Warning: singular matrix:  check node x
+
+Warning: singular matrix:  check node x
+
+Warning: singular matrix:  check node x
+
+Warning: singular matrix:  check node x
+
+Warning: True gmin stepping failed
+Note: Starting source stepping
+Warning: source stepping failed
+Note: Transient op started
+Error: Transient op failed, timestep too small
+
+
+Error: The operating point could not be simulated successfully.
+    Any of the following steps may fail.!
+
+
+Error: Finding the operating point for transient simulation failed 
+
+doAnalyses: TRAN:  Timestep too small; initial timepoint: cause unrecorded.
+
+
+tran simulation(s) aborted
+Warning from checkvalid: vector in is not available or has zero length.
+Error during 'write': no writable vector found.
+
+Note: Compatibility modes selected: hs a
+
+
+Circuit: float
+
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using KLU as Direct Linear Solver
+
+Last Node Voltages
+------------------
+
+Node                                   Last Voltage        Previous Iter
+----                                   ------------        -------------
+in                                                0                    0
+x                                              -nan                 -nan
+v1#branch                                      -nan                 -nan
+
+
+No. of Data Rows : 0
+ngspice-47 done

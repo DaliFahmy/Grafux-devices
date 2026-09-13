@@ -1,0 +1,42 @@
+
+Note: Compatibility modes selected: hs a
+
+
+Circuit: rc low pass
+
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using KLU as Direct Linear Solver
+
+Initial Transient Solution
+--------------------------
+
+Node                                   Voltage
+----                                   -------
+in                                           0
+out                                          0
+v1#branch                                    0
+
+
+No. of Data Rows : 89
+
+  Measurements for Transient Analysis
+
+
+Error: measure  never  when(WHEN) : out of interval
+ .meas tran never when v(out)=5 failed!
+
+trise               =  2.19562e-03 targ=  2.30155e-03 trig=  1.05930e-04
+
+ASCII raw file "sim.raw"
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using KLU as Direct Linear Solver
+
+No. of Data Rows : 1
+
+  Measurements for Transient Analysis
+
+
+ASCII raw file "sim.raw"
+ngspice-47 done

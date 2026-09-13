@@ -1,19 +1,19 @@
 """
 EDA — the chip-design (electronic design automation) runtime.
 
-One package, five block types.  ``verilator``, ``yosys``, ``openroad``,
-``openram`` and ``opengcram`` are separate Grafux block types but they share everything that is
+One package, six block types.  ``verilator``, ``yosys``, ``openroad``,
+``openram``, ``opengcram`` and ``analogue_simulator`` are separate Grafux block types but they share everything that is
 expensive to build: RunPod provisioning, the SSH transport, artifact download,
 the registry and the idle reaper.  So they live together here and are exposed as
-five REST prefixes (``/verilator``, ``/yosys``, ``/openroad``, ``/openram``,
-``/opengcram``) —
+six REST prefixes (``/verilator``, ``/yosys``, ``/openroad``, ``/openram``,
+``/opengcram``, ``/analogue_simulator``) —
 the Qt client and the orchestrator address block types by URL prefix, and the
 tools' outputs genuinely differ.
 
 They no longer share one container image.  ``image_for_kind`` in models.py picks
 between the full ORFS image, the light verification image, the OpenRAM one and
-the OpenGCRAM one,
-because the pull dominates the wall clock of a run that itself takes seconds.
+the OpenGCRAM one
+and the ngspice one, because the pull dominates the wall clock of a run that itself takes seconds.
 
 The canvas flow these blocks are built for::
 
@@ -28,6 +28,10 @@ The canvas flow these blocks are built for::
     opengcram -> the same, for a GAIN-CELL memory (OpenGCRAM, an OpenRAM fork).
        Needs a technology that carries a gain cell on its tech_archive port,
        because no public one does.
+
+    analogue_simulator -> ngspice on a transistor-level netlist (sky130A /
+       gf180mcuD models in the image). Its `spice` sibling is openram.spice;
+       its `waveforms` port plots straight into a plotter block.
 
 Lifecycle (identical for every kind; ``{kind}`` is the tool name)::
 

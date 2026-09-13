@@ -31,6 +31,7 @@ import shlex
 import xml.etree.ElementTree as ET
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from . import ngspice
 from .models import DEFAULT_OPENGCRAM_TECH, DEFAULT_OPENRAM_TECH, ORFS_STAGES
 from .pod_client import WORK_DIR, _EDA_ENV, exec_simple, exec_stream
 
@@ -2941,6 +2942,12 @@ def globs_for(kind: str, *, work_dir: str = WORK_DIR, platform: str = "",
                 f"{out}/*.v", f"{out}/*.sp", f"{out}/*.spice",
                 f"{out}/*.html", f"{out}/*.log", f"{out}/*.py",
                 f"{out}/*.lvs", f"{out}/*.json"]
+    if kind == "analogue_simulator":
+        # The deck as run, ngspice's own log, and the full rawfile -- the
+        # waveforms port is decimated, this is not.  Named files rather than
+        # *.raw globs so a model file staged through `files` is not echoed back.
+        return [f"{work_dir}/{ngspice.DECK_FILE}", f"{work_dir}/{ngspice.LOG_FILE}",
+                f"{work_dir}/{ngspice.RAW_FILE}"]
     results = f"$FLOW_HOME/results/{platform}/{design}/base"
     reports = f"$FLOW_HOME/reports/{platform}/{design}/base"
     return [
@@ -3858,6 +3865,228 @@ def run_opengcram(
         fail=_fail, on_stage=on_stage, on_line=on_line, should_cancel=should_cancel,
         extra_stats=None if override else extra_stats,
     )
+
+
+# ngspice's environment.  The defaults match Dockerfile.ngspice; the image's own
+# profile.d values win, so a user pinning another build through the `image` port
+# gets that build's paths.  OMP_NUM_THREADS feeds the OpenMP model evaluation
+# the image is built with.
+_NGSPICE_ENV = (
+    'export PDK_ROOT="${PDK_ROOT:-' + ngspice.DEFAULT_PDK_ROOT + '}"; '
+    'export GRAFUX_NGSPICE_CMD="${GRAFUX_NGSPICE_CMD:-ngspice}"; '
+    'export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc)}"; '
+)
+
+# Unquoted for the reason _OPENRAM_CMD_DEFAULT is.  ``EDA_NGSPICE_CMD`` on the
+# devices server overrides it outright.
+_NGSPICE_CMD_DEFAULT = "$GRAFUX_NGSPICE_CMD"
+
+# How much of ngspice's log is read back.  The log's tail is where the verdict,
+# the measurements and the errors are; a runaway `print` in a user's .control
+# block must not become a megabyte port.
+NGSPICE_LOG_TAIL_BYTES = 256 * 1024
+
+
+def _sh_ngspice(command: str) -> str:
+    """``_sh`` plus ngspice's PDK root, entry point and thread count."""
+    return _sh(_NGSPICE_ENV + command)
+
+
+def _ngspice_probe(text: str) -> Tuple[str, int, str]:
+    """``(pdk_root, nproc, version)`` from the deck stage's one-shot probe."""
+    root, nproc = "", 0
+    for line in (text or "").splitlines():
+        if line.startswith("ROOT:"):
+            root = line[5:].strip()
+        elif line.startswith("NPROC:"):
+            try:
+                nproc = int(line[6:].strip())
+            except ValueError:
+                nproc = 0
+    return root or ngspice.DEFAULT_PDK_ROOT, nproc, ngspice.parse_version(text)
+
+
+def _analyses_summary(plots: Sequence[Dict[str, Any]], requested: Sequence[str]) -> str:
+    """The `analyses` output port: what actually ran, with its point counts."""
+    if not plots:
+        return "\n".join("{0} -- no results".format(a) for a in requested)
+    lines = []
+    for plot in plots:
+        vectors = plot.get("vectors") or []
+        lines.append("{0}: {1} point{2}, {3} vector{4}".format(
+            plot.get("name", "?"), plot.get("points", 0),
+            "" if plot.get("points", 0) == 1 else "s",
+            len(vectors), "" if len(vectors) == 1 else "s"))
+    return "\n".join(lines)
+
+
+def run_analogue_simulator(
+    client,
+    req,
+    *,
+    on_stage: Callable[[str, str], None],
+    on_line: Optional[Callable[[str], None]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+) -> Dict[str, Any]:
+    """
+    Simulate a SPICE deck with ngspice and turn its log and rawfile into ports.
+
+    Three stages -- ``deck`` (preflight, resolve the PDK on the pod, write the
+    deck), ``simulate`` and ``collect``.  The verdict is NOT ngspice's exit code:
+    it exits 0 after dropping a malformed element line and 1 only for some load
+    failures, so ``status`` needs a clean log AND results (see
+    ngspice.classify_ngspice_log for which log lines are fatal and why).
+    """
+    pdk, _ = ngspice.normalize_pdk(getattr(req, "pdk", ""))
+    corner, _ = ngspice.normalize_corner(pdk, getattr(req, "corner", ""))
+    work = WORK_DIR
+
+    def _fail(stage: str, message: str, *, log_text: str = "", deck: str = "",
+              notes: Optional[List[str]] = None) -> Dict[str, Any]:
+        outputs = {
+            "status": "error", "errors": message,
+            "warnings": "\n".join(n for n in (notes or []) if n),
+            "log": log_text, "netlist": deck, "measurements": "{}",
+            "waveforms": "", "operating_point": "{}", "analyses": "",
+            "stats": json.dumps({"simulator": "ngspice", "pdk": pdk, "corner": corner}),
+            "raw": "",
+        }
+        return {"outputs": outputs, "_status": "error", "_stage": stage,
+                "_globs": globs_for("analogue_simulator")}
+
+    # ---- stage 1: deck -----------------------------------------------------
+    on_stage("deck", "running")
+    refusal = ngspice.analogue_preflight(req)
+    if refusal:
+        on_stage("deck", "failed")
+        return _fail("deck", refusal)
+
+    _code, probe, _err = exec_simple(client, _sh_ngspice(
+        'printf "ROOT:%s\\nNPROC:%s\\n" "$PDK_ROOT" "$(nproc)"; '
+        '$GRAFUX_NGSPICE_CMD -v 2>&1 | head -5'), timeout=60)
+    pdk_root, nproc, version = _ngspice_probe(probe)
+
+    netlist = getattr(req, "netlist", "") or ""
+    if pdk in ngspice.NGSPICE_PDKS and not ngspice.references_pdk_library(netlist, pdk):
+        paths = ngspice.pdk_library_paths(pdk, pdk_root)
+        _code, missing, _err = exec_simple(client, _sh(
+            "for f in {0}; do test -f \"$f\" || echo \"MISSING:$f\"; done".format(
+                " ".join(shlex.quote(p) for p in paths))), timeout=60)
+        gone = [ln[8:] for ln in (missing or "").splitlines() if ln.startswith("MISSING:")]
+        if gone:
+            on_stage("deck", "failed")
+            return _fail("deck", (
+                "This image does not carry the {0} device models (missing: {1}). Leave "
+                "the image port empty to use the default analogue_simulator image, or "
+                "set pdk to none for a deck that loads its own models.").format(
+                    pdk, ", ".join(gone)))
+
+    deck, analyses_run, notes = ngspice.build_ngspice_deck(req, pdk_root=pdk_root)
+    script_path = ngspice.__file__
+    with open(script_path, "r", encoding="utf-8") as fh:
+        script_text = fh.read()
+    sftp = client.open_sftp()
+    try:
+        _write_file(sftp, "{0}/{1}".format(work, ngspice.DECK_FILE), deck)
+        _write_file(sftp, "{0}/{1}".format(work, ngspice.SPICEINIT_FILE),
+                    ngspice.spiceinit_for(pdk, threads=nproc))
+        _write_file(sftp, "{0}/{1}".format(work, ngspice.SCRIPT_FILE), script_text)
+    finally:
+        sftp.close()
+    on_stage("deck", "done")
+
+    # ---- stage 2: simulate -------------------------------------------------
+    on_stage("simulate", "running")
+    command = (os.environ.get("EDA_NGSPICE_CMD", "") or "").strip() or _NGSPICE_CMD_DEFAULT
+    # `tee` WITH pipefail.  The live log tail needs ngspice's output as it
+    # happens, and the measurements need all of it (exec_stream keeps only a
+    # tail), so the output goes both ways.  pipefail is what makes the pipeline
+    # report ngspice's exit status rather than tee's -- the trap run_yosys
+    # documents.  The rawfile is deleted first because the deck appends to it.
+    code, _out, err = exec_stream(
+        client,
+        _sh_ngspice("cd {0} && rm -f {1} {2} && set -o pipefail && {3} -b {4} 2>&1 | tee {2}".format(
+            shlex.quote(work), ngspice.RAW_FILE, ngspice.LOG_FILE, command, ngspice.DECK_FILE)),
+        timeout=int(getattr(req, "timeout", 0) or 900),
+        on_line=on_line, should_cancel=should_cancel,
+    )
+    if code in (-1, -2):
+        on_stage("simulate", "failed")
+        return _fail("simulate", "The simulation was cancelled." if code == -1 else (
+            "The simulation exceeded its {0}s timeout. Shorten the analysis (a smaller "
+            "stop time or a coarser step), or raise the timeout port.").format(
+                int(getattr(req, "timeout", 0) or 900)),
+            log_text=(_out or "").strip(), deck=deck, notes=notes)
+    on_stage("simulate", "done" if code == 0 else "failed")
+
+    # ---- stage 3: collect --------------------------------------------------
+    on_stage("collect", "running")
+    _c, log_text, _e = exec_simple(client, _sh("tail -c {0} {1}/{2} 2>/dev/null".format(
+        NGSPICE_LOG_TAIL_BYTES, shlex.quote(work), ngspice.LOG_FILE)), timeout=60)
+    log_text = (log_text or _out or err or "").strip()
+
+    max_points = ngspice._int_or(getattr(req, "max_points", ""), ngspice.DEFAULT_MAX_POINTS)
+    probes = ngspice.split_probes(getattr(req, "probes", ""))
+    _c, post_out, post_err = exec_simple(client, _sh_ngspice(
+        "cd {0} && python3 {1} postprocess {2} {3} {4}".format(
+            shlex.quote(work), ngspice.SCRIPT_FILE, ngspice.RAW_FILE, max_points,
+            shlex.quote(json.dumps(probes)))), timeout=600)
+    try:
+        post = json.loads(post_out or "{}")
+    except ValueError:
+        post = {}
+        notes.append("Could not read the simulation results back: {0}".format(
+            (post_err or post_out or "no output").strip()[:500]))
+
+    measurements, meas_notes = ngspice.parse_measurements(
+        log_text, ngspice.measure_names(deck))
+    errors, ng_warnings, hints = ngspice.classify_ngspice_log(log_text, code)
+    plots = post.get("plots") or []
+    produced = any((p.get("points") or 0) > 0 for p in plots)
+    own_control = ngspice.has_control_block(netlist)
+    if not errors and not produced and not own_control:
+        errors.append("ngspice finished without writing any results. The log is the whole "
+                      "story; the commonest cause is a deck that failed to load.")
+    if own_control and not produced:
+        notes.append("The deck's own .control block wrote no sim.raw, so the waveforms "
+                     "and operating_point ports are empty.")
+
+    raw_bytes = int(post.get("raw_bytes") or 0)
+    if raw_bytes > 32 * 1024 * 1024:
+        notes.append("The rawfile is {0:.0f} MB; artifacts past the download cap arrive "
+                     "truncated. The waveforms port is unaffected.".format(raw_bytes / 1e6))
+
+    status = "error" if errors else "ok"
+    error_text = "\n".join(errors)
+    if hints:
+        error_text += "\n\nLikely cause:\n" + "\n".join("- " + h for h in hints)
+
+    stats = {
+        "simulator": "ngspice", "version": version, "pdk": pdk, "corner": corner,
+        "temperature": (getattr(req, "temperature", "") or "").strip() or "27",
+        "analyses": analyses_run, "plots": plots,
+        "waveform_plot": post.get("waveform_plot", ""),
+        "measurements": len(measurements),
+        "measurements_failed": sum(1 for v in measurements.values() if v is None),
+        "raw_bytes": raw_bytes, "exit_code": code,
+    }
+    outputs: Dict[str, str] = {
+        "status": status,
+        "netlist": deck,
+        "measurements": json.dumps(measurements),
+        "waveforms": post.get("waveforms", "") or "",
+        "operating_point": json.dumps(post.get("operating_point") or {}),
+        "analyses": _analyses_summary(plots, analyses_run),
+        "stats": json.dumps(stats),
+        "errors": error_text,
+        "warnings": "\n".join(n for n in (notes + meas_notes + list(post.get("notes") or [])
+                                         + ng_warnings) if n),
+        "log": log_text,
+        "raw": ngspice.RAW_FILE if produced else "",
+    }
+    on_stage("collect", "done")
+    return {"outputs": outputs, "_status": status, "_stage": "collect",
+            "_globs": globs_for("analogue_simulator")}
 
 
 def run_yosys(

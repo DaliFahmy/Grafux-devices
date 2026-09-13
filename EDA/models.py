@@ -82,7 +82,7 @@ DEFAULT_INSTANCE = os.environ.get("EDA_DEFAULT_INSTANCE", "cpu3c-8")
 ORFS_STAGES = ("synth", "floorplan", "place", "cts", "route", "final")
 
 # The kinds this package serves, one per Grafux block type.
-EDA_KINDS = ("verilator", "yosys", "openroad", "openram", "opengcram")
+EDA_KINDS = ("verilator", "yosys", "openroad", "openram", "opengcram", "analogue_simulator")
 
 # The light verification image: Verilator + cocotb + iverilog, no PDK and no
 # OpenROAD.  It exists because pod placement and image pull dominate a simulation
@@ -144,6 +144,25 @@ DEFAULT_OPENGCRAM_IMAGE = os.environ.get(
 # nor the uploaded archive names one.
 DEFAULT_OPENGCRAM_TECH = os.environ.get("EDA_OPENGCRAM_TECH", "tsmcN40")
 
+# The ANALOGUE simulator image: ngspice built from source plus the SPICE model
+# subsets of sky130A and gf180mcuD, built from EDA/docker/Dockerfile.ngspice.
+#
+# WHY A SIXTH IMAGE.  ngspice needs none of the other toolchains, and a
+# transistor-level simulation that takes seconds should not pull gigabytes of
+# OpenROAD to run.  The tag names the ngspice release and the open_pdks commit the
+# models came from, because a changed model is a changed answer.
+#
+# PIN THE TAG, for the same reason DEFAULT_VERIFY_IMAGE is pinned.
+DEFAULT_NGSPICE_IMAGE = os.environ.get(
+    "EDA_NGSPICE_IMAGE",
+    "ghcr.io/dalifahmy/grafux-ngspice:ng47-pdk1689ac3-20260913",
+)
+
+# The PDK names an analogue_simulator block can target: the model sets the image
+# carries, plus "none" for a deck that brings its own models through `files`.
+NGSPICE_PDK_CHOICES = ["sky130A", "gf180mcuD", "none"]
+DEFAULT_NGSPICE_PDK = "sky130A"
+
 # The image each kind gets when the block left its `image` port empty.  A dict
 # rather than a chain of conditionals because every entry is the same kind of
 # statement, and a missing kind must fall back to the full EDA image rather than
@@ -152,6 +171,7 @@ _KIND_IMAGES = {
     "verilator": lambda: DEFAULT_VERIFY_IMAGE,
     "openram": lambda: DEFAULT_OPENRAM_IMAGE,
     "opengcram": lambda: DEFAULT_OPENGCRAM_IMAGE,
+    "analogue_simulator": lambda: DEFAULT_NGSPICE_IMAGE,
 }
 
 # Container disk in GB per kind.  ORFS carries a PDK and gigabytes of tooling;
@@ -161,6 +181,7 @@ _KIND_DISKS = {
     "verilator": 20,
     "openram": 30,
     "opengcram": 30,
+    "analogue_simulator": 20,
 }
 
 
@@ -190,7 +211,7 @@ class EdaSpec(BaseModel):
 
     kind: str = Field(
         "yosys",
-        description="Which tool this block runs: 'verilator' | 'yosys' | 'openroad' | 'openram' | 'opengcram'.",
+        description="Which tool this block runs: 'verilator' | 'yosys' | 'openroad' | 'openram' | 'opengcram' | 'analogue_simulator'.",
     )
     image: str = Field(
         DEFAULT_IMAGE,
@@ -434,6 +455,59 @@ class OpenGcRamRunRequest(OpenRamRunRequest):
     vddio: str = Field(
         "",
         description="I/O supply voltage in volts for the level shifters. The compiler's default (1.2) applies when empty.",
+    )
+
+
+class AnalogueSimRunRequest(_RunBase):
+    """
+    Live inputs for an ngspice (analogue_simulator) run.
+
+    Strings throughout, for the reason OpenRamRunRequest gives: an unwired port
+    is empty, and empty means "use the default", never 0.
+
+    ``meas_statements`` is deliberately not called ``measurements``: that is the
+    OUTPUT port (the measured values), and on an EDA block a name shared by an
+    input and an output means "echoed through" -- as ``netlist`` is, whose output
+    is the exact deck ngspice ran.
+    """
+
+    netlist: str = Field(
+        "",
+        description=(
+            "The SPICE deck. First line is the title (SPICE ignores it). May carry "
+            "its own .control block, in which case it runs as written."
+        ),
+    )
+    pdk: str = Field(
+        "",
+        description="'sky130A' (default), 'gf180mcuD', or 'none' for a deck that loads its own models.",
+    )
+    corner: str = Field(
+        "",
+        description="Process corner: sky130A tt/ss/ff/sf/fs/..., gf180mcuD typical/ff/ss/fs/sf. Empty = typical.",
+    )
+    temperature: str = Field("", description="Simulation temperature in C (.temp). Empty = ngspice's 27.")
+    supply_voltage: str = Field(
+        "", description="Defines .param vdd=<value> for the deck to use as {vdd}, unless it defines vdd itself."
+    )
+    analyses: str = Field(
+        "",
+        description=(
+            "Analyses to run, one per line, e.g. 'tran 10p 5n' or 'ac dec 20 1 1G'. "
+            "Replaces the deck's own analysis cards when set."
+        ),
+    )
+    meas_statements: str = Field(
+        "", description=".meas lines appended to the deck; their values land on the measurements port."
+    )
+    probes: str = Field(
+        "", description="Vectors to save and plot (e.g. 'v(out) i(vdd)'). Empty = everything, voltages first."
+    )
+    max_points: str = Field(
+        "", description="Points per series on the waveforms port (decimated). Default 2000."
+    )
+    extra_control: str = Field(
+        "", description="Raw ngspice control commands run after the analyses (before quit)."
     )
 
 
