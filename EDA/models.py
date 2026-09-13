@@ -61,6 +61,15 @@ PDK_CHOICES = ["sky130hd", "sky130hs", "asap7", "nangate45", "ihp-sg13g2"]
 # build time, so it only appears here once an image that carries it is pinned.
 OPENRAM_TECH_CHOICES = ["scn4m_subm", "freepdk45"]
 
+# The technology NAMES an opengcram block can compile for.  Unlike OpenRAM's list
+# this is not "what the image ships": OpenGCRAM's public repository carries NO
+# gain-cell library for any technology.  tsmcN40 is its reference technology and
+# an empty NDA placeholder upstream, so it only works when the block supplies it
+# through the `tech_archive` port; freepdk45 ships in the image but has only the
+# old 6T SRAM cells, so on its own it fails the gain-cell check.  Listed first,
+# tsmcN40 is the name a user holding the technology will archive it under.
+OPENGCRAM_TECH_CHOICES = ["tsmcN40", "freepdk45"]
+
 # EDA tools are CPU-bound — synthesis and place-and-route never touch a GPU — so
 # the default pod is a RunPod CPU instance, which is far cheaper than renting an
 # idle GPU.  ``EDA_COMPUTE_TYPE=GPU`` falls back to the gpu block's proven code
@@ -73,7 +82,7 @@ DEFAULT_INSTANCE = os.environ.get("EDA_DEFAULT_INSTANCE", "cpu3c-8")
 ORFS_STAGES = ("synth", "floorplan", "place", "cts", "route", "final")
 
 # The kinds this package serves, one per Grafux block type.
-EDA_KINDS = ("verilator", "yosys", "openroad", "openram")
+EDA_KINDS = ("verilator", "yosys", "openroad", "openram", "opengcram")
 
 # The light verification image: Verilator + cocotb + iverilog, no PDK and no
 # OpenROAD.  It exists because pod placement and image pull dominate a simulation
@@ -116,6 +125,25 @@ DEFAULT_OPENRAM_IMAGE = os.environ.get(
 # scn4m_subm because it needs no external PDK: a freshly dropped block Runs.
 DEFAULT_OPENRAM_TECH = os.environ.get("EDA_OPENRAM_TECH", "scn4m_subm")
 
+
+# The GAIN-CELL memory compiler image: OpenGCRAM (github.com/xxwang1/OpenGCRAM, a
+# fork of OpenRAM) plus a Python runtime, built from EDA/docker/Dockerfile.opengcram.
+#
+# WHY A FIFTH IMAGE.  OpenGCRAM is a fork, not a plugin: it carries its own copy
+# of the whole OpenRAM package under the same import name, so it cannot share the
+# openram image without one shadowing the other.  Upstream has no tags, so the
+# tag pins a COMMIT.
+#
+# The image ships no usable technology on purpose -- see OPENGCRAM_TECH_CHOICES.
+DEFAULT_OPENGCRAM_IMAGE = os.environ.get(
+    "EDA_OPENGCRAM_IMAGE",
+    "ghcr.io/dalifahmy/grafux-opengcram:cbdc35b-20260913",
+)
+
+# The technology an opengcram run compiles for when neither the `tech_name` port
+# nor the uploaded archive names one.
+DEFAULT_OPENGCRAM_TECH = os.environ.get("EDA_OPENGCRAM_TECH", "tsmcN40")
+
 # The image each kind gets when the block left its `image` port empty.  A dict
 # rather than a chain of conditionals because every entry is the same kind of
 # statement, and a missing kind must fall back to the full EDA image rather than
@@ -123,6 +151,7 @@ DEFAULT_OPENRAM_TECH = os.environ.get("EDA_OPENRAM_TECH", "scn4m_subm")
 _KIND_IMAGES = {
     "verilator": lambda: DEFAULT_VERIFY_IMAGE,
     "openram": lambda: DEFAULT_OPENRAM_IMAGE,
+    "opengcram": lambda: DEFAULT_OPENGCRAM_IMAGE,
 }
 
 # Container disk in GB per kind.  ORFS carries a PDK and gigabytes of tooling;
@@ -131,6 +160,7 @@ _KIND_IMAGES = {
 _KIND_DISKS = {
     "verilator": 20,
     "openram": 30,
+    "opengcram": 30,
 }
 
 
@@ -160,7 +190,7 @@ class EdaSpec(BaseModel):
 
     kind: str = Field(
         "yosys",
-        description="Which tool this block runs: 'verilator' | 'yosys' | 'openroad' | 'openram'.",
+        description="Which tool this block runs: 'verilator' | 'yosys' | 'openroad' | 'openram' | 'opengcram'.",
     )
     image: str = Field(
         DEFAULT_IMAGE,
@@ -371,6 +401,40 @@ class OpenRamRunRequest(_RunBase):
         description="'1' to skip layout: no GDS and no LEF, much faster. The iteration mode.",
     )
     extra_config: str = Field("", description="Raw extra lines appended verbatim to the generated config.")
+
+
+class OpenGcRamRunRequest(OpenRamRunRequest):
+    """
+    Live inputs for an OpenGCRAM gain-cell memory-compiler run.
+
+    Every OpenRAM field carries over unchanged -- OpenGCRAM is a fork and reads
+    the same config variables -- plus the three that only a gain-cell run has.
+    Strings throughout, for the reason OpenRamRunRequest gives.
+
+    Two differences a reader of the parent's docstring would not expect:
+    OpenGCRAM ships only a TWO-port gain cell, so the three port counts must add
+    up to 2 (one read + one write by default), and it ships no technology that
+    contains one, so ``tech_archive`` is what makes a run possible at all.
+    """
+
+    tech_archive: str = Field(
+        "",
+        description=(
+            "The technology to compile for, as a .tar.gz/.tgz/.tar/.zip of an "
+            "OpenRAM technology directory (tech/tech.py, gds_lib/, sp_lib/, "
+            "layers.map) whose gds_lib holds os_gc/si_gc/hybrid_gc. The block "
+            "uploads the file through input_files; this field carries its name. "
+            "Required unless a pinned image already carries such a technology."
+        ),
+    )
+    gc_type: str = Field(
+        "",
+        description="Gain-cell flavour: 'OS' (oxide semiconductor, the default), 'Si' or 'hybrid'.",
+    )
+    vddio: str = Field(
+        "",
+        description="I/O supply voltage in volts for the level shifters. The compiler's default (1.2) applies when empty.",
+    )
 
 
 class CreateEdaResponse(BaseModel):

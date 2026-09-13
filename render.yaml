@@ -125,6 +125,21 @@ services:
       # be wrong and redeploying is faster than rebuilding.
       - key: EDA_OPENRAM_CMD
         value: ""
+      # The OPENGCRAM image, used for the opengcram kind only: the gain-cell
+      # fork of OpenRAM (see EDA/docker/Dockerfile.opengcram). It carries NO
+      # usable technology -- none with a gain cell is public -- so a block
+      # supplies one on its tech_archive port. Same rules: PIN THE TAG (upstream
+      # has no tags, so the tag pins a commit), PUBLIC package, and this
+      # dashboard value silently overrides EDA/models.py.
+      - key: EDA_OPENGCRAM_IMAGE
+        value: "ghcr.io/dalifahmy/grafux-opengcram:cbdc35b-20260913"
+      # Technology name used when neither the tech_name port nor the uploaded
+      # archive names one. tsmcN40 is OpenGCRAM's reference technology.
+      - key: EDA_OPENGCRAM_TECH
+        value: "tsmcN40"
+      # Escape hatch for the compiler invocation, like EDA_OPENRAM_CMD.
+      - key: EDA_OPENGCRAM_CMD
+        value: ""
       # Default process design kit / OpenROAD platform. sky130hd is the standard
       # open-source target and what every public ORFS example uses.
       - key: EDA_DEFAULT_PDK

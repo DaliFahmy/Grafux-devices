@@ -112,11 +112,13 @@ except Exception as exc:  # noqa: BLE001 — never let GPU imports break device 
     logger.warning("GPU router not mounted: %s", exc)
 
 # EDA — chip design: verilator (simulate/lint), yosys (synthesize), openroad
-# (floorplan -> place -> CTS -> route -> GDS) and openram (compile an SRAM macro
-# from memory parameters).  Four block types sharing one package, so they mount
+# (floorplan -> place -> CTS -> route -> GDS), openram (compile an SRAM macro
+# from memory parameters) and opengcram (the same for a gain-cell memory).  Five
+# block types sharing one package, so they mount
 # together: if the shared EDA runtime fails to import, none of them can work
 # anyway.  They no longer share one container image — see image_for_kind.
 try:
+    from EDA.opengcram_router import router as opengcram_router
     from EDA.openram_router import router as openram_router
     from EDA.openroad_router import router as openroad_router
     from EDA.verilator_router import router as verilator_router
@@ -126,7 +128,8 @@ try:
     app.include_router(yosys_router)
     app.include_router(openroad_router)
     app.include_router(openram_router)
-    logger.info("EDA routers mounted at /verilator, /yosys, /openroad and /openram")
+    app.include_router(opengcram_router)
+    logger.info("EDA routers mounted at /verilator, /yosys, /openroad, /openram and /opengcram")
 except Exception as exc:  # noqa: BLE001 — never let EDA imports break device serving
     logger.warning("EDA routers not mounted: %s", exc)
 

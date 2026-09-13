@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from EDA.models import (  # noqa: E402
     DEFAULT_IMAGE,
+    DEFAULT_OPENGCRAM_IMAGE,
     DEFAULT_OPENRAM_IMAGE,
     DEFAULT_VERIFY_IMAGE,
     EDA_KINDS,
@@ -87,6 +88,8 @@ def test_run_body_fields_are_parsed_not_ignored(client, kind):
                      "clock_period": "5", "from_stage": "floorplan"},
         "openram": {"word_size": "8", "num_words": "64",
                     "tech_name": "scn4m_subm", "num_banks": "1"},
+        "opengcram": {"word_size": "8", "num_words": "32", "gc_type": "OS",
+                      "vddio": "1.2", "tech_archive": "C:/tech/tsmcN40.tar.gz"},
     }
     # Parametrized over EDA_KINDS, so a kind added without a representative body
     # fails HERE -- loudly and offline -- rather than by shipping another kind's
@@ -138,6 +141,22 @@ def test_an_openram_block_gets_the_memory_compiler_image():
     assert spec.kind == "openram"
     assert spec.image == DEFAULT_OPENRAM_IMAGE
     assert spec.container_disk_gb == 30
+
+
+def test_an_opengcram_block_gets_the_gain_cell_compiler_image():
+    """OpenGCRAM is a fork that reuses OpenRAM's import name, so it cannot share that image."""
+    spec = _coerce_kind(EdaSpec(), "opengcram")
+    assert spec.kind == "opengcram"
+    assert spec.image == DEFAULT_OPENGCRAM_IMAGE
+    assert spec.image != DEFAULT_OPENRAM_IMAGE
+    assert spec.container_disk_gb == 30
+
+
+def test_opengcram_pdks_lists_gain_cell_technology_names(client):
+    body = client.get("/opengcram/pdks").json()
+    assert body["default"] == "tsmcN40"
+    assert "tsmcN40" in body["pdks"]
+    assert not any(p.startswith("sky130hd") for p in body["pdks"])
 
 
 def test_openram_pdks_lists_technologies_not_orfs_platforms(client):

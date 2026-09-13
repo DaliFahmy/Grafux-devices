@@ -1,0 +1,88 @@
+# The Grafux OPENGCRAM image: the gain-cell memory compiler, reachable over SSH.
+#
+# WHY A FIFTH IMAGE.  OpenGCRAM (github.com/xxwang1/OpenGCRAM) is a FORK of
+# OpenRAM, not a plugin: it ships its own copy of the whole compiler under the
+# same `openram` package name.  Installing both into one image means whichever is
+# first on PYTHONPATH silently serves both blocks.  Everything else about this
+# file is Dockerfile.openram's reasoning, repeated where it applies.
+#
+# WHAT IT DOES NOT CARRY -- read this before assuming the image is broken:
+#   * NO TECHNOLOGY WITH A GAIN CELL.  None is public.  Upstream's reference
+#     technology, tsmcN40, is an empty NDA placeholder (a .gitkeep), and the
+#     freepdk45 in the repository has only the 6T SRAM cells (cell_1rw/2rw) --
+#     no os_gc / si_gc / hybrid_gc.  A block supplies its technology on the
+#     `tech_archive` port; run_opengcram unpacks it into WORK_DIR/gcram_tech,
+#     which _OPENGCRAM_ENV puts FIRST on OPENRAM_TECH, and refuses the run with a
+#     readable message when the gain cell is not in it.
+#   * no hspice / Calibre / Virtuoso -- upstream's docs assume all three and none
+#     can be redistributed.  EDA/flow.py writes analytical_delay = True (upstream
+#     default False) and use_pex = False (upstream default True) for that reason.
+#
+# Same sshd contract as every other EDA image: RunPod injects PUBLIC_KEY but adds
+# no sshd, and a pod with nothing on port 22 fails provisioning with a misleading
+# "does not provide direct public-IP networking" error.  start.sh is shared.
+#
+# Build and push (PIN THE TAG; see EDA/models.py DEFAULT_OPENGCRAM_IMAGE):
+#   docker build -t ghcr.io/dalifahmy/grafux-opengcram:cbdc35b-20260913 \
+#       -f EDA/docker/Dockerfile.opengcram EDA/docker
+#   docker push  ghcr.io/dalifahmy/grafux-opengcram:cbdc35b-20260913
+# ...or, better, .github/workflows/build-opengcram-image.yml, whose smoke test is
+# the thing that proves the image.  The GHCR package must be PUBLIC.
+#
+# Local development (no RunPod account, no spend) -- what EDA_LOCAL_SSH=1 talks to:
+#   ssh-keygen -t rsa -b 2048 -f /tmp/eda_key -N ''
+#   docker run -d --name grafux-opengcram -p 2222:22 \
+#       -e PUBLIC_KEY="$(cat /tmp/eda_key.pub)" <img>
+#   EDA_LOCAL_SSH=1 EDA_LOCAL_KEY=/tmp/eda_key uvicorn device.app:app
+
+FROM ubuntu:22.04
+
+# `curl` is deliberately ABSENT, exactly as in Dockerfile.openram: the compiler
+# runs upstream's install_conda.sh on every invocation, and with curl present it
+# would download ~100 MB of miniconda per cold pod for an environment nothing
+# uses.  Without it the script fails in a few harmless lines on the `log` port.
+# `unzip` is not needed either: run_opengcram unpacks a .zip with python3.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        openssh-server rsync ca-certificates git \
+        python3 python3-venv python3-dev build-essential \
+ && mkdir -p /var/run/sshd /root/.ssh \
+ && chmod 700 /root/.ssh \
+ && sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+ && sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+ && rm -rf /var/lib/apt/lists/*
+
+# PIN THIS to a COMMIT.  Upstream publishes no tags or releases, and `main` is a
+# research branch that has renamed and moved files between commits.  cbdc35b is
+# main as of 2026-03-17, the commit every fact in EDA/flow.py was read from.
+ARG OPENGCRAM_REF=cbdc35b
+RUN git clone https://github.com/xxwang1/OpenGCRAM.git /opt/opengcram \
+ && git -C /opt/opengcram checkout --quiet "${OPENGCRAM_REF}"
+
+# Its own virtualenv, for the reason Dockerfile.openram gives.
+RUN python3 -m venv /opt/opengcram-venv \
+ && /opt/opengcram-venv/bin/pip install --no-cache-dir --upgrade pip \
+ && /opt/opengcram-venv/bin/pip install --no-cache-dir -r /opt/opengcram/requirements.txt
+
+# Where a real run finds the compiler: an SSH exec does not inherit Docker ENV,
+# but EDA/flow.py runs everything under `bash -lc`, which sources profile.d.
+# _OPENGCRAM_ENV supplies the same values with `:-` defaults; the ENV below
+# serves `docker run ... bash -lc` smoke tests.  Keep all three in step.
+RUN printf '%s\n' \
+      'export OPENRAM_HOME=/opt/opengcram/compiler' \
+      'export OPENRAM_TECH=/opt/opengcram/technology' \
+      'export GRAFUX_OPENGCRAM_CMD="python3 /opt/opengcram/gain_cell_compiler.py"' \
+      > /etc/profile.d/opengcram.sh \
+ && chmod 0644 /etc/profile.d/opengcram.sh
+
+ENV OPENRAM_HOME=/opt/opengcram/compiler \
+    OPENRAM_TECH=/opt/opengcram/technology \
+    GRAFUX_OPENGCRAM_CMD="python3 /opt/opengcram/gain_cell_compiler.py" \
+    PYTHONPATH=/opt/opengcram/compiler \
+    PATH="/opt/opengcram-venv/bin:${PATH}"
+
+COPY start.sh /start.sh
+RUN chmod +x /start.sh
+
+EXPOSE 22
+CMD ["/start.sh"]
