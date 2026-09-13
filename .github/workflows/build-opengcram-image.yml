@@ -116,7 +116,9 @@ jobs:
             set +e; $GRAFUX_OPENGCRAM_CMD >/tmp/usage.txt 2>&1; code=$?; set -e
             cat /tmp/usage.txt; test "$code" = 2
             echo "--- 2. the generated config is valid Python here ---"
-            python3 -m py_compile /host/gcram_config.py
+            # compile() rather than py_compile: /host is a read-only mount and
+            # py_compile writes __pycache__ beside the file.
+            python3 -c "compile(open(\"/host/gcram_config.py\").read(), \"gcram_config.py\", \"exec\")"
           ' 2>&1 | tee /tmp/gcram_smoke.log
 
           echo "--- 3a. the probe on the shipped freepdk45 ---"
