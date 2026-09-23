@@ -135,6 +135,18 @@ try:
 except Exception as exc:  # noqa: BLE001 — never let EDA imports break device serving
     logger.warning("EDA routers not mounted: %s", exc)
 
+# CPU — post-silicon verification: compile a verification case, run it on a real
+# CPU and benchmark it.  It reuses EDA's provisioning and registry, so this mount
+# only works when the EDA one did — but it gets its OWN try/except regardless, so
+# a fault in the CPU package can never take the six EDA block types down with it.
+try:
+    from CPU.router import router as cpu_router
+
+    app.include_router(cpu_router)
+    logger.info("CPU router mounted at /cpu")
+except Exception as exc:  # noqa: BLE001 — never let CPU imports break device serving
+    logger.warning("CPU router not mounted: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint

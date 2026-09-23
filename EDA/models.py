@@ -206,6 +206,26 @@ def disk_for_kind(kind: str) -> int:
     return _KIND_DISKS.get(kind or "", 60)
 
 
+def register_kind_image(kind: str, image_factory, disk_gb: int) -> None:
+    """
+    Let a package OUTSIDE this one claim a kind's default image and disk.
+
+    ``CPU/`` reuses this package's provisioning, SSH transport, registry and
+    reaper but is a different block type with its own toolchain image, and it
+    self-registers here at import.  The alternative -- hard-coding "cpu" in the
+    two dicts above -- would make this module depend on a package that depends on
+    it, and would mean every future runtime that borrows EDA's plumbing has to
+    edit a file it does not own.
+
+    ``image_factory`` is a zero-arg callable, not a string, for the reason
+    ``image_for_kind`` documents: the value is usually an environment-overridable
+    module-level name, and storing it eagerly would freeze whatever it happened to
+    be when this function was called rather than when the image is needed.
+    """
+    _KIND_IMAGES[kind] = image_factory
+    _KIND_DISKS[kind] = disk_gb
+
+
 class EdaSpec(BaseModel):
     """The persistent definition of an EDA pod (everything except the live run)."""
 

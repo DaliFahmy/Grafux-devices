@@ -229,3 +229,20 @@ services:
       # travels as an artifact instead and the openroad block accepts either form.
       - key: EDA_NETLIST_INLINE_MAX
         value: "1048576"
+
+      # ----- CPU: post-silicon verification -------------------------------
+      # The `cpu` block compiles a verification case, runs it on a real CPU and
+      # benchmarks it. It REUSES the EDA provisioning above — the registry, the
+      # reaper, the ephemeral/keep-warm rules and every EDA_* cost control apply
+      # to it unchanged, so there is deliberately no CPU_EPHEMERAL or
+      # CPU_MAX_RUN_MINUTES here. Only what is genuinely CPU-specific lives below.
+      #
+      # The toolchain image: gcc, g++, python3, /usr/bin/time and the sshd
+      # PUBLIC_KEY contract. PIN THE TAG. Beyond the usual reason (an unpinned
+      # image changes under you and breaks provisioning silently), this block
+      # reports DURATIONS — a floating base image moves the compiler and libc
+      # underneath it, and two measurements taken a month apart quietly stop being
+      # comparable. This value must stay byte-identical to the default in
+      # CPU/models.py and to the workflow input in build-cpu-image.yml.
+      - key: CPU_DEFAULT_IMAGE
+        value: "ghcr.io/dalifahmy/grafux-cpu:gcc11-20260922"

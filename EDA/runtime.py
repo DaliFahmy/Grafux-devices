@@ -29,7 +29,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import flow, pod_client
 from .models import (
@@ -408,6 +408,34 @@ def _teardown_after_run(eda_id: str, record: EdaRecord) -> None:
         logger.warning("eda post-run teardown failed for %s: %s", eda_id, exc)
 
 
+# Runners contributed by packages that borrow this one's plumbing, keyed by kind.
+#
+# ``CPU/`` is a different block type with its own toolchain, but provisioning, the
+# SSH transport, the registry, the reaper and every cost-safety mechanism in this
+# file are exactly what it needs.  Registering a runner here lets it reuse all of
+# that without this module importing it -- and, more importantly, without a second
+# copy of _start_job/_run_job, which is where the orphan-pod and keep-warm bugs
+# live and where two copies would silently diverge into real money.
+#
+# A registered runner has the same signature as the ``flow.run_*`` functions.
+_RUNNERS: Dict[str, Callable[..., Dict[str, Any]]] = {}
+
+
+def register_runner(kind: str, runner: Callable[..., Dict[str, Any]]) -> None:
+    """Claim a kind's run behaviour; see ``_RUNNERS``."""
+    _RUNNERS[kind] = runner
+
+
+def start_job(eda_id: str, req, kind: str) -> Dict[str, Any]:
+    """
+    Start a run for any kind, registered or built in.
+
+    Public because packages that register a runner need it; ``_start_job`` remains
+    as the in-module name the ``start_*_job`` helpers below were written against.
+    """
+    return _start_job(eda_id, req, kind)
+
+
 def _start_job(eda_id: str, req, kind: str) -> Dict[str, Any]:
     """
     Shared body of the three ``start_*_job`` entry points.
@@ -487,7 +515,16 @@ def _run_job(eda_id: str, req, kind: str) -> None:
             finally:
                 sftp.close()
 
-        if kind == "verilator":
+        runner = _RUNNERS.get(kind)
+        if runner is not None:
+            # A kind contributed by another package (see _RUNNERS). Checked first
+            # so a registered runner always wins over the fall-through to ORFS at
+            # the bottom, which is what an unknown kind would otherwise reach.
+            outcome = runner(
+                client, req, on_stage=on_stage, on_line=on_line,
+                should_cancel=should_cancel,
+            )
+        elif kind == "verilator":
             outcome = flow.run_verilator(
                 client, req, on_stage=on_stage, on_line=on_line,
                 should_cancel=should_cancel,

@@ -1,0 +1,162 @@
+# Build and publish the CPU image (post-silicon verification) to GHCR.
+#
+# WHY THIS EXISTS AS CI.  The tag it publishes is pinned in three places that must
+# agree byte-for-byte -- CPU/models.py DEFAULT_CPU_IMAGE, render.yaml
+# CPU_DEFAULT_IMAGE, and the input default below.  Building images by hand is how
+# a tag ends up referenced everywhere but never actually pushed, which fails at
+# RunPod with a misleading IMAGE_AUTH_ERROR.
+#
+# The image itself is small and boring on purpose -- gcc, g++, python3,
+# /usr/bin/time and sshd.  It is pinned anyway because this block reports
+# DURATIONS: a floating base image moves the compiler and libc under it, and two
+# measurements taken a month apart quietly stop being comparable.
+#
+# MANUAL STEP AFTER THE FIRST RUN.  GHCR container packages are created PRIVATE on
+# first push even from a public repo, and GitHub exposes no API to change
+# container package visibility.  Flip it once at
+#   https://github.com/users/DaliFahmy/packages/container/grafux-cpu/settings
+#   -> Danger Zone -> Change visibility -> Public
+# RunPod pulls ANONYMOUSLY, so a private package fails the pull.  The last step
+# below probes GHCR anonymously and fails the job if it is still private, so this
+# can never be silently forgotten.
+name: Build CPU image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: >-
+          Image tag to build. MUST match CPU/models.py DEFAULT_CPU_IMAGE and
+          render.yaml CPU_DEFAULT_IMAGE, or the devices server asks RunPod for an
+          image that was never published.
+        required: true
+        default: "gcc11-20260922"
+      push_image:
+        description: "Push to GHCR (uncheck to build + smoke-test only)"
+        type: boolean
+        required: true
+        default: true
+
+env:
+  IMAGE: ghcr.io/dalifahmy/grafux-cpu
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build and LOAD rather than push: the smoke test below has to run against
+      # the real image before anything is published, because a tag that is already
+      # public and broken is worse than one that is missing.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: CPU/docker
+          file: CPU/docker/Dockerfile
+          # RunPod CPU pods are amd64. Building anything else here would produce an
+          # image that pulls fine and then cannot start.
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE }}:${{ inputs.tag }}
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Everything CPU/flow.py assumes about the image, checked before shipping.
+      # Each of these has a failure mode that is invisible until someone rents a
+      # machine, which is the whole reason this step exists.
+      - name: Smoke-test the image
+        run: |
+          set -euo pipefail
+          img="${IMAGE}:${{ inputs.tag }}"
+          out=$(docker run --rm "$img" bash -lc '
+            set -e
+            command -v gcc g++ python3 sshd
+            gcc --version | head -1
+            python3 --version
+            # /usr/bin/time, NOT the bash builtin of the same name. Only the real
+            # binary supports -v, which is where the benchmark reads peak RSS; if
+            # the package is missing, max_rss_kb is silently always 0.
+            /usr/bin/time -v true 2>&1 | grep -c "Maximum resident set size" \
+              | sed "s/^/timev_ok /"
+            # The work directory EDA clears before each run.
+            test -d /workspace/grafux && echo "workdir ok"
+          ')
+          echo "$out"
+          echo "$out" | grep -q "^timev_ok 1" \
+            || { echo "::error::/usr/bin/time -v is unavailable; the benchmark would report max_rss_kb=0 forever"; exit 1; }
+          echo "$out" | grep -q "^workdir ok" \
+            || { echo "::error::/workspace/grafux is missing"; exit 1; }
+
+      # A real end-to-end build+run of the shape CPU/flow.py generates. Catches a
+      # toolchain that is present but unusable (no libc headers, no C++ standard
+      # library) -- which `gcc --version` cannot tell you.
+      - name: Compile and run a verification case
+        run: |
+          set -euo pipefail
+          img="${IMAGE}:${{ inputs.tag }}"
+          out=$(docker run --rm "$img" bash -lc '
+            set -e
+            cd /workspace/grafux
+            cat > case.cpp <<"EOF"
+            #include <cstdio>
+            #include <vector>
+            int main() {
+                std::vector<int> v(16, 7);
+                std::printf("%s: sum\n", v[0] * 16 == 112 ? "PASS" : "FAIL");
+                return 0;
+            }
+            EOF
+            g++ case.cpp -o case -O2
+            s=$(date +%s%N); ./case; e=$(date +%s%N)
+            echo "elapsed_ms $(( (e - s) / 1000000 ))"
+          ')
+          echo "$out"
+          echo "$out" | grep -q "^PASS: sum" \
+            || { echo "::error::the C++ toolchain cannot build and run a trivial case"; exit 1; }
+          echo "$out" | grep -qE "^elapsed_ms [0-9]+" \
+            || { echo "::error::date +%s%N did not yield a usable timing; the benchmark depends on it"; exit 1; }
+
+      - name: Push
+        if: ${{ inputs.push_image }}
+        run: docker push "${IMAGE}:${{ inputs.tag }}"
+
+      # RunPod pulls with no credentials, so "it pushed" is not the same as "it
+      # works". Ask GHCR for an anonymous pull token exactly the way RunPod's
+      # daemon does; no token means the package is still private.
+      - name: Verify the package is anonymously pullable
+        if: ${{ inputs.push_image }}
+        run: |
+          set -uo pipefail
+          img="${IMAGE}:${{ inputs.tag }}"
+          body=$(curl -sS "https://ghcr.io/token?scope=repository:dalifahmy/grafux-cpu:pull&service=ghcr.io")
+          if echo "$body" | grep -q '"token"'; then
+            echo "### Published: \`$img\` (public, anonymously pullable)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "### Pushed \`$img\`, but the GHCR package is still PRIVATE"
+            echo ""
+            echo "RunPod pulls anonymously and will fail with \`IMAGE_AUTH_ERROR ... denied\`."
+            echo ""
+            echo "Fix it once, by hand:"
+            echo "https://github.com/users/DaliFahmy/packages/container/grafux-cpu/settings"
+            echo "-> Danger Zone -> Change visibility -> Public"
+            echo ""
+            echo "GHCR said: \`$body\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::grafux-cpu is not anonymously pullable; make the GHCR package public"
+          exit 1
