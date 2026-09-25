@@ -91,6 +91,7 @@ def make_router(
     *,
     pdk_choices: Optional[Sequence[str]] = None,
     default_pdk: Optional[str] = None,
+    instances: Optional[Callable[[], Sequence[Dict[str, Any]]]] = None,
 ) -> APIRouter:
     """
     Build the REST router for one EDA block type.
@@ -100,7 +101,12 @@ def make_router(
     nothing to do with the ORFS platforms the other three share -- an openram
     block offered "sky130hd" would be offered a name its compiler has never
     heard of.
+
+    ``instances`` overrides the machine list ``GET /{kind}/instances`` answers.
+    It exists for cpu, whose machine IS the measurement and so offers every
+    RunPod CPU flavour, where the EDA kinds keep their short compute-first list.
     """
+    list_machines = instances if instances is not None else pod_client.list_instances
     router = APIRouter(prefix=f"/{kind}", tags=[kind])
 
     @router.post("/create", response_model=CreateEdaResponse)
@@ -131,7 +137,7 @@ def make_router(
                     usd_per_hr=float(i.get("usd_per_hr", 0.0)),
                     compute_type=i.get("compute_type", "CPU"),
                 )
-                for i in pod_client.list_instances()
+                for i in list_machines()
             ]
         )
 

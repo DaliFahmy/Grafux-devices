@@ -556,6 +556,14 @@ def test_the_unknown_language_warning_reaches_the_block(transport):
     assert "golang" in outcome["outputs"]["warnings"]
 
 
+def test_a_substituted_machine_is_named_in_the_warnings(transport):
+    """A benchmark must say when it ran somewhere other than where it was asked to."""
+    req = CpuRunRequest(code="int main(){return 0;}", language="c")
+    req._machine_note = "instance_type 'xeon-8' names no RunPod CPU flavour"
+    outcome = flow.run_cpu(_FakeClient(), req, on_stage=lambda s, d: None)
+    assert "xeon-8" in outcome["outputs"]["warnings"]
+
+
 def test_stages_are_reported_in_order(transport):
     """The block face must say something true while a long run is in flight."""
     outcome = _run(transport, code="int main(){}", warmup="1")

@@ -16,7 +16,9 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+from EDA import pod_client
 from EDA import runtime as eda_runtime
+from EDA.registry import registry
 
 from . import flow
 from .models import CpuRunRequest  # noqa: F401 — also self-registers the image
@@ -30,4 +32,7 @@ eda_runtime.register_runner("cpu", flow.run_cpu)
 
 def start_cpu_job(eda_id: str, req: CpuRunRequest) -> Dict[str, Any]:
     """Start a post-silicon verification run.  Returns as soon as the job starts."""
+    record = registry.get(eda_id)
+    if record is not None:
+        req._machine_note = pod_client.instance_type_note(record.spec.instance_type)
     return eda_runtime.start_job(eda_id, req, "cpu")

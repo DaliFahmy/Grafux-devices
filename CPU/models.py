@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import os
 
-from pydantic import Field
+from pydantic import Field, PrivateAttr
 
 from EDA.models import _RunBase, register_kind_image
+from EDA.pod_client import register_instance_prices
 
 # The image a cpu pod runs: a C/C++ toolchain, Python 3, and the sshd +
 # PUBLIC_KEY contract every pod in this codebase is reached through.
@@ -77,6 +78,45 @@ CPU_DEFAULT_PDK = ""
 # Smaller than any EDA kind: a compiler, a Python runtime and one small binary.
 CPU_DISK_GB = 25
 
+# The machine dropdown for this block (``GET /cpu/instances``).  Wider than EDA's
+# list on purpose: for a benchmark the machine IS the experiment, so every RunPod
+# CPU flavour family is offered, not just the compute-optimised one synthesis
+# wants.  Ids are EDA's ``<family>-<vcpus>`` convention, which ``create_pod``
+# splits into ``cpuFlavorIds`` + ``vcpuCount``; the families are exactly the
+# REST v1 ``cpuFlavorIds`` enum.  Families: c = compute (2 GB/vCPU), g = general
+# (4 GB/vCPU), m = memory (8 GB/vCPU); 3 / 5 = hardware generation.
+#
+# ``usd_per_hr`` is advisory (the live pod costPerHr replaces it once polled).
+# cpu3c-8 stays the default: it is the size every cpu block has run on so far.
+CPU_INSTANCES = [
+    {"id": "cpu3c-2", "label": "Compute 2 vCPU / 4 GB", "usd_per_hr": 0.06},
+    {"id": "cpu3c-4", "label": "Compute 4 vCPU / 8 GB", "usd_per_hr": 0.12},
+    {"id": "cpu3c-8", "label": "Compute 8 vCPU / 16 GB", "usd_per_hr": 0.24},
+    {"id": "cpu3c-16", "label": "Compute 16 vCPU / 32 GB", "usd_per_hr": 0.48},
+    {"id": "cpu3c-32", "label": "Compute 32 vCPU / 64 GB", "usd_per_hr": 0.96},
+    {"id": "cpu3g-4", "label": "General 4 vCPU / 16 GB", "usd_per_hr": 0.16},
+    {"id": "cpu3g-8", "label": "General 8 vCPU / 32 GB", "usd_per_hr": 0.33},
+    {"id": "cpu3g-16", "label": "General 16 vCPU / 64 GB", "usd_per_hr": 0.64},
+    {"id": "cpu3m-4", "label": "Memory 4 vCPU / 32 GB", "usd_per_hr": 0.24},
+    {"id": "cpu3m-8", "label": "Memory 8 vCPU / 64 GB", "usd_per_hr": 0.48},
+    {"id": "cpu5c-4", "label": "Compute (gen 5) 4 vCPU / 8 GB", "usd_per_hr": 0.14},
+    {"id": "cpu5c-8", "label": "Compute (gen 5) 8 vCPU / 16 GB", "usd_per_hr": 0.28},
+    {"id": "cpu5c-16", "label": "Compute (gen 5) 16 vCPU / 32 GB", "usd_per_hr": 0.56},
+    {"id": "cpu5c-32", "label": "Compute (gen 5) 32 vCPU / 64 GB", "usd_per_hr": 1.12},
+    {"id": "cpu5g-8", "label": "General (gen 5) 8 vCPU / 32 GB", "usd_per_hr": 0.40},
+    {"id": "cpu5m-8", "label": "Memory (gen 5) 8 vCPU / 64 GB", "usd_per_hr": 0.56},
+]
+DEFAULT_CPU_INSTANCE = "cpu3c-8"
+
+
+def list_cpu_instances() -> list:
+    """The cpu block's machine dropdown (id + label + advisory usd_per_hr)."""
+    return [dict(i) for i in CPU_INSTANCES]
+
+
+# So the cost estimate knows these prices without EDA importing this package.
+register_instance_prices(CPU_INSTANCES)
+
 # Claim this kind's image and disk in EDA's maps.  Done at import of this module,
 # which ``CPU.runtime`` (and therefore ``CPU.router``) pulls in, so it has always
 # happened by the time a request can arrive.
@@ -85,6 +125,11 @@ register_kind_image("cpu", lambda: DEFAULT_CPU_IMAGE, CPU_DISK_GB)
 
 class CpuRunRequest(_RunBase):
     """Live inputs for a post-silicon verification run."""
+
+    # Set server-side by ``start_cpu_job`` from the pod's spec, never by a client:
+    # a one-line note when the requested machine was substituted, so the run's
+    # `warnings` say where the numbers actually came from.
+    _machine_note: str = PrivateAttr("")
 
     code: str = Field(
         "",

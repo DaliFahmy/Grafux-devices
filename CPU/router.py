@@ -7,7 +7,7 @@ REST surface for the "cpu" block: run a verification case on real silicon.
     POST   /cpu/{id}/run       START a verification run         (Run)
     GET    /cpu/{id}/status    poll phase / stage / log tail
     GET    /cpu/{id}/result    the finished payload
-    GET    /cpu/instances      machine dropdown
+    GET    /cpu/instances      machine dropdown (every RunPod CPU flavour)
     GET    /cpu/pdks           empty here — no PDK applies to running a program
     GET    /cpu                list
     DELETE /cpu/{id}           cancel + terminate               (Stop)
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from EDA.router_base import make_router
 
-from .models import CPU_DEFAULT_PDK, CPU_PDK_CHOICES, CpuRunRequest
+from .models import CPU_DEFAULT_PDK, CPU_PDK_CHOICES, CpuRunRequest, list_cpu_instances
 from .runtime import start_cpu_job
 
 router = make_router(
@@ -37,4 +37,5 @@ router = make_router(
     start_cpu_job,
     pdk_choices=CPU_PDK_CHOICES,
     default_pdk=CPU_DEFAULT_PDK,
+    instances=list_cpu_instances,
 )

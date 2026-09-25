@@ -130,6 +130,49 @@ def test_instances_is_not_swallowed_by_the_id_path(client):
     assert "instances" in resp.json()
 
 
+def test_cpu_instances_offer_every_runpod_cpu_flavour(client):
+    """
+    For a benchmark the machine is the experiment, so the cpu dropdown spans every
+    flavour family RunPod accepts -- not just EDA's compute-first shortlist -- and
+    still defaults to the size cpu blocks have always run on.
+    """
+    from CPU.models import CPU_INSTANCES, DEFAULT_CPU_INSTANCE
+    from EDA import pod_client
+
+    ids = [i["id"] for i in client.get("/cpu/instances").json()["instances"]]
+    assert ids == [i["id"] for i in CPU_INSTANCES]
+    assert DEFAULT_CPU_INSTANCE in ids
+    families = {pod_client.split_instance_type(i)[0] for i in ids}
+    assert families == set(pod_client.CPU_FLAVOR_FAMILIES)
+    for inst_id in ids:
+        # Only an id whose family is real: split_instance_type would otherwise
+        # quietly rent a different machine than the dropdown said.
+        assert inst_id.split("-")[0] in pod_client.CPU_FLAVOR_FAMILIES, inst_id
+        assert pod_client.price_for(inst_id) > 0, inst_id
+
+
+@pytest.mark.parametrize("kind", ["verilator", "yosys", "openroad", "openram"])
+def test_the_cpu_machine_list_did_not_leak_into_eda_kinds(client, kind):
+    from EDA import pod_client
+
+    ids = [i["id"] for i in client.get(f"/{kind}/instances").json()["instances"]]
+    assert ids == [i["id"] for i in pod_client.EDA_INSTANCES]
+
+
+def test_starting_a_run_notes_a_substituted_machine(monkeypatch):
+    from CPU import runtime as cpu_runtime
+    from CPU.models import CpuRunRequest
+
+    eda_id = registry.create(EdaRecord(
+        spec=EdaSpec(kind="cpu", instance_type="xeon-8"), pod_id="pod-1",
+        public_ip="1.2.3.4", ssh_port=22))
+    seen = {}
+    monkeypatch.setattr(cpu_runtime.eda_runtime, "start_job",
+                        lambda i, req, kind: seen.setdefault("note", req._machine_note))
+    cpu_runtime.start_cpu_job(eda_id, CpuRunRequest(code="x"))
+    assert "xeon-8" in seen["note"] and "cpu3c-8" in seen["note"]
+
+
 def test_pdks_answers_empty_rather_than_offering_an_orfs_platform(client):
     """
     No PDK applies to running a program on a CPU. The endpoint exists because it

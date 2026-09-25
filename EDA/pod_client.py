@@ -293,6 +293,57 @@ _PRICE_BY_GPU: Dict[str, float] = {
 }
 
 
+# Advisory $/vCPU-hr per flavour family, for an id the curated tables do not name
+# (a hand-typed ``cpu3m-12``, or a size some kind's dropdown lists but EDA's does
+# not).  The 3c/3g/5c rates are the curated prices above divided by their vCPUs;
+# the rest follow the same RAM-per-vCPU ratio.  Advisory only -- the live pod
+# costPerHr replaces it as soon as the pod is polled.
+_USD_PER_VCPU_BY_FAMILY: Dict[str, float] = {
+    "cpu3c": 0.03,
+    "cpu3g": 0.04,
+    "cpu3m": 0.06,
+    "cpu5c": 0.035,
+    "cpu5g": 0.05,
+    "cpu5m": 0.07,
+}
+
+
+def register_instance_prices(instances: List[Dict[str, Any]]) -> None:
+    """
+    Add another package's curated machine prices to the lookup ``price_for`` uses.
+
+    The CPU package offers its own, wider machine list; registering it here keeps
+    EDA from importing CPU (the same direction as ``register_kind_image``).  An id
+    already in the table keeps its existing price.
+    """
+    for inst in instances:
+        key = str(inst.get("id", "")).strip()
+        if key and key not in _PRICE_BY_INSTANCE:
+            _PRICE_BY_INSTANCE[key] = float(inst.get("usd_per_hr", 0.0))
+
+
+def instance_type_note(instance_type: str) -> str:
+    """
+    Explain, in one line, when ``split_instance_type`` replaced the requested family.
+
+    Empty when the id names a real RunPod flavour (or is empty, meaning "default").
+    The substitution itself stays tolerant; this exists so a benchmark can say it
+    ran somewhere other than where it was asked to, instead of doing so silently.
+    """
+    raw = (instance_type or "").strip().lower()
+    if not raw:
+        return ""
+    family = raw.split("-")[0]
+    if family in CPU_FLAVOR_FAMILIES:
+        return ""
+    used, vcpus = split_instance_type(raw)
+    return (
+        f"instance_type '{instance_type}' names no RunPod CPU flavour, so the pod ran "
+        f"on {used}-{vcpus} instead. Valid families: {', '.join(CPU_FLAVOR_FAMILIES)} "
+        f"(e.g. cpu3c-8)."
+    )
+
+
 def list_instances() -> List[Dict[str, Any]]:
     """Return the curated machine dropdown list (id + label + usd_per_hr)."""
     return list(EDA_INSTANCES)
@@ -303,7 +354,14 @@ def price_for(instance_type: str, compute_type: str = "CPU") -> float:
     key = (instance_type or "").strip()
     if (compute_type or "CPU").upper() == "GPU":
         return _PRICE_BY_GPU.get(key, 0.0)
-    return _PRICE_BY_INSTANCE.get(key, 0.0)
+    if key in _PRICE_BY_INSTANCE:
+        return _PRICE_BY_INSTANCE[key]
+    family = key.lower().split("-")[0]
+    rate = _USD_PER_VCPU_BY_FAMILY.get(family)
+    if rate is None:
+        return 0.0
+    _family, vcpus = split_instance_type(key)
+    return round(rate * vcpus, 4)
 
 
 def cost_per_hr_of(pod: Dict[str, Any]) -> float:

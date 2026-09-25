@@ -560,6 +560,22 @@ def test_split_instance_type(raw, expected):
     assert pod_client.split_instance_type(raw) == expected
 
 
+def test_price_for_falls_back_to_the_family_rate():
+    """A size no curated list names still gets a cost estimate, scaled by vCPUs."""
+    assert pod_client.price_for("cpu3c-8") == 0.24          # curated price wins
+    assert pod_client.price_for("cpu3m-12") == pytest.approx(0.06 * 12)
+    assert pod_client.price_for("cpu5c-2") == pytest.approx(0.035 * 2)
+    assert pod_client.price_for("nonsense-8") == 0.0
+    assert pod_client.price_for("") == 0.0
+
+
+def test_instance_type_note_only_speaks_up_on_a_substitution():
+    assert pod_client.instance_type_note("") == ""
+    assert pod_client.instance_type_note("cpu5g-16") == ""
+    note = pod_client.instance_type_note("xeon-16")
+    assert "xeon-16" in note and "cpu3c-16" in note
+
+
 def test_every_curated_instance_id_splits_to_a_valid_flavor():
     """The dropdown must never offer an id RunPod would reject."""
     for entry in pod_client.list_instances():

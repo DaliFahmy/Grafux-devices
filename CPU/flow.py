@@ -431,7 +431,8 @@ def run_cpu(
     warmup = _positive_int(getattr(req, "warmup", ""), 1, maximum=50)
     repetitions = _positive_int(getattr(req, "repetitions", ""), 5, maximum=200)
     timeout = int(getattr(req, "timeout", 900) or 900)
-    notes: List[str] = [n for n in (lang_note,) if n]
+    machine_note = getattr(req, "_machine_note", "") or ""
+    notes: List[str] = [n for n in (machine_note, lang_note) if n]
 
     def _outputs(**over: Any) -> Dict[str, Any]:
         base = {
