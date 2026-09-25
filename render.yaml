@@ -237,12 +237,21 @@ services:
       # to it unchanged, so there is deliberately no CPU_EPHEMERAL or
       # CPU_MAX_RUN_MINUTES here. Only what is genuinely CPU-specific lives below.
       #
-      # The toolchain image: gcc, g++, python3, /usr/bin/time and the sshd
-      # PUBLIC_KEY contract. PIN THE TAG. Beyond the usual reason (an unpinned
-      # image changes under you and breaks provisioning silently), this block
-      # reports DURATIONS — a floating base image moves the compiler and libc
-      # underneath it, and two measurements taken a month apart quietly stop being
-      # comparable. This value must stay byte-identical to the default in
-      # CPU/models.py and to the workflow input in build-cpu-image.yml.
+      # The toolchain image: gcc, g++, python3 and the sshd PUBLIC_KEY contract.
+      #
+      # This is the VERIFY image, on purpose — see the long comment on
+      # DEFAULT_CPU_IMAGE in CPU/models.py. It points at a published, public tag
+      # because this key previously named a grafux-cpu tag that had never been
+      # built, and RunPod answered every Regenerate by stopping the pod with a
+      # bare "Exited by Runpod". A default image must be one that exists.
+      #
+      # It must stay byte-identical to the default in CPU/models.py. NOTE that a
+      # value set by hand in the Render dashboard silently overrides both — if the
+      # cpu block still reports a missing image after a deploy, check there first.
+      #
+      # PIN THE TAG. Beyond the usual reason (an unpinned image changes under you
+      # and breaks provisioning silently), this block reports DURATIONS — a
+      # floating base image moves the compiler and libc underneath it, and two
+      # measurements taken a month apart quietly stop being comparable.
       - key: CPU_DEFAULT_IMAGE
-        value: "ghcr.io/dalifahmy/grafux-cpu:gcc11-20260922"
+        value: "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903"

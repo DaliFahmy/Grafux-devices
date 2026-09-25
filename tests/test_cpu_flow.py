@@ -100,6 +100,63 @@ def test_defines_and_includes_are_prefixed_only_when_needed():
 # The run target
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Resolving the compiler against what the image actually has
+# ---------------------------------------------------------------------------
+
+def test_the_probe_looks_for_both_kinds_and_stops_at_the_first_hit():
+    probe = flow.build_compiler_probe()
+    assert "CC:$c" in probe and "CXX:$c" in probe
+    assert "gcc" in probe and "g++" in probe
+    assert "break" in probe  # first hit wins, no pointless lookups
+
+
+def test_parse_compiler_probe():
+    assert flow.parse_compiler_probe("CC:gcc\nCXX:g++") == {"c": "gcc", "cpp": "g++"}
+    assert flow.parse_compiler_probe("CXX:g++") == {"cpp": "g++"}
+    assert flow.parse_compiler_probe("") == {}
+    # Noise from a login shell's profile must not be read as a compiler.
+    assert flow.parse_compiler_probe("Welcome to Ubuntu\nCC:cc") == {"c": "cc"}
+
+
+def test_a_full_toolchain_uses_the_conventional_names():
+    available = {"c": "gcc", "cpp": "g++"}
+    assert flow.resolve_compiler("c", available) == ("gcc", "")
+    assert flow.resolve_compiler("cpp", available) == ("g++", "")
+
+
+def test_a_c_case_falls_back_to_the_cxx_compiler_and_says_so():
+    """
+    The exact shape of the default image: Ubuntu's `g++` metapackage ships
+    /usr/bin/g++ and pulls in gcc-11, but /usr/bin/gcc comes from the separate
+    `gcc` metapackage. Hard-coding "gcc" made every C case -- the default language
+    a generated case comes back in -- fail with "compiler not found (exit 127)".
+    """
+    command, note = flow.resolve_compiler("c", {"cpp": "g++"})
+    assert command == "g++ -x c"
+    # Building C as C++ is a real semantic change, so it must never be silent.
+    assert note and "C++" in note and "cpp" in note
+
+
+def test_a_versioned_compiler_is_accepted_when_the_plain_name_is_absent():
+    assert flow.resolve_compiler("c", {"c": "gcc-12"}) == ("gcc-12", "")
+
+
+def test_no_compiler_at_all_resolves_to_nothing():
+    """The caller turns this into an actionable error rather than a bare exit 127."""
+    assert flow.resolve_compiler("c", {}) == ("", "")
+    assert flow.resolve_compiler("cpp", {}) == ("", "")
+
+
+def test_the_resolved_compiler_reaches_the_compile_command():
+    cmd = flow.build_compile_cmd(
+        "c", source="case.c", binary="case", build_flags="-O2", compiler="g++ -x c")
+    assert cmd.startswith("g++ -x c case.c -o case")
+    # Flag order still holds with a multi-token compiler.
+    parts = cmd.split()
+    assert parts.index("case.c") < parts.index("-o") < parts.index("-O2")
+
+
 def test_python_runs_through_the_interpreter_and_c_runs_the_binary():
     assert flow.run_target_for("python", binary="case", source="case.py") == "python3 case.py"
     assert flow.run_target_for("cpp", binary="case", source="case.cpp") == "./case"
@@ -316,6 +373,9 @@ def transport(monkeypatch):
         "stderr": "",
         "time_v": "\tMaximum resident set size (kbytes): 4096\n",
         "lscpu": "Model name:   AMD EPYC 7763\nCPU(s):    8\n",
+        # What the compiler probe finds. Defaults to a full toolchain; a test that
+        # cares sets it to the verify image's shape (g++ but no gcc) or to nothing.
+        "compilers": "CC:gcc\nCXX:g++",
         "commands": [],
     }
 
@@ -327,6 +387,8 @@ def transport(monkeypatch):
 
     def fake_exec_simple(_client, command, timeout):
         state["commands"].append(command)
+        if "CC:$c" in command:
+            return 0, state["compilers"], ""
         if flow.STDOUT_FILE in command:
             return 0, state["stdout"], ""
         if flow.STDERR_FILE in command:
@@ -427,6 +489,30 @@ def test_compiler_warnings_on_a_successful_build_are_surfaced(transport):
     outcome = _run(transport, code="int main(){}", language="c")
     assert outcome["outputs"]["passed"] == "true"
     assert "comparison of integer" in outcome["outputs"]["warnings"]
+
+
+def test_a_c_case_builds_on_the_default_image_which_has_no_gcc(transport):
+    """
+    End to end on the image the cpu block actually defaults to. Before the probe
+    this returned "compiler not found (exit 127)" for the most common case there
+    is: a generated C verification case.
+    """
+    transport["compilers"] = "CXX:g++"          # verify image: g++, no gcc
+    outcome = _run(transport, code="int main(){return 0;}", language="c")
+    assert outcome["outputs"]["passed"] == "true"
+    assert any("g++ -x c" in c for c in transport["commands"])
+    # The substitution is reported, not silent.
+    assert "built as C++" in outcome["outputs"]["warnings"]
+
+
+def test_an_image_with_no_compiler_says_which_port_to_fix(transport):
+    transport["compilers"] = ""
+    outcome = _run(transport, code="int main(){}", language="c")
+    assert outcome["_status"] == "error"
+    assert outcome["_stage"] == "build"
+    assert "`image` port" in outcome["outputs"]["errors"]
+    # It never tried to compile, so there is no misleading exit-127 diagnostic.
+    assert not any("case.c -o" in c for c in transport["commands"])
 
 
 def test_python_skips_the_compile_step_entirely(transport):

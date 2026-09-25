@@ -122,9 +122,14 @@ def build_compile_cmd(
     build_flags: str = "",
     defines: str = "",
     include_dirs: str = "",
+    compiler: str = "",
 ) -> Optional[str]:
     """
     The compile command, or None for a language that does not compile.
+
+    ``compiler`` is resolved ON THE POD by ``resolve_compilers`` and may carry
+    flags (``"g++ -x c"``).  Left empty it falls back to the conventional names,
+    which is only right for an image known to carry them.
 
     ``build_flags`` go AFTER the source and ``-o`` output.  That is not cosmetic:
     ``-l`` libraries must follow the object that references them or the linker
@@ -134,8 +139,8 @@ def build_compile_cmd(
     """
     if language == "python":
         return None
-    compiler = "gcc" if language == "c" else "g++"
-    parts = [compiler]
+    chosen = (compiler or "").strip() or ("gcc" if language == "c" else "g++")
+    parts = chosen.split()
     for token in (defines or "").split():
         parts.append(f"-D{token}" if not token.startswith("-D") else token)
     for token in (include_dirs or "").replace("\n", " ").split():
@@ -143,6 +148,71 @@ def build_compile_cmd(
     parts += [source, "-o", binary]
     parts += (build_flags or "").split()
     return " ".join(shlex.quote(p) if " " in p else p for p in parts)
+
+
+# Compiler names to look for on the pod, best first.
+#
+# WHY THIS IS A SEARCH rather than the literal "gcc" and "g++".  Images differ in
+# which METAPACKAGE they install, and the unversioned names are not guaranteed:
+# on Ubuntu the `g++` metapackage ships /usr/bin/g++ and pulls in gcc-11, but
+# /usr/bin/gcc comes from the separate `gcc` metapackage.  So an image can be
+# perfectly able to compile C and still have no `gcc` on PATH -- which is exactly
+# the case for the verification image this block defaults to.  Hard-coding the
+# names turned that into "compiler not found (exit 127)" for every C case, and C
+# is the default language a generated case comes back in.
+_C_COMPILERS = ("gcc", "cc", "gcc-13", "gcc-12", "gcc-11")
+_CXX_COMPILERS = ("g++", "c++", "g++-13", "g++-12", "g++-11")
+
+
+def build_compiler_probe() -> str:
+    """A single command that reports the best available compiler of each kind."""
+    def first_of(names: Tuple[str, ...], label: str) -> str:
+        listed = " ".join(names)
+        return (f'for c in {listed}; do command -v "$c" >/dev/null 2>&1 '
+                f'&& {{ echo "{label}:$c"; break; }}; done')
+    return first_of(_C_COMPILERS, "CC") + "; " + first_of(_CXX_COMPILERS, "CXX")
+
+
+def parse_compiler_probe(text: str) -> Dict[str, str]:
+    """Read ``{"c": ..., "cpp": ...}`` out of the probe's output."""
+    found: Dict[str, str] = {}
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line.startswith("CC:"):
+            found.setdefault("c", line[3:].strip())
+        elif line.startswith("CXX:"):
+            found.setdefault("cpp", line[4:].strip())
+    return {k: v for k, v in found.items() if v}
+
+
+def resolve_compiler(language: str, available: Dict[str, str]) -> Tuple[str, str]:
+    """
+    Pick the compiler for a language from what the pod actually has.
+
+    Returns ``(command, note)``.  ``note`` is non-empty only when something the
+    user should know happened -- currently the one case where a C case is built
+    by a C++ compiler, which is a real semantic change (C++ rejects implicit
+    conversions from ``void*``, among others) and must never be silent.
+
+    An empty command means nothing on the pod can build this language; the caller
+    turns that into an actionable error rather than a bare exit 127.
+    """
+    if language == "python":
+        return "", ""
+    if language == "cpp":
+        return available.get("cpp", ""), ""
+    c_compiler = available.get("c", "")
+    if c_compiler:
+        return c_compiler, ""
+    cxx = available.get("cpp", "")
+    if cxx:
+        return f"{cxx} -x c", (
+            f"No C compiler was found on this image, so the case was built as C++ "
+            f"with '{cxx} -x c'. That is stricter than C and can reject valid C "
+            f"(implicit conversions from void*, for one). Set the language port to "
+            f"cpp, or use an image that carries gcc."
+        )
+    return "", ""
 
 
 def run_target_for(language: str, *, binary: str, source: str, args: str = "") -> str:
@@ -395,14 +465,35 @@ def run_cpu(
         sftp.close()
 
     compile_ms = 0
-    compile_cmd = build_compile_cmd(
-        language,
-        source=source,
-        binary=BINARY_NAME,
-        build_flags=getattr(req, "build_flags", ""),
-        defines=getattr(req, "defines", ""),
-        include_dirs=getattr(req, "include_dirs", ""),
-    )
+    compile_cmd = None
+    if language != "python":
+        # Ask the pod what it actually has before assuming a name. One cheap exec,
+        # and it is what keeps this block working across images whose toolchain
+        # metapackages differ -- see _C_COMPILERS.
+        _code, probe_out, _err = exec_simple(
+            client, _sh(build_compiler_probe()), timeout=PROBE_TIMEOUT_S,
+        )
+        available = parse_compiler_probe(probe_out)
+        compiler, compiler_note = resolve_compiler(language, available)
+        if not compiler:
+            return _fail("build", (
+                f"This image has no compiler for {language}: none of "
+                f"{', '.join(_C_COMPILERS if language == 'c' else _CXX_COMPILERS)} "
+                f"is on PATH. Leave the `image` port empty to use the default "
+                f"image for this block, or point it at one that carries a "
+                f"C/C++ toolchain."
+            ))
+        if compiler_note:
+            notes.append(compiler_note)
+        compile_cmd = build_compile_cmd(
+            language,
+            source=source,
+            binary=BINARY_NAME,
+            build_flags=getattr(req, "build_flags", ""),
+            defines=getattr(req, "defines", ""),
+            include_dirs=getattr(req, "include_dirs", ""),
+            compiler=compiler,
+        )
     if compile_cmd is not None:
         import time as _time
         started = _time.monotonic()

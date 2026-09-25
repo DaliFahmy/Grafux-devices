@@ -415,16 +415,81 @@ def test_wait_until_ready_catches_an_image_error_before_the_pod_exits(fake_clock
         pod_client.wait_until_ready("rp_k", "pod-1", timeout_s=900, poll_s=5)
 
 
-def test_wait_until_ready_treats_exited_as_terminal(fake_clock_pod):
-    """EXITED for a non-image reason is still terminal — and still retryable."""
+def test_wait_until_ready_treats_exited_as_fatal_not_retryable(fake_clock_pod):
+    """
+    EXITED is terminal AND fatal.  This REVERSES the earlier behaviour, which made
+    it retryable: every Grafux image runs sshd in the foreground, so one of ours
+    never exits on its own, and both real causes (an image that cannot be pulled,
+    or a command that returns) are reproduced exactly by a fresh machine.  Hopping
+    only bought three pods and a slower failure.
+    """
     fake_clock_pod["pod"] = {
         "desiredStatus": "EXITED", "machineId": "m1",
         "image": VERIFY_IMAGE, "lastStatusChange": "container exited",
     }
+    with pytest.raises(pod_client.PodExitedError) as exc:
+        pod_client.wait_until_ready("rp_k", "pod-1", timeout_s=900, poll_s=5)
+    assert not isinstance(exc.value, pod_client.ProvisionError)
+    assert VERIFY_IMAGE in str(exc.value)
+    assert fake_clock_pod["t"] < 10
+
+
+def test_wait_until_ready_diagnoses_runpods_bare_exit_wording(fake_clock_pod):
+    """
+    The regression test for the bug this class was added for.
+
+    A cpu block was pointed at a tag that had never been pushed.  RunPod worded the
+    stop as a plain "Exited by Runpod: <date>" — which names no cause and matches no
+    entry in _IMAGE_ERROR_MARKERS — so it fell through to the retryable branch and
+    created three pods before blaming the machine's networking.
+    """
+    fake_clock_pod["pod"] = {
+        "desiredStatus": "EXITED", "machineId": "m1",
+        "image": VERIFY_IMAGE,
+        "lastStatusChange": "Exited by Runpod: Wed Sep 23 2026 22:36:39 GMT+0000 "
+                            "(Coordinated Universal Time)",
+    }
+    with pytest.raises(pod_client.PodExitedError) as exc:
+        pod_client.wait_until_ready("rp_k", "pod-1", timeout_s=900, poll_s=5)
+    message = str(exc.value)
+    # It must name the image, both causes, and that retrying is pointless.
+    assert VERIFY_IMAGE in message
+    assert "PUBLIC" in message
+    assert "retrying will not help" in message
+
+
+@pytest.mark.parametrize("status", ["TERMINATED", "FAILED"])
+def test_wait_until_ready_keeps_the_other_terminal_states_retryable(fake_clock_pod, status):
+    """Only EXITED moved. These can genuinely be the machine, so hopping may help."""
+    fake_clock_pod["pod"] = {
+        "desiredStatus": status, "machineId": "m1",
+        "image": VERIFY_IMAGE, "lastStatusChange": "stopped",
+    }
     with pytest.raises(pod_client.NoEndpointError) as exc:
         pod_client.wait_until_ready("rp_k", "pod-1", timeout_s=900, poll_s=5)
     assert isinstance(exc.value, pod_client.ProvisionError)
-    assert fake_clock_pod["t"] < 10
+
+
+def test_pod_exited_error_is_not_a_provision_error():
+    """The single fact provision_eda's handler ordering depends on."""
+    assert issubclass(pod_client.PodExitedError, RuntimeError)
+    assert not issubclass(pod_client.PodExitedError, pod_client.ProvisionError)
+
+
+def test_phase_from_pod_diagnoses_an_exited_pod():
+    """
+    The live status poll is what the BLOCK shows — it usually wins the race against
+    the provisioning thread, so a bare "pod entered status EXITED" here is what the
+    user actually reads. It must carry the same diagnosis as the wait path.
+    """
+    phase, detail = pod_client.phase_from_pod({
+        "id": "pod-1", "desiredStatus": "EXITED", "image": VERIFY_IMAGE,
+        "lastStatusChange": "Exited by Runpod: Wed Sep 23 2026 22:36:39 GMT+0000",
+    })
+    assert phase == "error"
+    assert VERIFY_IMAGE in detail
+    assert "PUBLIC" in detail
+    assert "pod entered status EXITED" not in detail
 
 
 def test_create_pod_rejects_a_missing_image_fatally(monkeypatch):
@@ -623,6 +688,35 @@ def test_provision_does_not_hop_machines_on_an_unpullable_image(monkeypatch, fak
     assert fake_pod["terminate"] == ["pod-1"]
     assert "PUBLIC" in result["errors"]
     assert VERIFY_IMAGE in result["errors"]
+
+
+def test_provision_does_not_hop_machines_on_an_exited_pod(monkeypatch, fake_pod):
+    """
+    The same three-pod burn, reached through the other door.
+
+    An unpullable image only raises ImagePullError when RunPod's wording matches a
+    known marker. When it says "Exited by Runpod: <date>" instead, the pod reaches
+    EXITED with no marker at all — and that path used to be retryable, so it cost
+    three pods for a fault no machine can fix.
+    """
+    monkeypatch.setenv("RUNPOD_API_KEY", "rp_env_key")
+    monkeypatch.setattr(runtime, "_RETRY_BACKOFF_S", 0)
+
+    def exited(api_key, pod_id, **kwargs):
+        raise pod_client.PodExitedError(
+            pod_client._exited_message(
+                VERIFY_IMAGE, pod_id, None,
+                "Exited by Runpod: Wed Sep 23 2026 22:36:39 GMT+0000",
+            )
+        )
+
+    monkeypatch.setattr(pod_client, "wait_until_ready", exited)
+    result = runtime.provision_eda(EdaSpec(kind="verilator"))
+    assert result["status"] == "error"
+    assert len(fake_pod["create"]) == 1          # NOT _PROVISION_ATTEMPTS
+    assert fake_pod["terminate"] == ["pod-1"]
+    assert VERIFY_IMAGE in result["errors"]
+    assert "retrying will not help" in result["errors"]
 
 
 def test_provision_terminates_on_an_unexpected_error(monkeypatch, fake_pod):

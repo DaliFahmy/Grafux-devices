@@ -111,6 +111,27 @@ class ImagePullError(RuntimeError):
     """
 
 
+class PodExitedError(RuntimeError):
+    """
+    The pod was placed and then its container exited — also a broken configuration.
+
+    Deliberately NOT a ProvisionError, for exactly the reason ImagePullError is not.
+    Every Grafux image runs sshd in the foreground (``start.sh``), so one of ours
+    never exits on its own; EXITED therefore means either the image could not be
+    pulled or its command returns immediately, and a different machine reproduces
+    both faithfully.
+
+    This class exists because ``_is_image_error`` cannot catch every wording. RunPod
+    reports an unpullable image as ``IMAGE_AUTH_ERROR`` *usually* — but it also
+    reports it as a plain ``"Exited by Runpod: <date>"``, which names no cause and
+    matches no marker.  That wording used to fall through to the retryable
+    NoEndpointError below, so a tag that had never been pushed created and destroyed
+    three pods before failing with a message about the machine's networking.
+
+    TERMINATED and FAILED stay retryable: those can genuinely be the machine.
+    """
+
+
 # Substrings (case-insensitive) in a RunPod create error body that mean the failure
 # is a transient *placement* problem a fresh attempt on another machine can fix.
 _CAPACITY_MARKERS = (
@@ -313,6 +334,15 @@ def phase_from_pod(pod: Dict[str, Any]) -> Tuple[str, str]:
             f"PUBLIC (RunPod pulls anonymously): {reason.strip()[:160]}"
         )
     status = (pod.get("desiredStatus") or pod.get("status") or "").upper()
+    # EXITED gets the same diagnosis the provisioning path gives, because this is
+    # the message the BLOCK shows: the live poll usually wins the race against the
+    # provisioning thread, so leaving it as a bare status here meant the user read
+    # "pod entered status EXITED: Exited by Runpod: <date>" and had nothing to act on.
+    if status == "EXITED":
+        return "error", _exited_message(
+            _pod_image(pod), str(pod.get("id") or ""), None,
+            str(pod.get("lastStatusChange") or ""),
+        )
     if status in _TERMINAL_STATUSES:
         detail = f"pod entered status {status}"
         last = str(pod.get("lastStatusChange") or "").strip()
@@ -582,12 +612,39 @@ def _image_error_message(
         f"{where}could not pull its image {image!r}: {reason.strip()[:300]} "
         "This is NOT a placement problem and retrying will not help. RunPod pulls "
         "ANONYMOUSLY, so the image must (a) exist at that exact tag — build and push "
-        "it (EDA/docker/Dockerfile.verify for the verify image, EDA/docker/Dockerfile "
-        "for the full EDA image; the 'Build verify image' GitHub Actions workflow does "
-        "both steps) — and (b) be readable with no credentials: on GitHub open the "
-        "package -> Package settings -> Change visibility -> PUBLIC. Or point the "
-        "block's 'image' port (or EDA_VERIFY_IMAGE / EDA_DEFAULT_IMAGE on the devices "
-        f"server) at an image that is already published.{tail}"
+        "it with the 'Build ... image' GitHub Actions workflow for this kind's image "
+        "(the Dockerfiles live in EDA/docker/ and CPU/docker/) — and (b) be readable "
+        "with no credentials: on GitHub open the package -> Package settings -> "
+        "Change visibility -> PUBLIC. Or point the block's 'image' port (or this "
+        "kind's *_DEFAULT_IMAGE on the devices server) at an image that is already "
+        f"published.{tail}"
+    )
+
+
+def _exited_message(image: str, pod_id: str = "", pod: Optional[Dict[str, Any]] = None,
+                    raw: str = "") -> str:
+    """
+    One wording for a pod whose container exited, shared by the wait and the poll.
+
+    RunPod's own text for this is often just "Exited by Runpod: <date>", which says
+    nothing a user can act on, so the causes are spelled out here.  They are ordered
+    by how often they are the answer: in practice this is nearly always an image
+    that was referenced before it was published.
+    """
+    where = f"Pod {pod_id} " if pod_id else "The pod "
+    detail = f" RunPod said: {raw.strip()[:160]}" if raw.strip() else ""
+    tail = f" {_status_summary(pod)}" if pod else ""
+    return (
+        f"{where}started and then its container EXITED immediately, so it never "
+        f"came up.{detail} This is NOT a placement problem and retrying will not "
+        f"help. Two things cause it, most likely first: (a) the image {image!r} "
+        "cannot be pulled — the tag must actually exist AND the package must be "
+        "readable with no credentials, because RunPod pulls ANONYMOUSLY (on GitHub: "
+        "open the package -> Package settings -> Change visibility -> PUBLIC); or "
+        "(b) the image's command exits instead of staying in the foreground — every "
+        "Grafux image ends in start.sh, which execs sshd -D. Point the block's "
+        "'image' port, or the kind's *_DEFAULT_IMAGE on the devices server, at an "
+        f"image that is already published.{tail}"
     )
 
 
@@ -626,6 +683,14 @@ def wait_until_ready(
                 _image_error_message(_pod_image(last), image_reason, pod_id, last)
             )
         status = (last.get("desiredStatus") or last.get("status") or "").upper()
+        # EXITED is split off from the other terminal states and is FATAL: one of
+        # ours never exits on its own, so it is a broken image, which a fresh
+        # machine reproduces exactly. See PodExitedError.
+        if status == "EXITED":
+            raise PodExitedError(
+                _exited_message(_pod_image(last), pod_id, last,
+                                str(last.get("lastStatusChange") or ""))
+            )
         if status in _TERMINAL_STATUSES:
             raise NoEndpointError(
                 f"Pod {pod_id} entered status {status}. {_status_summary(last)}"

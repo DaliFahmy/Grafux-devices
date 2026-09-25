@@ -32,23 +32,32 @@ from pydantic import Field
 
 from EDA.models import _RunBase, register_kind_image
 
-# The post-silicon image: a C/C++ toolchain, Python 3, /usr/bin/time, and the
-# sshd + PUBLIC_KEY contract every pod in this codebase is reached through.
+# The image a cpu pod runs: a C/C++ toolchain, Python 3, and the sshd +
+# PUBLIC_KEY contract every pod in this codebase is reached through.
 #
-# WHY A CUSTOM IMAGE AT ALL, when the toolchain is just gcc.  RunPod's own images
-# ship openssh-server plus a start script that installs the ``PUBLIC_KEY`` env var
-# into authorized_keys; an arbitrary stock image has neither, so a pod built from
-# one comes up RUNNING with nothing listening on port 22 and wait_until_ready
-# reports "this machine does not provide direct public-IP networking" — an error
-# that points nowhere near the cause.  ``docker/Dockerfile`` here adds that
-# contract.  Pinning also pins the compiler and libc versions, which is what makes
-# two benchmark numbers from different days comparable at all.
+# THIS IS THE VERIFY IMAGE, ON PURPOSE.  ``docker/Dockerfile`` beside this file
+# builds a purpose-made grafux-cpu image, and this default deliberately does NOT
+# point at it: that tag was referenced here before it had ever been built and
+# pushed, so every Regenerate asked RunPod for an image that does not exist, and
+# RunPod stopped the pod with a bare "Exited by Runpod" that named no cause.  A
+# default must point at something that is actually published.
+#
+# The verify image carries everything CPU/flow.py invokes -- its runtime stage
+# installs `g++ make perl python3 python3-venv` on ubuntu:22.04 (g++ pulls in gcc
+# and libc6-dev), plus the same start.sh sshd contract -- and it is already public
+# on GHCR, which matters because RunPod pulls ANONYMOUSLY.
+#
+# THE ONE THING IT LACKS is /usr/bin/time, so `benchmark.max_rss_kb` reads 0.
+# Nothing else is affected: every timing comes from the pod's own nanosecond clock
+# in build_bench_script, not from `time`, and run_cpu already tolerates the binary
+# being absent.  To get peak RSS, run the "Build CPU image" workflow, make the new
+# GHCR package PUBLIC, and set CPU_DEFAULT_IMAGE (or this default) to that tag.
 #
 # PIN THE TAG, for the same reason EDA_DEFAULT_IMAGE and GPU_DEFAULT_IMAGE are
 # pinned: an unpinned image changes under you and breaks provisioning silently.
 DEFAULT_CPU_IMAGE = os.environ.get(
     "CPU_DEFAULT_IMAGE",
-    "ghcr.io/dalifahmy/grafux-cpu:gcc11-20260922",
+    "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903",
 )
 
 # The languages a verification case can be written in.  Assembly is deliberately
