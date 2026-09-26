@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "slug": "openram",
+  "name": "OpenRAM (custom)",
+  "version": "1.0.0",
+  "description": "Compile an SRAM macro with OpenRAM: memory parameters in, GDS/LEF/Liberty/Verilog model/SPICE out. The hand-written reference a Generator run is judged against.",
+  "source": { "repo": "https://github.com/VLSIDA/OpenRAM", "ref": "stable", "commit": "d909181" },
+  "runtime": {
+    "compute": "cpu",
+    "instance_type": "cpu3c-8",
+    "disk_gb": 30,
+    "image": "ghcr.io/dalifahmy/grafux-gen:example-openram-1",
+    "timeout_s": 3600,
+    "entry": "/opt/grafux/run.sh"
+  },
+  "inputs": [
+    { "name": "config", "type": "text", "description": "A whole OpenRAM config; when set it overrides every parameter below." },
+    { "name": "word_size", "type": "int", "default": "2", "description": "Bits per word." },
+    { "name": "num_words", "type": "int", "default": "16", "description": "Number of words." },
+    { "name": "num_banks", "type": "int", "default": "1" },
+    { "name": "num_rw_ports", "type": "int", "default": "1" },
+    { "name": "num_r_ports", "type": "int", "default": "0" },
+    { "name": "num_w_ports", "type": "int", "default": "0" },
+    { "name": "write_size", "type": "int", "description": "Write-mask granularity in bits; empty = no mask." },
+    { "name": "tech_name", "type": "enum", "default": "scn4m_subm",
+      "choices": ["scn4m_subm", "scn3me_subm", "freepdk45", "gf180mcu", "sky130"] },
+    { "name": "output_name", "type": "text", "default": "sram", "description": "Macro (module) name." },
+    { "name": "process_corners", "type": "text", "description": "Comma-separated, e.g. TT,SS." },
+    { "name": "supply_voltages", "type": "text", "description": "Comma-separated volts." },
+    { "name": "temperatures", "type": "text", "description": "Comma-separated degrees C." },
+    { "name": "check_lvsdrc", "type": "bool", "default": "false" },
+    { "name": "netlist_only", "type": "bool", "default": "false" },
+    { "name": "extra_config", "type": "text", "description": "Appended to the generated config." }
+  ],
+  "outputs": [
+    { "name": "top", "kind": "text" },
+    { "name": "tech_name", "kind": "text" },
+    { "name": "verilog_model", "kind": "text", "description": "Behavioural Verilog model; wire to verilator.rtl." },
+    { "name": "spice", "kind": "artifact", "glob": "files/*.sp" },
+    { "name": "gds", "kind": "artifact", "glob": "files/*.gds" },
+    { "name": "lef", "kind": "artifact", "glob": "files/*.lef" },
+    { "name": "lib", "kind": "artifact", "glob": "files/*.lib" },
+    { "name": "datasheet", "kind": "artifact", "glob": "files/*.html" },
+    { "name": "config", "kind": "text", "description": "The config OpenRAM actually ran." },
+    { "name": "stats", "kind": "text" }
+  ],
+  "status": { "require_outputs": ["gds"] },
+  "selftest": {
+    "inputs": { "word_size": "2", "num_words": "16", "tech_name": "scn4m_subm" },
+    "expect_outputs": ["gds", "lef", "lib", "verilog_model", "spice"]
+  }
+}

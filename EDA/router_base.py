@@ -92,6 +92,7 @@ def make_router(
     pdk_choices: Optional[Sequence[str]] = None,
     default_pdk: Optional[str] = None,
     instances: Optional[Callable[[], Sequence[Dict[str, Any]]]] = None,
+    check_spec: Optional[Callable[[EdaSpec], EdaSpec]] = None,
 ) -> APIRouter:
     """
     Build the REST router for one EDA block type.
@@ -105,14 +106,23 @@ def make_router(
     ``instances`` overrides the machine list ``GET /{kind}/instances`` answers.
     It exists for cpu, whose machine IS the measurement and so offers every
     RunPod CPU flavour, where the EDA kinds keep their short compute-first list.
+
+    ``check_spec`` runs on every create AFTER ``_coerce_kind`` and may raise an
+    ``HTTPException`` to refuse it.  It exists for custom, which has no default
+    image: letting the ORFS fallback through would rent a pod that boots fine and
+    has nothing to run.
     """
     list_machines = instances if instances is not None else pod_client.list_instances
+
+    def _prepare(spec: EdaSpec) -> EdaSpec:
+        spec = _coerce_kind(spec, kind)
+        return check_spec(spec) if check_spec is not None else spec
     router = APIRouter(prefix=f"/{kind}", tags=[kind])
 
     @router.post("/create", response_model=CreateEdaResponse)
     def create(spec: EdaSpec) -> CreateEdaResponse:
         """Provision a pod from the block's config ports (Regenerate, blocking)."""
-        return CreateEdaResponse(**runtime.provision_eda(_coerce_kind(spec, kind)))
+        return CreateEdaResponse(**runtime.provision_eda(_prepare(spec)))
 
     @router.post("/create_async", response_model=CreateEdaResponse)
     def create_async(spec: EdaSpec) -> CreateEdaResponse:
@@ -123,7 +133,7 @@ def make_router(
         (or ``error``), so a multi-minute image pull shows live phases instead of
         a blocking wait.
         """
-        return CreateEdaResponse(**runtime.provision_eda_async(_coerce_kind(spec, kind)))
+        return CreateEdaResponse(**runtime.provision_eda_async(_prepare(spec)))
 
     # Declared before "/{eda_id}" so the literal paths are not swallowed by the
     # path parameter — FastAPI matches in declaration order.

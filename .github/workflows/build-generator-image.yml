@@ -1,0 +1,61 @@
+# Build and publish the Generator SANDBOX image (Claude Code + Codex + git + sshd).
+#
+# MANUAL STEP AFTER THE FIRST RUN: make the package public at
+#   https://github.com/users/DaliFahmy/packages/container/grafux-generator/settings
+# RunPod pulls anonymously. The devices server also checks this before every
+# session (GENERATOR/models.py image_published) and refuses with this reason.
+name: Build generator image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: MUST match GENERATOR_IMAGE (GENERATOR/models.py / render.yaml).
+        required: true
+        default: "v1-20260926"
+      claude_code_version:
+        description: "@anthropic-ai/claude-code version (pin it)"
+        required: true
+        default: "latest"
+      codex_version:
+        description: "@openai/codex version (pin it)"
+        required: true
+        default: "latest"
+
+env:
+  IMAGE: ghcr.io/dalifahmy/grafux-generator
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: GENERATOR/docker
+          platforms: linux/amd64
+          build-args: |
+            CLAUDE_CODE_VERSION=${{ inputs.claude_code_version }}
+            CODEX_VERSION=${{ inputs.codex_version }}
+          tags: ${{ env.IMAGE }}:${{ inputs.tag }}
+          load: true
+      - name: Smoke-test the image
+        run: |
+          docker run --rm "${IMAGE}:${{ inputs.tag }}" bash -lc \
+            'command -v sshd git node claude codex && claude --version && codex --version && test -x /start.sh' \
+            | tee /tmp/versions.txt
+          { echo '### CLI versions in this image'; echo '```'; cat /tmp/versions.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - run: docker push "${IMAGE}:${{ inputs.tag }}"
+      - name: Verify the package is anonymously pullable
+        run: |
+          body=$(curl -sS "https://ghcr.io/token?scope=repository:dalifahmy/grafux-generator:pull&service=ghcr.io")
+          echo "$body" | grep -q '"token"' || { echo "::error::grafux-generator is private; make it public (see header)"; exit 1; }

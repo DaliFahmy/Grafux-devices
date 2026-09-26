@@ -255,3 +255,24 @@ services:
       # measurements taken a month apart quietly stop being comparable.
       - key: CPU_DEFAULT_IMAGE
         value: "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903"
+      # GENERATOR -- Claude Code / Codex build "custom" blocks from a repo + an idea.
+      # The sandbox image must be PUBLISHED and PUBLIC before it is used; the
+      # server checks and refuses a session with the reason if it is not.
+      - key: GENERATOR_IMAGE
+        value: "ghcr.io/dalifahmy/grafux-generator:v1-20260926"
+      - key: GENERATOR_INSTANCE
+        value: "cpu3c-4"
+      # Image builds run in GitHub Actions (GENERATOR/builds-repo/README.md).
+      # Without these two, Plan mode works and Edit mode explains what is missing.
+      - key: GENERATOR_GITHUB_TOKEN
+        sync: false
+      - key: GENERATOR_BUILDS_REPO
+        sync: false
+      - key: GENERATOR_IMAGE_REPO
+        value: "ghcr.io/dalifahmy/grafux-gen"
+      # Validate/build/smoke repair turns before handing back to the user, and
+      # whether a verified block must also pass one real run on a fresh pod.
+      - key: GENERATOR_MAX_REPAIRS
+        value: "4"
+      - key: GENERATOR_SMOKE_RUN
+        value: "1"

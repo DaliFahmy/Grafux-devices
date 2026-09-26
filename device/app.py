@@ -147,6 +147,25 @@ try:
 except Exception as exc:  # noqa: BLE001 — never let CPU imports break device serving
     logger.warning("CPU router not mounted: %s", exc)
 
+# CUSTOM -- manifest-defined blocks (the Generator's output).  Same reuse of EDA's
+# plumbing as CPU, and its own try/except for the same reason.
+try:
+    from CUSTOM.router import router as custom_router
+
+    app.include_router(custom_router)
+    logger.info("CUSTOM router mounted at /custom")
+except Exception as exc:  # noqa: BLE001 — never let CUSTOM imports break device serving
+    logger.warning("CUSTOM router not mounted: %s", exc)
+
+# GENERATOR -- Claude Code / Codex turn a repo + an idea into a custom block.
+try:
+    from GENERATOR.router import router as generator_router
+
+    app.include_router(generator_router)
+    logger.info("GENERATOR router mounted at /generator")
+except Exception as exc:  # noqa: BLE001 — never let GENERATOR imports break device serving
+    logger.warning("GENERATOR router not mounted: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint
