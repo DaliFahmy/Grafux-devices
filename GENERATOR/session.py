@@ -40,6 +40,7 @@ from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 from CUSTOM.manifest import parse_manifest
 
 from . import agents, contract
+from .models import AGENT_PROVIDER, resolve_agent_key
 
 logger = logging.getLogger("generator.session")
 
@@ -103,8 +104,13 @@ class GeneratorSession:
         self.idea = req.prompt
         self.repo_url, self.ref = parse_repo_url(req.repo_url)
         self.api_keys = req.api_keys
-        self._keys = {"ANTHROPIC_API_KEY": (req.anthropic_api_key or "").strip(),
-                      "OPENAI_API_KEY": (req.openai_api_key or "").strip()}
+        # The user's key if they gave one, else Grafux's (GENERATOR_* then the
+        # general server key) -- see models.resolve_agent_key.
+        anthropic, anthropic_src = resolve_agent_key("anthropic", req.anthropic_api_key)
+        openai, openai_src = resolve_agent_key("openai", req.openai_api_key)
+        self._keys = {"ANTHROPIC_API_KEY": anthropic, "OPENAI_API_KEY": openai}
+        self.key_source = {"anthropic": anthropic_src, "openai": openai_src}
+        self._announced_key = False
         self.sandbox, self.builder, self.smoke = sandbox, builder, smoke
         self.max_repairs = max_repairs
         self.state = "starting"
@@ -184,6 +190,14 @@ class GeneratorSession:
         if mode not in agents.MODES:
             raise ValueError("mode must be plan or edit")
         self.emit("user", shown or text, mode=mode)
+        if not self._announced_key:
+            self._announced_key = True
+            provider = AGENT_PROVIDER.get(self.agent, "anthropic")
+            label = "Anthropic" if provider == "anthropic" else "OpenAI"
+            src = self.key_source.get(provider, "")
+            if src:
+                whose = "your" if src == "user" else "Grafux's"
+                self.emit("info", f"Using {whose} {label} key.", key_source=src, provider=provider)
         self._thread = threading.Thread(target=self._turn, args=(text, mode),
                                         name=f"generator-{self.id}", daemon=True)
         self._thread.start()
@@ -251,11 +265,13 @@ class GeneratorSession:
 
     def _agent_turn(self, text: str, mode: str) -> bool:
         if self.agent == "claude_code" and not self._keys["ANTHROPIC_API_KEY"]:
-            self.emit("error", "Claude Code needs your Anthropic API key (Generator settings).")
+            self.emit("error", "No Anthropic key: add yours in the Generator settings (⚙), or ask "
+                               "the admin to set GENERATOR_ANTHROPIC_API_KEY on the devices server.")
             self.set_state("awaiting_user")
             return False
         if self.agent == "codex" and not self._keys["OPENAI_API_KEY"]:
-            self.emit("error", "Codex needs your OpenAI API key (Generator settings).")
+            self.emit("error", "No OpenAI key: add yours in the Generator settings (⚙), or ask "
+                               "the admin to set GENERATOR_OPENAI_API_KEY on the devices server.")
             self.set_state("awaiting_user")
             return False
         self.set_state("agent", f"{self.agent} is working ({mode} mode)")

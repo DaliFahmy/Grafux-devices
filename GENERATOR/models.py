@@ -44,6 +44,34 @@ class CreateSessionRequest(BaseModel):
     api_keys: str = ""
 
 
+# Which provider each agent bills, and the env vars that hold GRAFUX's key for it.
+# The dedicated GENERATOR_* key is tried first on purpose: the sandbox also runs
+# code from the user's repo, so a key placed there can be read by it.  Grafux's
+# key for this job should be a separate, spend-limited one; the general key the
+# claw block uses is only the fallback.
+AGENT_PROVIDER = {"claude_code": "anthropic", "codex": "openai"}
+_SERVER_KEY_ENV = {
+    "anthropic": ("GENERATOR_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
+    "openai": ("GENERATOR_OPENAI_API_KEY", "OPENAI_API_KEY"),
+}
+
+
+def resolve_agent_key(provider: str, given: str = "") -> Tuple[str, str]:
+    """
+    ``(key, source)`` for a provider: the user's key if they gave one, else
+    Grafux's.  ``source`` is "user", "grafux" or "" (no key anywhere).  The same
+    order the claw/gpu/eda runtimes use: the block's key first, then the server's.
+    """
+    given = (given or "").strip()
+    if given:
+        return given, "user"
+    for name in _SERVER_KEY_ENV.get(provider, ()):
+        value = (os.environ.get(name) or "").strip()
+        if value:
+            return value, "grafux"
+    return "", ""
+
+
 class MessageRequest(BaseModel):
     text: str
     mode: str = "edit"

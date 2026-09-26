@@ -102,6 +102,17 @@ class FakeBuilder:
         return self.results.pop(0)
 
 
+SERVER_KEY_VARS = ("GENERATOR_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY",
+                   "GENERATOR_OPENAI_API_KEY", "OPENAI_API_KEY")
+
+
+@pytest.fixture(autouse=True)
+def _no_server_keys(monkeypatch):
+    """Each test decides which server keys exist; the developer's env must not leak in."""
+    for name in SERVER_KEY_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+
 def _req(**kw):
     base = dict(agent="claude_code", mode="edit", prompt="a demo block",
                 repo_url="https://github.com/VLSIDA/OpenRAM/tree/stable",
@@ -256,7 +267,8 @@ def test_missing_builder_or_key_or_sandbox_are_explained():
     assert s.state == "error" and "builder is not configured" in s.events[-2]["text"]
 
     s2, _ = _run(write_good, anthropic_api_key="")
-    assert any("needs your Anthropic API key" in e["text"] for e in s2.events)
+    assert any("No Anthropic key" in e["text"] and "GENERATOR_ANTHROPIC_API_KEY" in e["text"]
+               for e in s2.events)
 
     sb = FakeSandbox(write_good, ensure_error="image not published")
     s3 = gsession.GeneratorSession(_req(), sandbox=sb)
@@ -309,3 +321,38 @@ def test_registry_sweeps_idle_sessions():
 def test_summary_shape():
     s = gsession.GeneratorSession(_req(), sandbox=FakeSandbox(write_good))
     assert set(s.summary()) >= {"session_id", "state", "busy", "last_seq", "verified"}
+
+
+SERVER_KEY = "sk-ant-GRAFUX-SERVER-KEY-0987654321"
+
+
+def test_without_a_user_key_the_session_runs_on_grafuxs_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SERVER_KEY)
+    s, sb = _run(write_good, builder=FakeBuilder([ok_build()]),
+                 smoke=lambda m, **k: (True, "", False), anthropic_api_key="")
+    assert s.state == "done", s.events
+    assert SERVER_KEY in sb.written[gsession.KEYS_FILE]
+    info = next(e for e in s.events if e["kind"] == "info")
+    assert info["text"] == "Using Grafux's Anthropic key." and info["data"]["key_source"] == "grafux"
+    blob = json.dumps(s.events)
+    assert SERVER_KEY not in blob and all(SERVER_KEY not in c for c in sb.commands)
+
+
+@pytest.mark.parametrize("env,given,expected,source", [
+    ({"ANTHROPIC_API_KEY": "general"}, "", "general", "grafux"),
+    ({"ANTHROPIC_API_KEY": "general", "GENERATOR_ANTHROPIC_API_KEY": "dedicated"}, "",
+     "dedicated", "grafux"),
+    ({"GENERATOR_ANTHROPIC_API_KEY": "dedicated"}, "  mine  ", "mine", "user"),
+    ({"ANTHROPIC_API_KEY": "   "}, "", "", ""),
+])
+def test_key_precedence(monkeypatch, env, given, expected, source):
+    from GENERATOR.models import resolve_agent_key
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert resolve_agent_key("anthropic", given) == (expected, source)
+
+
+def test_a_user_key_is_announced_as_theirs():
+    s, _ = _run(write_good, mode="plan")
+    info = next(e for e in s.events if e["kind"] == "info")
+    assert info["text"] == "Using your Anthropic key."

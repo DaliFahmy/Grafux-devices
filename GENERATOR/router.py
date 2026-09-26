@@ -24,7 +24,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from . import agents
 from .builder import BuilderNotConfigured, GitHubBuilder
-from .models import CreateSessionRequest, MessageRequest
+from .models import CreateSessionRequest, MessageRequest, resolve_agent_key
 from .session import GeneratorSession, PodSandbox, run_smoke, sessions, SMOKE_ENABLED
 
 router = APIRouter(prefix="/generator", tags=["generator"])
@@ -56,10 +56,12 @@ def _get(sid: str) -> GeneratorSession:
 def list_agents() -> Dict[str, Any]:
     return {
         "agents": [
+            # server_key: Grafux holds a key for this agent, so the user's is optional.
+            # A boolean only -- the key itself never leaves the server this way.
             {"id": "claude_code", "label": "Claude Code", "models": agents.MODELS["claude_code"],
-             "key": "anthropic_api_key"},
+             "key": "anthropic_api_key", "server_key": bool(resolve_agent_key("anthropic")[0])},
             {"id": "codex", "label": "Codex (experimental)", "models": agents.MODELS["codex"],
-             "key": "openai_api_key"},
+             "key": "openai_api_key", "server_key": bool(resolve_agent_key("openai")[0])},
         ],
         "modes": list(agents.MODES),
         "builder_configured": make_builder() is not None,

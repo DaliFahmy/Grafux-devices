@@ -262,6 +262,17 @@ services:
         value: "ghcr.io/dalifahmy/grafux-generator:v1-20260926"
       - key: GENERATOR_INSTANCE
         value: "cpu3c-4"
+      # Grafux's model keys for the Generator, used when the user leaves theirs empty.
+      # Order: the user's key, then GENERATOR_*_API_KEY, then the general
+      # ANTHROPIC_API_KEY / OPENAI_API_KEY. Prefer the dedicated, SPEND-LIMITED
+      # GENERATOR_* keys: the agent's sandbox also runs the user's repo code, which
+      # can read any key placed there.
+      - key: GENERATOR_ANTHROPIC_API_KEY
+        sync: false
+      - key: GENERATOR_OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
       # Image builds run in GitHub Actions (GENERATOR/builds-repo/README.md).
       # Without these two, Plan mode works and Edit mode explains what is missing.
       - key: GENERATOR_GITHUB_TOKEN

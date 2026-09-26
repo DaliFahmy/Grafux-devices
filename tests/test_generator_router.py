@@ -6,6 +6,7 @@ smoke seams replaced so no pod, GitHub or LLM is touched.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -44,10 +45,17 @@ def _wait(client, sid, until=lambda b: not b["busy"]):
     raise AssertionError("session never settled")
 
 
-def test_agents_catalogue(client):
+def test_agents_catalogue(client, monkeypatch):
+    for name in ("GENERATOR_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY",
+                 "GENERATOR_OPENAI_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-server-secret-123")
     body = client.get("/generator/agents").json()
     assert [a["id"] for a in body["agents"]] == ["claude_code", "codex"]
     assert body["modes"] == ["plan", "edit"]
+    # Whether Grafux holds a key -- never the key itself.
+    assert [a["server_key"] for a in body["agents"]] == [True, False]
+    assert "sk-ant-server-secret-123" not in json.dumps(body)
 
 
 def test_plan_then_edit_then_result(client):
