@@ -300,7 +300,6 @@ def repair_prompt(stage: str, detail: str) -> str:
     heading = {
         "validate": "Your files in /workspace/gen were rejected before building:",
         "build": "The image build failed. The tail of the build log:",
-        "smoke": "The image built, but a real run of the block on a fresh pod failed:",
     }.get(stage, "The last attempt failed:")
     return (f"{heading}\n\n{detail.strip()}\n\nFix the files in {GEN_DIR} (edit them in place) and "
             "stop. Do not weaken the selftest to make it pass -- make the block produce its outputs.")

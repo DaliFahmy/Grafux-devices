@@ -256,34 +256,34 @@ services:
       - key: CPU_DEFAULT_IMAGE
         value: "ghcr.io/dalifahmy/grafux-verify:v5050-cocotb20-20260903"
       # GENERATOR -- Claude Code / Codex build "custom" blocks from a repo + an idea.
-      # The sandbox image must be PUBLISHED and PUBLIC before it is used; the
-      # server checks and refuses a session with the reason if it is not.
-      - key: GENERATOR_IMAGE
-        value: "ghcr.io/dalifahmy/grafux-generator:v1-20260926"
-      - key: GENERATOR_INSTANCE
-        value: "cpu3c-4"
+      # It rents NO RunPod pod: each agent turn is a GitHub Actions job and the
+      # image is built by another (GENERATOR/builds-repo/README.md). A block's
+      # pod is created only by its Regenerate, like cpu / openram / verilator.
+      #
       # Grafux's model keys for the Generator, used when the user leaves theirs empty.
       # Order: the user's key, then GENERATOR_*_API_KEY, then the general
       # ANTHROPIC_API_KEY / OPENAI_API_KEY. Prefer the dedicated, SPEND-LIMITED
-      # GENERATOR_* keys: the agent's sandbox also runs the user's repo code, which
-      # can read any key placed there.
+      # GENERATOR_* keys: the agent job also runs the user's repo code, which can
+      # read any key placed there.
       - key: GENERATOR_ANTHROPIC_API_KEY
         sync: false
       - key: GENERATOR_OPENAI_API_KEY
         sync: false
       - key: OPENAI_API_KEY
         sync: false
-      # Image builds run in GitHub Actions (GENERATOR/builds-repo/README.md).
-      # Without these two, Plan mode works and Edit mode explains what is missing.
+      # The builds repo that runs both jobs, and a token scoped to it
+      # (Contents + Actions read/write). Without them the Generator refuses with
+      # the list of what is missing.
       - key: GENERATOR_GITHUB_TOKEN
         sync: false
       - key: GENERATOR_BUILDS_REPO
         sync: false
+      # Fernet key sealing the model key + callback token handed to the agent job.
+      # The SAME value must be the builds repo's GENERATOR_WRAP_KEY secret.
+      - key: GENERATOR_WRAP_KEY
+        sync: false
       - key: GENERATOR_IMAGE_REPO
         value: "ghcr.io/dalifahmy/grafux-gen"
-      # Validate/build/smoke repair turns before handing back to the user, and
-      # whether a verified block must also pass one real run on a fresh pod.
+      # Repair turns (validate/build failures) before handing back to the user.
       - key: GENERATOR_MAX_REPAIRS
         value: "4"
-      - key: GENERATOR_SMOKE_RUN
-        value: "1"

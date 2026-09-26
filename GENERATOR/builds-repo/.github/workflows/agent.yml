@@ -1,0 +1,180 @@
+# Runs ONE Generator agent turn (Claude Code or Codex). Dispatched by the devices
+# server (GENERATOR/actions.py). No RunPod pod is involved: pods are rented only
+# by a block's Regenerate.
+#
+# The server has already committed everything this job needs to branch
+# session/<session_id>:
+#   gen/**            the block's files so far (the agent edits these)
+#   .grafux/state/**  the CLI's session transcripts, so --resume works across jobs
+#   .grafux/run.sh    the exact agent command (built by the server, just executed here)
+#   .grafux/prompt.md, .grafux/system.md, .grafux/turn.json
+#
+# `sealed` is Fernet-encrypted with the GENERATOR_WRAP_KEY secret. It holds the
+# model key and the callback URL + token. Inputs are readable by anyone who can
+# read this repo, so nothing sensitive is passed in clear.
+#
+# The run-name is load-bearing: a dispatch returns no run id, so the server
+# finds this run by its title "agent <session>-<turn>".
+name: Generator agent turn
+run-name: agent ${{ inputs.session_id }}-${{ inputs.turn }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_id:
+        required: true
+      turn:
+        required: true
+      sealed:
+        required: true
+
+concurrency:
+  group: generator-session-${{ inputs.session_id }}
+  cancel-in-progress: false
+
+jobs:
+  turn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      # persist-credentials: false -- the agent (and the repo code it may run)
+      # must never hold this repo's GITHUB_TOKEN. Only the final step gets it.
+      - uses: actions/checkout@v4
+        with:
+          ref: session/${{ inputs.session_id }}
+          path: turn
+          persist-credentials: false
+
+      - name: Unseal
+        env:
+          SEALED: ${{ inputs.sealed }}
+          WRAP: ${{ secrets.GENERATOR_WRAP_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check cryptography
+          mkdir -p /tmp/grafux && chmod 700 /tmp/grafux
+          python3 - <<'PY'
+          import json, os, shlex
+          from cryptography.fernet import Fernet
+          d = json.loads(Fernet(os.environ["WRAP"].encode()).decrypt(os.environ["SEALED"].encode()))
+          for v in d.values():
+              if isinstance(v, str) and v:
+                  print(f"::add-mask::{v}")
+          with open("/tmp/grafux/keys.env", "w") as f:
+              for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+                  if d.get(k):
+                      f.write(f"{k}={shlex.quote(d[k])}\n")
+          with open("/tmp/grafux/callback.json", "w") as f:
+              json.dump({"url": d.get("callback_url", ""), "token": d.get("callback_token", "")}, f)
+          PY
+          chmod 600 /tmp/grafux/*
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the agent CLI
+        run: |
+          set -euo pipefail
+          agent=$(jq -r .agent turn/.grafux/turn.json)
+          version=$(jq -r --arg a "$agent" '.cli_versions[$a] // "latest"' turn/.grafux/turn.json)
+          if [ "$agent" = "claude_code" ]; then
+            npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${version}"
+            claude --version
+          else
+            npm install -g --no-fund --no-audit "@openai/codex@${version}"
+            codex --version
+          fi
+
+      # Same paths the prompts use (/workspace/src, /workspace/gen).
+      - name: Prepare the workspace
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /workspace && sudo chown "$USER" /workspace
+          mkdir -p /workspace/gen /workspace/src /workspace/.grafux
+          [ -d turn/gen ] && cp -a turn/gen/. /workspace/gen/ || true
+          cp turn/.grafux/prompt.md turn/.grafux/system.md turn/.grafux/run.sh /workspace/.grafux/
+          cp /tmp/grafux/keys.env /workspace/.grafux/keys.env
+          chmod 600 /workspace/.grafux/keys.env
+          repo=$(jq -r .repo_url turn/.grafux/turn.json)
+          ref=$(jq -r .ref turn/.grafux/turn.json)
+          if [ -n "$repo" ]; then
+            if [ -n "$ref" ]; then
+              git clone --depth 1 --branch "$ref" "$repo" /workspace/src
+            else
+              git clone --depth 1 "$repo" /workspace/src
+            fi
+            echo "cloned $repo @ ${ref:-default} ($(git -C /workspace/src rev-parse --short HEAD))"
+          fi
+          mkdir -p ~/.claude/projects ~/.codex/sessions
+          [ -d turn/.grafux/state/claude ] && cp -a turn/.grafux/state/claude/. ~/.claude/projects/ || true
+          [ -d turn/.grafux/state/codex ] && cp -a turn/.grafux/state/codex/. ~/.codex/sessions/ || true
+
+      # The agent's JSONL goes to a file AND, in batches, to the devices server
+      # (the live view in the Generator panel). A callback failure never fails
+      # the turn: the server reads agent.jsonl back from the branch afterwards.
+      - name: Run the agent
+        env:
+          TURN: ${{ inputs.turn }}
+        run: |
+          cat > /tmp/grafux/forward.py <<'PY'
+          import json, sys, time, urllib.request
+          cb = json.load(open("/tmp/grafux/callback.json"))
+          turn = int(sys.argv[2])
+          out = open(sys.argv[1], "w")
+          buf, n, last = [], 0, time.monotonic()
+          def flush():
+              global buf, last
+              last = time.monotonic()
+              if not buf or not cb.get("url"):
+                  buf = []
+                  return
+              body = json.dumps({"token": cb["token"], "turn": turn, "lines": buf}).encode()
+              req = urllib.request.Request(cb["url"], data=body, method="POST",
+                                           headers={"Content-Type": "application/json"})
+              try:
+                  urllib.request.urlopen(req, timeout=10).read()
+              except Exception as exc:
+                  print(f"(live view unavailable: {exc})", file=sys.stderr)
+              buf = []
+          for line in sys.stdin:
+              line = line.rstrip("\n")
+              out.write(line + "\n"); out.flush()
+              buf.append({"n": n, "line": line}); n += 1
+              if len(buf) >= 40 or time.monotonic() - last > 2:
+                  flush()
+          flush()
+          PY
+          set +e
+          bash /workspace/.grafux/run.sh 2>&1 | python3 /tmp/grafux/forward.py /workspace/.grafux/agent.jsonl "$TURN"
+          echo "${PIPESTATUS[0]}" > /workspace/.grafux/exit_code
+          echo "agent exited $(cat /workspace/.grafux/exit_code)"
+          exit 0
+
+      - name: Save the turn
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -f /workspace/.grafux/keys.env
+          cd turn
+          rm -rf .grafux/state .grafux/out
+          mkdir -p gen .grafux/state/claude .grafux/state/codex .grafux/out
+          # A Plan turn never changes the block (the server enforces this too).
+          if [ "$(jq -r .mode .grafux/turn.json)" != "plan" ]; then
+            rm -rf gen && mkdir gen
+            cp -a /workspace/gen/. gen/ 2>/dev/null || true
+            rm -rf gen/.git
+          fi
+          cp -a ~/.claude/projects/. .grafux/state/claude/ 2>/dev/null || true
+          cp -a ~/.codex/sessions/. .grafux/state/codex/ 2>/dev/null || true
+          cp /workspace/.grafux/agent.jsonl /workspace/.grafux/exit_code .grafux/out/ 2>/dev/null || true
+          git config user.name "grafux-generator"
+          git config user.email "generator@grafux.invalid"
+          git add -A
+          git commit -qm "turn ${{ inputs.turn }}" --allow-empty
+          git push -q "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" \
+            "HEAD:session/${{ inputs.session_id }}"

@@ -17,3 +17,5 @@ segno>=1.5.2
 # paramiko powers the SSH compile-and-run loop in GPU/runpod_client.py (httpx above
 # is reused for the RunPod REST API). Pinned here because Render installs this file.
 paramiko>=3.0
+# GENERATOR seals the model key + callback token for the agent job (Fernet).
+cryptography>=41

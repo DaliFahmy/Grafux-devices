@@ -28,9 +28,9 @@ Claude Code  ``claude -p PROMPT --output-format stream-json --verbose``
 Codex        ``codex exec --json --skip-git-repo-check -m MODEL
              --sandbox danger-full-access PROMPT``; resume is
              ``codex exec resume ID PROMPT``.  Its own sandbox (bubblewrap +
-             landlock) cannot start in an unprivileged container, so the POD is
-             the sandbox and plan mode is enforced by the caller (it reverts the
-             workspace after a plan turn), not by the flag.  Events:
+             landlock) cannot start in an unprivileged container, so the Actions
+             runner is the sandbox and plan mode is enforced by the caller (the
+             session discards a plan turn's files), not by the flag.  Events:
              ``thread.started`` (thread_id), ``item.completed`` with item.type
              agent_message / reasoning / command_execution / file_change,
              ``turn.completed``, ``turn.failed``, ``error``.
@@ -52,8 +52,8 @@ MODELS = {
     "codex": ["gpt-5-codex", "gpt-5"],
 }
 
-# Tools Claude Code may use without asking in EDIT mode.  The pod is a throwaway
-# sandbox holding only the cloned repo and the output directory, so Bash is
+# Tools Claude Code may use without asking in EDIT mode.  The Actions runner is a
+# throwaway machine holding only the cloned repo and the output directory, so Bash is
 # allowed whole: exploring a build system means running it.
 CLAUDE_EDIT_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "WebFetch", "WebSearch")
 

@@ -1,32 +1,30 @@
 """
 models.py
-Request schemas for the Generator, and the sandbox pod's image.
+Request schemas for the Generator, key resolution, and the sealing of what an
+agent job needs to know but a workflow input must not show.
+
+There is no sandbox POD any more: agent turns run as GitHub Actions jobs
+(``actions.py``).  RunPod pods are rented only by a block's Regenerate.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import threading
-import time
-from typing import Dict, Tuple
+from typing import Any, Dict, Tuple
 
 from pydantic import BaseModel, Field
 
-from EDA.models import register_kind_image
-
 logger = logging.getLogger("generator.models")
 
-# The sandbox the agents run in: ubuntu + git + node + Claude Code + Codex +
-# sshd/start.sh.  Built by .github/workflows/build-generator-image.yml.  PINNED,
-# and checked for publication before every session (``image_published``): the
-# cpu block shipped a default that had never been pushed, and RunPod answered
-# with a bare "Exited by Runpod".  A session must fail fast with the reason.
-GENERATOR_IMAGE = os.environ.get("GENERATOR_IMAGE", "ghcr.io/dalifahmy/grafux-generator:v1-20260926")
-GENERATOR_INSTANCE = os.environ.get("GENERATOR_INSTANCE", "cpu3c-4")
-GENERATOR_DISK_GB = 30
-
-register_kind_image("generator", lambda: GENERATOR_IMAGE, GENERATOR_DISK_GB)
+# The CLI versions the agent job installs.  PINNED: a CLI that changes its JSONL
+# schema under us turns every turn into a parse error.  Bump deliberately, after
+# re-running the parser tests against captured output.
+CLI_VERSIONS = {
+    "claude_code": os.environ.get("GENERATOR_CLAUDE_CODE_VERSION", "2.1.283"),
+    "codex": os.environ.get("GENERATOR_CODEX_VERSION", "0.157.1"),
+}
 
 
 class CreateSessionRequest(BaseModel):
@@ -36,16 +34,16 @@ class CreateSessionRequest(BaseModel):
     prompt: str = Field(..., description="The user's idea, in words.")
     repo_url: str = Field("", description="Upstream git repository (GitHub tree URLs accepted).")
     owner: str = Field("", description="The user's name or id; namespaces the image tag.")
-    # The user's own model keys (the user pays for tokens).  Held in memory for
-    # the session only, written to a 0600 file on the sandbox, never logged.
+    # Optional: the user's own model keys.  Empty = Grafux's (resolve_agent_key).
+    # Held in memory for the session only, handed to the job SEALED, never logged.
     anthropic_api_key: str = ""
     openai_api_key: str = ""
-    # RunPod key override (same shapes as every pod-backed block's api_keys port).
+    # Kept for request compatibility; the Generator rents no pods.
     api_keys: str = ""
 
 
 # Which provider each agent bills, and the env vars that hold GRAFUX's key for it.
-# The dedicated GENERATOR_* key is tried first on purpose: the sandbox also runs
+# The dedicated GENERATOR_* key is tried first on purpose: the agent job also runs
 # code from the user's repo, so a key placed there can be read by it.  Grafux's
 # key for this job should be a separate, spend-limited one; the general key the
 # claw block uses is only the fallback.
@@ -77,50 +75,48 @@ class MessageRequest(BaseModel):
     mode: str = "edit"
 
 
+class IngestRequest(BaseModel):
+    """What the agent job's forwarder POSTs: numbered raw output lines."""
+    token: str
+    turn: int
+    lines: list = Field(default_factory=list)      # [{"n": int, "line": str}]
+
+
 # ---------------------------------------------------------------------------
-# Is an image actually published (anonymously pullable)?
+# Sealing: workflow inputs are visible to anyone who can read the builds repo
 # ---------------------------------------------------------------------------
 
-_published_cache: Dict[str, Tuple[bool, float]] = {}
-_cache_lock = threading.Lock()
-_CACHE_S = 600.0
+def wrap_key() -> str:
+    return (os.environ.get("GENERATOR_WRAP_KEY") or "").strip()
 
 
-def image_published(image: str, http=None) -> bool:
+def seal(payload: Dict[str, Any], key: str = "") -> str:
+    """Fernet-encrypt ``payload`` with GENERATOR_WRAP_KEY (also a builds-repo secret)."""
+    from cryptography.fernet import Fernet
+    return Fernet((key or wrap_key()).encode()).encrypt(json.dumps(payload).encode()).decode()
+
+
+def unseal(token: str, key: str = "") -> Dict[str, Any]:
+    """The inverse of ``seal`` -- what agent.yml does in Python on the runner."""
+    from cryptography.fernet import Fernet
+    return json.loads(Fernet((key or wrap_key()).encode()).decrypt(token.encode()))
+
+
+def callback_url() -> str:
     """
-    True when GHCR serves ``image`` to an anonymous client -- exactly how RunPod
-    pulls.  Non-GHCR images are assumed published (we cannot cheaply check).
-    Errors reaching GHCR count as published: an outage must not block sessions.
+    Where the job POSTs live output.  GENERATOR_PUBLIC_URL, else the URL Render
+    injects into every web service.  Empty = no live stream; the whole output is
+    still read back from the branch when the job ends.
     """
-    if not image.startswith("ghcr.io/"):
-        return True
-    with _cache_lock:
-        hit = _published_cache.get(image)
-        if hit and time.monotonic() - hit[1] < _CACHE_S:
-            return hit[0]
-    name, _, tag = image[len("ghcr.io/"):].partition(":")
-    tag = tag or "latest"
-    try:
-        if http is None:
-            import httpx
-            http = httpx.Client(timeout=15.0)
-        tok = http.get("https://ghcr.io/token",
-                       params={"scope": f"repository:{name}:pull", "service": "ghcr.io"})
-        token = tok.json().get("token") if tok.status_code == 200 else None
-        if not token:
-            ok = False
-        else:
-            head = http.head(f"https://ghcr.io/v2/{name}/manifests/{tag}", headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.oci.image.index.v1+json, "
-                          "application/vnd.docker.distribution.manifest.list.v2+json, "
-                          "application/vnd.docker.distribution.manifest.v2+json, "
-                          "application/vnd.oci.image.manifest.v1+json",
-            })
-            ok = head.status_code == 200
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("could not check %s on GHCR (%s); assuming published", image, exc)
-        return True
-    with _cache_lock:
-        _published_cache[image] = (ok, time.monotonic())
-    return ok
+    base = (os.environ.get("GENERATOR_PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip()
+    return base.rstrip("/")
+
+
+def missing_configuration() -> str:
+    """Why the Generator cannot run on this server, or "" when it can."""
+    missing = [name for name in ("GENERATOR_GITHUB_TOKEN", "GENERATOR_BUILDS_REPO", "GENERATOR_WRAP_KEY")
+               if not (os.environ.get(name) or "").strip()]
+    if not missing:
+        return ""
+    return ("The Generator is not set up on this server: set " + ", ".join(missing)
+            + " on the devices service (see GENERATOR/builds-repo/README.md).")

@@ -7,16 +7,21 @@ block, write nothing) or Edit (build it), and describe what you want, e.g.
 "a block for OpenRAM, https://github.com/VLSIDA/OpenRAM/tree/stable".
 
 What comes out is a ``custom`` block (see ``CUSTOM/``): a manifest plus an image
-in ghcr.io/dalifahmy/grafux-gen, verified by a self-test at build time and by a
-real run on a fresh pod.  Nothing in Grafux itself is generated.
+in ghcr.io/dalifahmy/grafux-gen whose build ran a self-test of the tool.  Nothing
+in Grafux itself is generated.
+
+NO RUNPOD POD IS EVER RENTED HERE.  The agent runs as a GitHub Actions job and
+the image is built by another; the block's first pod is the user's Regenerate --
+the same rule as cpu, openram and verilator.
 
     agents.py    headless command lines + stream parsers for both CLIs
     contract.py  what the agent must write, how Grafux judges it, the prompts
     builder.py   GitHub Actions image builds (docker build + push to GHCR)
-    session.py   the sandbox pod, the turn, and the validate/build/smoke/repair loop
+    actions.py   each agent turn as a GitHub Actions job (builds-repo/agent.yml)
+    session.py   the conversation and the validate/build/repair loop
     router.py    /generator/*
 
-The agent runs in a RunPod pod from ``docker/Dockerfile`` with the user's own
-model key; the build runs in GitHub Actions (``builds-repo/``), where the push
-credential never meets the repo's code.
+The agent job gets the model key (the user's, else Grafux's) sealed with
+GENERATOR_WRAP_KEY; the build job holds the GHCR push credential, which never
+meets the agent.
 """

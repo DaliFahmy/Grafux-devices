@@ -3,13 +3,16 @@ router.py
 REST surface for the Generator (the app's "Generator" panel).
 
     GET    /generator/agents                       agents, their models, the modes
-    POST   /generator/sessions                     start: provision, clone, first turn
+    POST   /generator/sessions                     start: the first agent turn (a GitHub Actions job)
     GET    /generator/sessions/{id}                summary (state, turns, cost)
     GET    /generator/sessions/{id}/events?after=N events newer than N (poll every ~1.5 s)
     POST   /generator/sessions/{id}/message        a follow-up turn {text, mode}
     GET    /generator/sessions/{id}/result         the verified block: {manifest, image, files}
-    POST   /generator/sessions/{id}/stop           stop the turn and release the sandbox
-    DELETE /generator/sessions/{id}                forget the session (and release the sandbox)
+    POST   /generator/sessions/{id}/stop           stop (cancels the running Actions job)
+    DELETE /generator/sessions/{id}                forget the session
+    POST   /generator/sessions/{id}/ingest         the agent job's live output (token-checked)
+
+No RunPod pod is ever rented here: pods come only from a block's Regenerate.
 
 Polling rather than a WebSocket on purpose: the WASM build must not do blocking
 work on a socket callback (see the WASM WebSocket asyncify note), and every
@@ -18,20 +21,22 @@ other long-running block here already speaks create + poll.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 
 from . import agents
+from .actions import ActionsAgentRunner
 from .builder import BuilderNotConfigured, GitHubBuilder
-from .models import CreateSessionRequest, MessageRequest, resolve_agent_key
-from .session import GeneratorSession, PodSandbox, run_smoke, sessions, SMOKE_ENABLED
+from .models import (CreateSessionRequest, IngestRequest, MessageRequest, missing_configuration,
+                     resolve_agent_key)
+from .session import GeneratorSession, sessions
 
 router = APIRouter(prefix="/generator", tags=["generator"])
 
 # Seams the tests replace.
-def make_sandbox(req: CreateSessionRequest) -> Any:
-    return PodSandbox(req.api_keys)
+def configuration_error() -> str:
+    return missing_configuration()
 
 
 def make_builder() -> Optional[GitHubBuilder]:
@@ -41,8 +46,8 @@ def make_builder() -> Optional[GitHubBuilder]:
         return None
 
 
-def make_smoke() -> Optional[Callable[..., Any]]:
-    return run_smoke if SMOKE_ENABLED else None
+def make_runner(builder: GitHubBuilder) -> Any:
+    return ActionsAgentRunner(builder)
 
 
 def _get(sid: str) -> GeneratorSession:
@@ -65,6 +70,10 @@ def list_agents() -> Dict[str, Any]:
         ],
         "modes": list(agents.MODES),
         "builder_configured": make_builder() is not None,
+        # Everything a session needs (builds repo, token, wrap key); the panel
+        # shows `setup` instead of letting Send fail.
+        "configured": not configuration_error(),
+        "setup": configuration_error(),
     }
 
 
@@ -76,8 +85,12 @@ def create_session(req: CreateSessionRequest) -> Dict[str, Any]:
         raise HTTPException(status_code=422, detail="mode must be plan or edit")
     if not req.prompt.strip():
         raise HTTPException(status_code=422, detail="describe what the block should do")
+    problem = configuration_error()
+    builder = make_builder()
+    if problem or builder is None:
+        raise HTTPException(status_code=503, detail=problem or "the image builder is not configured")
     try:
-        s = GeneratorSession(req, sandbox=make_sandbox(req), builder=make_builder(), smoke=make_smoke())
+        s = GeneratorSession(req, runner=make_runner(builder), builder=builder)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     sessions.add(s)
@@ -135,3 +148,14 @@ def delete_session(sid: str) -> Dict[str, Any]:
     if s.state != "stopped":
         s.stop()
     return {"deleted": sid}
+
+
+@router.post("/sessions/{sid}/ingest")
+def ingest(sid: str, body: IngestRequest) -> Dict[str, Any]:
+    """Live output from the agent job's forwarder (see builds-repo agent.yml)."""
+    s = _get(sid)
+    try:
+        accepted = s.ingest(body.token, body.turn, body.lines)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail="bad token") from exc
+    return {"accepted": accepted}

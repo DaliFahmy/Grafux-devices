@@ -2,7 +2,7 @@
 builder.py
 Builds a generated block's image with GitHub Actions and pushes it to GHCR.
 
-Why Actions and not the sandbox pod: RunPod containers are unprivileged, so
+Why Actions and not a RunPod pod: RunPod containers are unprivileged, so
 neither docker nor rootful buildah runs there, and kaniko is only supported
 inside its own image.  Actions runs real ``docker build`` -- the path every
 Grafux image already takes -- and the push credential lives in the runner, never
@@ -121,22 +121,35 @@ class GitHubBuilder:
                                f"{resp.text[:400]}")
         return commit
 
-    def dispatch(self, branch: str, tag: str) -> None:
-        self._json("POST", f"/repos/{self.repo}/actions/workflows/{self.workflow}/dispatches",
-                   json={"ref": self.ref, "inputs": {"branch": branch, "tag": tag}})
+    def dispatch_workflow(self, workflow: str, inputs: Dict[str, str]) -> None:
+        self._json("POST", f"/repos/{self.repo}/actions/workflows/{workflow}/dispatches",
+                   json={"ref": self.ref, "inputs": inputs})
 
-    def find_run(self, tag: str) -> Optional[dict]:
-        """The dispatched run, matched by its run-name (``build <tag>``)."""
+    def find_run_named(self, workflow: str, title: str) -> Optional[dict]:
+        """
+        A dispatched run, matched by its run-name.  A dispatch returns no run id,
+        so every workflow the Generator starts sets a unique ``run-name``.
+        """
         deadline = time.monotonic() + self.find_timeout_s
         while True:
-            runs = self._json("GET", f"/repos/{self.repo}/actions/workflows/{self.workflow}/runs",
+            runs = self._json("GET", f"/repos/{self.repo}/actions/workflows/{workflow}/runs",
                               params={"event": "workflow_dispatch", "per_page": 30}).get("workflow_runs", [])
             for run in runs:
-                if (run.get("display_title") or run.get("name") or "").strip() == f"build {tag}":
+                if (run.get("display_title") or run.get("name") or "").strip() == title:
                     return run
             if time.monotonic() > deadline:
                 return None
             self._sleep(min(5.0, self.poll_s))
+
+    def get_run(self, run_id: int) -> dict:
+        return self._json("GET", f"/repos/{self.repo}/actions/runs/{run_id}")
+
+    def dispatch(self, branch: str, tag: str) -> None:
+        self.dispatch_workflow(self.workflow, {"branch": branch, "tag": tag})
+
+    def find_run(self, tag: str) -> Optional[dict]:
+        """The dispatched build run, matched by its run-name (``build <tag>``)."""
+        return self.find_run_named(self.workflow, f"build {tag}")
 
     def failure_log(self, run_id: int) -> str:
         jobs = self._json("GET", f"/repos/{self.repo}/actions/runs/{run_id}/jobs").get("jobs", [])

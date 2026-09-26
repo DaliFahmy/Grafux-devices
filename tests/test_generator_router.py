@@ -1,7 +1,7 @@
 """
 test_generator_router.py
-The /generator REST surface through TestClient, with the sandbox, builder and
-smoke seams replaced so no pod, GitHub or LLM is touched.
+The /generator REST surface through TestClient, with the runner and builder
+seams replaced so no GitHub job, LLM or pod is touched.
 """
 
 from __future__ import annotations
@@ -19,19 +19,21 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from GENERATOR import router as grouter  # noqa: E402
 from GENERATOR.builder import BuildResult  # noqa: E402
-from tests.test_generator_session import GOOD, FakeBuilder, FakeSandbox  # noqa: E402
+from GENERATOR.session import sessions  # noqa: E402
+from tests.test_generator_session import GOOD, WRAP, FakeBuilder, FakeRunner  # noqa: E402
 
 
 @pytest.fixture
 def client(monkeypatch):
-    def agent(prompt, mode, gen):
+    def agent(prompt, mode, files):
         if mode == "edit":
-            gen.update(GOOD)
+            files.update(GOOD)
         return "the plan" if mode == "plan" else "built"
 
-    monkeypatch.setattr(grouter, "make_sandbox", lambda req: FakeSandbox(agent))
+    monkeypatch.setenv("GENERATOR_WRAP_KEY", WRAP)
+    monkeypatch.setattr(grouter, "configuration_error", lambda: "")
+    monkeypatch.setattr(grouter, "make_runner", lambda builder: FakeRunner(agent))
     monkeypatch.setattr(grouter, "make_builder", lambda: FakeBuilder([BuildResult(True, "i")] * 3))
-    monkeypatch.setattr(grouter, "make_smoke", lambda: (lambda m, **k: (True, "", False)))
     from device.app import app
     return TestClient(app)
 
@@ -45,6 +47,14 @@ def _wait(client, sid, until=lambda b: not b["busy"]):
     raise AssertionError("session never settled")
 
 
+def _create(client, **over):
+    body = {"agent": "claude_code", "mode": "plan", "prompt": "OpenRAM block",
+            "repo_url": "https://github.com/VLSIDA/OpenRAM/tree/stable",
+            "anthropic_api_key": "sk-ant-x-1234567890", "owner": "ahmed"}
+    body.update(over)
+    return client.post("/generator/sessions", json=body)
+
+
 def test_agents_catalogue(client, monkeypatch):
     for name in ("GENERATOR_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY",
                  "GENERATOR_OPENAI_API_KEY", "OPENAI_API_KEY"):
@@ -53,16 +63,26 @@ def test_agents_catalogue(client, monkeypatch):
     body = client.get("/generator/agents").json()
     assert [a["id"] for a in body["agents"]] == ["claude_code", "codex"]
     assert body["modes"] == ["plan", "edit"]
+    assert body["configured"] is True and body["setup"] == ""
     # Whether Grafux holds a key -- never the key itself.
     assert [a["server_key"] for a in body["agents"]] == [True, False]
     assert "sk-ant-server-secret-123" not in json.dumps(body)
 
 
+def test_an_unconfigured_server_refuses_with_the_missing_settings(monkeypatch):
+    for name in ("GENERATOR_GITHUB_TOKEN", "GENERATOR_BUILDS_REPO", "GENERATOR_WRAP_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    from device.app import app
+    c = TestClient(app)
+    r = _create(c)
+    assert r.status_code == 503
+    assert "GENERATOR_GITHUB_TOKEN" in r.json()["detail"] and "GENERATOR_WRAP_KEY" in r.json()["detail"]
+    agents_body = c.get("/generator/agents").json()
+    assert agents_body["configured"] is False and "GENERATOR_BUILDS_REPO" in agents_body["setup"]
+
+
 def test_plan_then_edit_then_result(client):
-    r = client.post("/generator/sessions", json={
-        "agent": "claude_code", "mode": "plan", "prompt": "OpenRAM block",
-        "repo_url": "https://github.com/VLSIDA/OpenRAM/tree/stable",
-        "anthropic_api_key": "sk-ant-x-1234567890", "owner": "ahmed"})
+    r = _create(client)
     assert r.status_code == 200, r.text
     sid = r.json()["session_id"]
     body = _wait(client, sid)
@@ -85,6 +105,28 @@ def test_plan_then_edit_then_result(client):
     assert client.post(f"/generator/sessions/{sid}/stop").json()["state"] == "stopped"
     assert client.delete(f"/generator/sessions/{sid}").status_code == 200
     assert client.get(f"/generator/sessions/{sid}").status_code == 404
+
+
+def test_ingest_endpoint(client):
+    sid = _create(client).json()["session_id"]
+    _wait(client, sid)
+    s = sessions.get(sid)
+    turn = s._turn_no
+    bad = client.post(f"/generator/sessions/{sid}/ingest",
+                      json={"token": "nope", "turn": turn, "lines": []})
+    assert bad.status_code == 403
+    line = json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "late"}]}})
+    ok = client.post(f"/generator/sessions/{sid}/ingest",
+                     json={"token": s.callback_token, "turn": turn, "lines": [{"n": 100, "line": line}]})
+    assert ok.json() == {"accepted": 1}
+    again = client.post(f"/generator/sessions/{sid}/ingest",
+                        json={"token": s.callback_token, "turn": turn, "lines": [{"n": 100, "line": line}]})
+    assert again.json() == {"accepted": 0}
+    stale = client.post(f"/generator/sessions/{sid}/ingest",
+                        json={"token": s.callback_token, "turn": turn + 5, "lines": [{"n": 101, "line": line}]})
+    assert stale.json() == {"accepted": 0}
+    assert client.post("/generator/sessions/nope/ingest",
+                       json={"token": "x", "turn": 1, "lines": []}).status_code == 404
 
 
 @pytest.mark.parametrize("body,status", [
