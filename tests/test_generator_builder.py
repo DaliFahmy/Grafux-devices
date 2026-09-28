@@ -29,8 +29,10 @@ class _Resp:
 
 
 class FakeGitHub:
-    def __init__(self, conclusion="success", ref_exists=False, log="step 1\nGRAFUX SELFTEST FAILED: x\nend"):
+    def __init__(self, conclusion="success", ref_exists=False, log="step 1\nGRAFUX SELFTEST FAILED: x\nend",
+                 failed_steps=()):
         self.calls = []
+        self.failed_steps = failed_steps
         self.conclusion = conclusion
         self.ref_exists = ref_exists
         self.log = log
@@ -67,7 +69,8 @@ class FakeGitHub:
             return _Resp(200, {"id": 7, "status": "completed" if done else "in_progress",
                                "conclusion": self.conclusion if done else None})
         if method == "GET" and path == f"{r}/actions/runs/7/jobs":
-            return _Resp(200, {"jobs": [{"id": 70, "name": "build", "conclusion": "failure", "steps": []}]})
+            return _Resp(200, {"jobs": [{"id": 70, "name": "build", "conclusion": "failure", "steps": [
+                {"name": n, "conclusion": "failure"} for n in self.failed_steps]}]})
         if method == "GET" and path == f"{r}/actions/jobs/70/logs":
             return _Resp(200, text=self.log)
         if method == "POST" and path == f"{r}/actions/runs/7/cancel":
@@ -112,6 +115,30 @@ def test_selftest_lines_survive_a_long_log():
     log = "GRAFUX SELFTEST FAILED: early\n" + "\n".join(f"noise {i}" for i in range(500))
     res = _builder(FakeGitHub(conclusion="failure", log=log)).build("t", {"Dockerfile": b"FROM x"})
     assert res.detail.startswith("GRAFUX SELFTEST FAILED: early")
+
+
+def test_a_refused_push_is_infra_not_a_repair_order():
+    log = ("GRAFUX SELFTEST OK\nThe push refers to repository [ghcr.io/dalifahmy/grafux-gen]\n"
+           "denied: permission_denied: write_package")
+    gh = FakeGitHub(conclusion="failure", log=log, failed_steps=["Push"])
+    res = _builder(gh).build("t", {"Dockerfile": b"FROM x"})
+    assert not res.ok and res.infra
+    assert "passed its self-test" in res.detail and "o/builds" in res.detail
+    assert "write_package" in res.detail
+
+
+def test_a_denial_without_named_steps_is_still_infra():
+    log = "denied: permission_denied: write_package"
+    res = _builder(FakeGitHub(conclusion="failure", log=log)).build("t", {"Dockerfile": b"FROM x"})
+    assert res.infra
+
+
+def test_a_failed_build_step_stays_a_repair_order_even_if_it_says_denied():
+    log = "E: Could not open lock file - open (13: Permission denied)\ndenied: permission_denied"
+    gh = FakeGitHub(conclusion="failure", log=log,
+                    failed_steps=["Build (includes the Grafux self-test)"])
+    res = _builder(gh).build("t", {"Dockerfile": b"FROM x"})
+    assert not res.ok and not res.infra
 
 
 def test_api_failures_are_infra_not_repair_orders():

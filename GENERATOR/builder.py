@@ -36,7 +36,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional
 
 from .contract import IMAGE_REPO, is_executable
 
@@ -60,6 +60,28 @@ class BuildResult:
 
 class BuilderNotConfigured(RuntimeError):
     pass
+
+
+# build.yml steps that talk to the registry, not to the generated files.
+REGISTRY_STEPS = ("Push", "Run docker/login-action@v3")
+# GHCR's refusals, for a log whose failed step GitHub did not name.
+_REGISTRY_DENIALS = ("permission_denied: write_package", "denied: permission_denied",
+                     "denied: requested access to the resource is denied")
+
+
+def is_registry_failure(failed_steps: List[str], log: str) -> bool:
+    if failed_steps:
+        return all(step in REGISTRY_STEPS for step in failed_steps)
+    return any(d in log for d in _REGISTRY_DENIALS)
+
+
+def registry_failure_message(image: str, builds_repo: str, log: str) -> str:
+    package = image.split(":", 1)[0]
+    tail = "\n".join(log.splitlines()[-20:])
+    return (f"The block's image built and passed its self-test, but the registry refused the push to "
+            f"{package}. This is a Grafux setup problem, not the block's: give {builds_repo} Write "
+            f"access on that package (package settings -> Manage Actions access), or set a "
+            f"GHCR_PUSH_TOKEN secret with write:packages on {builds_repo}. Then reply to retry.\n\n{tail}")
 
 
 class GitHubBuilder:
@@ -151,6 +173,11 @@ class GitHubBuilder:
         """The dispatched build run, matched by its run-name (``build <tag>``)."""
         return self.find_run_named(self.workflow, f"build {tag}")
 
+    def failed_steps(self, run_id: int) -> List[str]:
+        jobs = self._json("GET", f"/repos/{self.repo}/actions/runs/{run_id}/jobs").get("jobs", [])
+        return [s.get("name", "") for job in jobs for s in job.get("steps", [])
+                if s.get("conclusion") == "failure"]
+
     def failure_log(self, run_id: int) -> str:
         jobs = self._json("GET", f"/repos/{self.repo}/actions/runs/{run_id}/jobs").get("jobs", [])
         for job in jobs:
@@ -206,7 +233,13 @@ class GitHubBuilder:
                 run = self._json("GET", f"/repos/{self.repo}/actions/runs/{run_id}")
             if run.get("conclusion") == "success":
                 return BuildResult(True, image, "built and pushed", url)
-            return BuildResult(False, image, self.failure_log(run_id), url)
+            log = self.failure_log(run_id)
+            if is_registry_failure(self.failed_steps(run_id), log):
+                # The generated files are fine; handing this to the agent only buys
+                # an unchanged repair and a dead "reply with guidance" end.
+                return BuildResult(False, image, registry_failure_message(image, self.repo, log),
+                                   url, infra=True)
+            return BuildResult(False, image, log, url)
         except Exception as exc:  # noqa: BLE001 -- reported, never raised into the loop
             logger.warning("generator build %s failed: %s", tag, exc)
             return BuildResult(False, image, f"Grafux could not run the build: {exc}", infra=True)

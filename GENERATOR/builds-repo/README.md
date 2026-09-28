@@ -23,6 +23,9 @@ The devices server's Generator never rents a RunPod pod (only a block's
 3. Package `ghcr.io/dalifahmy/grafux-gen`: Package settings, then *Manage Actions
    access*, then add `grafux-gen-builds` with **Write**, so `build.yml` can
    push. (Or add a `GHCR_PUSH_TOKEN` secret holding a PAT with `write:packages`.)
+   **Required:** without it every build passes its self-test and then fails at
+   *Push* with `denied: permission_denied: write_package`. The package was created by
+   another repo's workflow, so this repo's `GITHUB_TOKEN` starts with no access to it.
    The package must stay **Public** (RunPod pulls anonymously).
 4. Create a fine-grained token scoped to THIS repository only, with
    **Contents: read & write** and **Actions: read & write**. On the devices
