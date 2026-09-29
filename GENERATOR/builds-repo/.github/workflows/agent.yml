@@ -168,6 +168,11 @@ jobs:
             rm -rf gen && mkdir gen
             cp -a /workspace/gen/. gen/ 2>/dev/null || true
             rm -rf gen/.git
+            # Tool droppings (a py_compile check, a pytest run) are not the block.
+            # The server drops them too (contract.is_junk); this keeps them out of git.
+            find gen -type d \( -name __pycache__ -o -name .pytest_cache -o -name .mypy_cache \
+              -o -name .ruff_cache \) -prune -exec rm -rf {} + 2>/dev/null || true
+            find gen -type f \( -name '*.pyc' -o -name '*.pyo' -o -name .DS_Store \) -delete 2>/dev/null || true
           fi
           cp -a ~/.claude/projects/. .grafux/state/claude/ 2>/dev/null || true
           cp -a ~/.codex/sessions/. .grafux/state/codex/ 2>/dev/null || true

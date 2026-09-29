@@ -338,7 +338,10 @@ class GeneratorSession:
             manifest, problems = contract.validate(files)
             problems += [f"{b} is a binary file; download or build it inside the Dockerfile instead."
                          for b in self._last_binaries]
-            digest = contract.content_hash(files)
+            # Binaries are in the digest too: they never travel back to the agent,
+            # so a repair that only deleted one leaves the text files identical,
+            # and without this the fixed result would be mistaken for "no change".
+            digest = contract.content_hash(files) + "|" + ",".join(sorted(self._last_binaries))
             if digest == last_failed:
                 # Checked BEFORE building: re-running an identical build re-buys
                 # the same failure (the verifyloop rule).

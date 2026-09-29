@@ -258,6 +258,23 @@ def test_a_repair_that_changes_nothing_stops_the_loop():
     assert any("did not change any file" in e["text"] for e in s.events)
 
 
+def test_a_repair_that_only_removes_a_binary_is_revalidated():
+    # Binaries never travel back to the agent, so its repair leaves the TEXT
+    # files identical.  That is a fix, not "no change": the loop must re-check.
+    class BinaryOnce(FakeRunner):
+        def run_turn(self, spec, **kw):
+            out = super().run_turn(spec, **kw)
+            if len(self.specs) == 1:
+                out.binaries = ["logo.png"]
+            return out
+
+    b = FakeBuilder([ok_build()])
+    s, runner = _run(None, runner=BinaryOnce(write_good), builder=b)
+    assert s.state == "done", s.events
+    assert len(runner.specs) == 2 and len(b.built) == 1
+    assert "logo.png is a binary file" in runner.specs[1].prompt
+
+
 def test_gives_up_after_max_repairs():
     n = [0]
 

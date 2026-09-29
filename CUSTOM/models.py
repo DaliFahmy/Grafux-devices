@@ -8,6 +8,9 @@ flat ``inputs`` map instead of one field per port:
 
     manifest   -> CustomRunRequest.manifest   the block's manifest (JSON text)
     <any port> -> CustomRunRequest.inputs     {port_name: text} for the manifest's inputs
+    <upload>   -> CustomRunRequest.input_port_files  {port_name: PortFile} for a port
+                  whose value names a file the user uploaded into it; the pod gets
+                  the file's BYTES at $GRAFUX_IN/<port>, not its name
     files      -> _RunBase.input_files        extra files staged before the run
     timeout    -> _RunBase.timeout            0 / unset = the manifest's runtime.timeout_s
 
@@ -24,7 +27,7 @@ from __future__ import annotations
 from typing import Dict
 
 from fastapi import HTTPException
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from EDA.models import DEFAULT_IMAGE, EdaSpec, _RunBase, register_kind_image
 
@@ -57,6 +60,13 @@ def require_image(spec: EdaSpec) -> EdaSpec:
     return spec
 
 
+class PortFile(BaseModel):
+    """A file uploaded into one input port: its original name and base64 bytes."""
+
+    filename: str = Field("", description="The uploaded file's original name, e.g. 'figure.jpeg'.")
+    content: str = Field("", description="The file's bytes, base64-encoded.")
+
+
 class CustomRunRequest(_RunBase):
     """Live inputs for one run of a manifest-defined block."""
 
@@ -65,4 +75,10 @@ class CustomRunRequest(_RunBase):
     inputs: Dict[str, str] = Field(
         default_factory=dict,
         description="Values of the manifest's input ports, by port name. Missing = the port's default.",
+    )
+    input_port_files: Dict[str, PortFile] = Field(
+        default_factory=dict,
+        description=("Files uploaded into input ports, by port name. Each is staged as raw bytes at "
+                     "$GRAFUX_IN/<port> (its name at $GRAFUX_IN/<port>.filename), replacing the "
+                     "port's text value, which is only the file's name."),
     )

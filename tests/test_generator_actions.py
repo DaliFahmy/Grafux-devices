@@ -159,6 +159,19 @@ def test_a_turn_round_trip():
     assert ("Run the agent", "") in statuses
 
 
+def test_tool_droppings_are_dropped_on_read_back():
+    # A py_compile syntax check once left __pycache__/*.pyc in gen/; validate
+    # flagged it and the repair turn could never see it to delete it.
+    result = {"gen/adapter.py": b"print(1)\n",
+              "gen/__pycache__/adapter.cpython-312.pyc": b"\x00\xff",
+              "gen/.pytest_cache/README.md": b"cache\n", "gen/.DS_Store": b"\x00\x01",
+              "gen/sub/old.pyc": b"\xff", "gen/logo.png": b"\x89PNG\x00\xff",
+              ".grafux/out/exit_code": b"0\n"}
+    out = _runner(FakeGitHub(result_tree=result)).run_turn(_spec())
+    assert out.files == {"adapter.py": "print(1)\n"}
+    assert out.binaries == ["logo.png"]          # a real binary is still reported
+
+
 def test_a_nonzero_agent_exit_is_a_failed_turn_not_infra():
     gh = FakeGitHub(result_tree={".grafux/out/exit_code": b"1"})
     out = _runner(gh).run_turn(_spec())

@@ -35,6 +35,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
+from . import contract
 from .builder import GitHubBuilder
 
 logger = logging.getLogger("generator.actions")
@@ -199,6 +200,8 @@ class ActionsAgentRunner:
             for path, data in files_b.items():
                 if path.startswith(GEN_PREFIX):
                     rel = path[len(GEN_PREFIX):]
+                    if contract.is_junk(rel):
+                        continue
                     try:
                         out.files[rel] = data.decode("utf-8")
                     except UnicodeDecodeError:

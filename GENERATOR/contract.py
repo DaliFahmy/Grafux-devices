@@ -70,6 +70,23 @@ def _safe_path(path: str) -> Optional[str]:
     return p
 
 
+# Tool droppings, never part of a block: a `python -m py_compile` syntax check or
+# a pytest run in /workspace/gen leaves these behind.  They are dropped when the
+# turn is read back rather than sent to validate, because the repair turn could
+# not act on them -- binaries never travel back to the agent, so it would be
+# asked to delete a file it cannot see.
+_JUNK_DIRS = {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+_JUNK_FILES = {".DS_Store"}
+_JUNK_SUFFIXES = (".pyc", ".pyo")
+
+
+def is_junk(path: str) -> bool:
+    """True for caches and OS droppings under /workspace/gen (see above)."""
+    parts = (path or "").replace("\\", "/").split("/")
+    return (any(p in _JUNK_DIRS for p in parts[:-1]) or parts[-1] in _JUNK_FILES
+            or parts[-1].endswith(_JUNK_SUFFIXES))
+
+
 def with_pending_image(text: str) -> str:
     """
     Fill runtime.image if the agent left it out, so validation can run.

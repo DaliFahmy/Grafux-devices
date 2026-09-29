@@ -209,6 +209,49 @@ def test_undeclared_inputs_are_ignored_but_noted(pod):
     assert "surprise" in o["warnings"]
 
 
+def test_an_uploaded_file_reaches_the_pod_as_bytes_not_its_name(pod):
+    # The page2circuit failure: the port's text is the upload's NAME, and the
+    # adapter must get the image itself.  Non-UTF-8 bytes prove no text decode.
+    import base64
+    image = b"\xff\xd8\xff\xe0JFIF\x00\x80\x81"
+    m = dict(MANIFEST, inputs=MANIFEST["inputs"] + [{"name": "picture", "type": "file"}])
+    outcome = _run(pod, manifest=m, inputs={"picture": "5-Figure2-1.jpeg"},
+                   input_port_files={"picture": {"filename": "5-Figure2-1.jpeg",
+                                                 "content": base64.b64encode(image).decode()}})
+    files = pod["client"].files
+    assert outcome["_status"] == "ok"
+    assert files[f"{IN}/picture"] == image
+    assert files[f"{IN}/picture.filename"] == b"5-Figure2-1.jpeg"
+    assert files[f"{IN}/words"] == b"16"                 # other ports unchanged
+
+
+def test_a_port_without_an_upload_is_still_its_text(pod):
+    # An upload is detected by the app, not guessed from the value: a text port
+    # holding a file-name-like string stays text, with no .filename beside it.
+    _run(pod, inputs={"code": "notes.txt"})
+    files = pod["client"].files
+    assert files[f"{IN}/code"] == b"notes.txt"
+    assert f"{IN}/code.filename" not in files
+
+
+@pytest.mark.parametrize("uploads,needle", [
+    ({"nope": {"filename": "a.png", "content": "AAAA"}}, "does not declare"),
+    ({"code": {"filename": "a.png", "content": "not base64!"}}, "not valid base64"),
+])
+def test_bad_uploads_are_refused_before_the_pod_runs_anything(pod, uploads, needle):
+    outcome = _run(pod, input_port_files=uploads)
+    assert outcome["_status"] == "error"
+    assert needle in outcome["outputs"]["errors"]
+    assert pod["commands"] == [] and pod["client"].files == {}
+
+
+def test_an_oversized_upload_is_refused(monkeypatch):
+    monkeypatch.setattr(flow, "PORT_FILE_MAX_BYTES", 3)
+    m = parse_manifest(MANIFEST)
+    files, problems = flow.resolve_port_files(m, {"code": {"filename": "big", "content": "AAAAAAAA"}})
+    assert files == {} and "the limit is" in problems[0]
+
+
 def test_coerce_input_keeps_empty_numbers_empty():
     m = parse_manifest(MANIFEST)
     assert flow.coerce_input(m.inputs[0], "  ") == ("", "")

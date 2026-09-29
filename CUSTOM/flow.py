@@ -4,7 +4,8 @@ The one runner every ``custom`` block shares.
 
 Three stages, the same for every manifest:
 
-    stage    write one file per input port into $GRAFUX_IN
+    stage    write one file per input port into $GRAFUX_IN (an uploaded file's
+             bytes, plus $GRAFUX_IN/<port>.filename, for a port holding one)
     run      bash -lc <runtime.entry>, streaming its output to the block face
     collect  read text outputs from $GRAFUX_OUT/<port>, match artifact globs,
              and judge the run
@@ -23,6 +24,8 @@ This module is pure apart from the transport functions it imports by name
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import shlex
@@ -99,8 +102,53 @@ def coerce_input(port: InputPort, raw: str) -> Tuple[str, str]:
             return value, f"input '{port.name}' must be JSON: {exc.msg} at line {exc.lineno}"
         return stripped, ""
     # text / file: passed through byte for byte -- a program's leading
-    # whitespace is part of the program.
+    # whitespace is part of the program.  An UPLOADED file does not arrive here:
+    # its port's text is only the file's name, and the bytes travel separately
+    # in ``input_port_files`` (see resolve_port_files).
     return value, ""
+
+
+# Decoded size cap per uploaded port file.  The app refuses above its own 25 MB
+# before sending; this is the backstop against a hand-built request.
+PORT_FILE_MAX_BYTES = 32 * 1024 * 1024
+
+
+def resolve_port_files(manifest: Manifest, given: Dict[str, Any]) -> Tuple[Dict[str, Tuple[str, bytes]], List[str]]:
+    """
+    Decode the files uploaded into input ports.
+
+    Returns ``({port: (filename, bytes)}, problems)``.  A port the manifest does
+    not declare, bad base64 or an oversized file is a problem that refuses the
+    run: the adapter would otherwise read a file NAME where it expects an image,
+    which is exactly the failure this field exists to prevent.
+    """
+    known = set(manifest.input_names())
+    files: Dict[str, Tuple[str, bytes]] = {}
+    problems: List[str] = []
+    for name, item in (given or {}).items():
+        name = str(name)
+        if name not in known:
+            problems.append(f"a file was uploaded into '{name}', which the manifest does not declare as an input")
+            continue
+        filename = str(_field(item, "filename") or "")
+        content = str(_field(item, "content") or "")
+        try:
+            data = base64.b64decode(content, validate=True)
+        except (binascii.Error, ValueError):
+            problems.append(f"the file uploaded into '{name}' ({filename or 'unnamed'}) is not valid base64")
+            continue
+        if len(data) > PORT_FILE_MAX_BYTES:
+            problems.append(f"the file uploaded into '{name}' ({filename or 'unnamed'}) is "
+                            f"{len(data) // (1024 * 1024)} MB; the limit is "
+                            f"{PORT_FILE_MAX_BYTES // (1024 * 1024)} MB")
+            continue
+        files[name] = (filename.replace("\n", " ").strip(), data)
+    return files, problems
+
+
+def _field(item: Any, key: str) -> Any:
+    """Read ``key`` from a PortFile model or a plain dict (the tests send dicts)."""
+    return item.get(key) if isinstance(item, dict) else getattr(item, key, None)
 
 
 def resolve_inputs(manifest: Manifest, given: Dict[str, Any]) -> Tuple[Dict[str, str], List[str], List[str]]:
@@ -191,6 +239,8 @@ def run_custom(
 
     values, problems, extra_notes = resolve_inputs(manifest, getattr(req, "inputs", {}) or {})
     notes.extend(extra_notes)
+    port_files, file_problems = resolve_port_files(manifest, getattr(req, "input_port_files", {}) or {})
+    problems.extend(file_problems)
     if problems:
         on_stage("stage", "failed")
         return _result(_base(errors="The run was refused before it started:\n" + "\n".join(problems),
@@ -203,6 +253,16 @@ def run_custom(
         sftp_makedirs(sftp, in_dir)
         sftp_makedirs(sftp, f"{out_dir}/files")
         for name, value in values.items():
+            if name in port_files:
+                # An uploaded file: the port's text is only its name, so the
+                # adapter gets the bytes, and the name beside them for tools
+                # that care about the extension.
+                filename, data = port_files[name]
+                with sftp.open(f"{in_dir}/{name}", "wb") as fh:
+                    fh.write(data)
+                with sftp.open(f"{in_dir}/{name}.filename", "wb") as fh:
+                    fh.write(filename.encode("utf-8"))
+                continue
             with sftp.open(f"{in_dir}/{name}", "wb") as fh:
                 fh.write(value.encode("utf-8"))
     finally:

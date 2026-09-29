@@ -23,6 +23,11 @@ over SSH, and reads each output port back from a file.
    line. Pin versions (base image tag, upstream git tag/commit, pip versions).
 3. `run.sh` — the adapter. Contract:
    - each input port `<name>` is a file `$GRAFUX_IN/<name>` (may be empty: use the default);
+   - when the user **uploads a file** into an input port (an image, a netlist, an archive),
+     `$GRAFUX_IN/<name>` holds that file's **raw bytes**, and `$GRAFUX_IN/<name>.filename`
+     holds its original name (use it for the extension). Without an upload the port holds
+     the text the user typed, which may be a path or a URL. Declare such ports `type: "file"`;
+     do not search the filesystem for an uploaded file by name, since only its bytes reach the pod;
    - write each **text** output port to `$GRAFUX_OUT/<name>`;
    - put files for **artifact** output ports under `$GRAFUX_OUT/files/` so they match the
      port's `glob` (relative to `$GRAFUX_OUT`, e.g. `files/*.gds`);
