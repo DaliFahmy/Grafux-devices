@@ -157,9 +157,25 @@ def content_hash(files: Dict[str, str]) -> str:
     return h.hexdigest()
 
 
+def _contract_salt() -> bytes:
+    """
+    Grafux's own share of every image: the trailer and start.sh.
+
+    Folded into the TAG (not ``content_hash``, which also answers "did the repair
+    change anything?"): when Grafux fixes its half -- e.g. start.sh learning to
+    create /run/sshd -- a rebuild of the same agent files must get a NEW tag, or
+    RunPod hosts keep serving the cached broken image under the old one.
+    """
+    with open(_START_SH, "rb") as fh:
+        start = fh.read()
+    # The trailer reads nothing from the manifest, so its text is fixed per release.
+    return start + b"\0" + dockerfile_trailer(None).encode("utf-8")
+
+
 def image_tag(owner: str, slug: str, files: Dict[str, str]) -> str:
     """``<owner>-<slug>-<sha12>``: one tag per distinct build, in ONE package."""
-    return f"{owner_slug(owner)}-{slug}-{content_hash(files)[:12]}"
+    h = hashlib.sha256(content_hash(files).encode() + b"\0" + _contract_salt())
+    return f"{owner_slug(owner)}-{slug}-{h.hexdigest()[:12]}"
 
 
 def finalize_manifest(files: Dict[str, str], image: str) -> str:

@@ -18,4 +18,9 @@ fi
 # Host keys are absent in a fresh image; without them sshd refuses to start.
 ssh-keygen -A
 
+# sshd refuses to start without its privilege-separation dir ("Missing privilege
+# separation directory: /run/sshd").  Our own Dockerfiles create it, but a
+# generated image's may not, and /run can be a fresh tmpfs at boot anyway.
+mkdir -p /run/sshd && chmod 0755 /run/sshd
+
 exec /usr/sbin/sshd -D -e

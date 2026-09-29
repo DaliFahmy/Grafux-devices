@@ -94,6 +94,25 @@ def test_build_context_appends_the_trailer_and_grafux_files():
     assert b"PUBLIC_KEY" in ctx["grafux-start.sh"]
 
 
+def test_start_sh_creates_the_sshd_privsep_dir_before_sshd():
+    """
+    A generated Dockerfile only installs openssh-server, which does not create
+    /run/sshd in a container; without it the pod's sshd dies at boot with
+    "Missing privilege separation directory: /run/sshd".
+    """
+    start = contract.build_context(_files(), contract.finalize_manifest(
+        _files(), f"{contract.IMAGE_REPO}:t1"))["grafux-start.sh"].decode()
+    assert "mkdir -p /run/sshd" in start
+    assert start.index("mkdir -p /run/sshd") < start.index("exec /usr/sbin/sshd")
+
+
+def test_tag_changes_when_grafux_changes_its_half(monkeypatch):
+    """A fix to start.sh/the trailer must not be hidden behind an old, cached tag."""
+    a = contract.image_tag("o", "demo", _files())
+    monkeypatch.setattr(contract, "_contract_salt", lambda: b"a newer start.sh")
+    assert contract.image_tag("o", "demo", _files()) != a
+
+
 def test_prompts():
     assert "{{EXAMPLE}}" not in contract.system_prompt()
     p = contract.first_prompt("an SRAM compiler", "https://github.com/x/y.git", "stable", "plan")

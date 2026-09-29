@@ -496,6 +496,13 @@ def create_pod(api_key: str, spec, public_key: str) -> str:
         "env": {"PUBLIC_KEY": public_key},
         "interruptible": False,
     }
+    if (spec.kind or "") == "custom":
+        # Generated images pushed before start.sh created /run/sshd die at boot with
+        # "Missing privilege separation directory: /run/sshd".  Creating it here
+        # rescues those images without a rebuild; on a fixed image it is a no-op.
+        # Scoped to custom so the proven EDA/CPU pod bodies stay unchanged.
+        body["dockerStartCmd"] = [
+            "sh", "-c", "mkdir -p /run/sshd && chmod 0755 /run/sshd && exec /start.sh"]
     if compute == "GPU":
         body["gpuTypeIds"] = [spec.instance_type]
         body["gpuCount"] = 1

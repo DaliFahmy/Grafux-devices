@@ -1191,3 +1191,23 @@ def test_local_ssh_mode_does_not_tear_down_a_pod_it_does_not_own(
     assert _wait_until(lambda: (registry.get(eda_id) or EdaRecord(spec=EdaSpec())).done)
     assert fake_pod["terminate"] == []
     assert registry.get(eda_id) is not None
+
+
+def test_custom_pod_body_creates_the_sshd_privsep_dir(captured_body):
+    """
+    Custom images pushed before start.sh created /run/sshd die at boot with
+    "Missing privilege separation directory: /run/sshd"; the start command
+    override rescues them without a rebuild.
+    """
+    spec = EdaSpec(kind="custom", compute_type="CPU", instance_type="cpu3c-8",
+                   image="ghcr.io/dalifahmy/grafux-gen:o-demo-abc")
+    pod_client.create_pod("rp_k", spec, "ssh-rsa AAA")
+    cmd = captured_body["body"]["dockerStartCmd"]
+    assert cmd[:2] == ["sh", "-c"]
+    assert "mkdir -p /run/sshd" in cmd[2] and cmd[2].endswith("exec /start.sh")
+
+
+def test_non_custom_pod_body_keeps_the_image_cmd(captured_body):
+    spec = EdaSpec(kind="verilator", compute_type="CPU", instance_type="cpu3c-8")
+    pod_client.create_pod("rp_k", spec, "ssh-rsa AAA")
+    assert "dockerStartCmd" not in captured_body["body"]
